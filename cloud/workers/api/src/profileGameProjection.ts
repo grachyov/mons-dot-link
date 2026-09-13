@@ -50,10 +50,14 @@ import {
   type ProfileLinkCatchupStore,
 } from "./profileLinkCatchupD1.ts";
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
+import { collectSuccessfulClaims, sendQueueTasks } from "./projectionSweep.ts";
+import {
+  infrastructureRetryDelaySeconds as profileGameProjectionRetryDelaySeconds,
+  MAX_INFRASTRUCTURE_RETRY_DELAY_SECONDS as MAX_PROFILE_GAME_PROJECTION_RETRY_DELAY_SECONDS,
+} from "./queueRetry.ts";
 
 const PROFILE_GAME_PROJECTION_SWEEP_LIMIT = PROFILE_BACKGROUND_SWEEP_LIMIT;
 const PROFILE_GAME_PROJECTION_SWEEP_CONCURRENCY = 10;
-const MAX_PROFILE_GAME_PROJECTION_RETRY_DELAY_SECONDS = 60;
 const PROFILE_GAME_PROJECTION_RECOVERY_DELAY_MS = 5 * 60 * 1_000;
 const HISTORICAL_MATCH_ARCHIVE_BATCH_SIZE = 5;
 
@@ -237,16 +241,6 @@ function validRatingProjectionRecord(
     isSafeRecordKey(update.inviteId) &&
     isSafeRecordKey(update.matchId) &&
     operationId === `${update.inviteId}__${update.matchId}`,
-  );
-}
-
-export function profileGameProjectionRetryDelaySeconds(
-  attempts: number,
-): number {
-  const exponent = Math.max(0, Math.min(6, attempts - 1));
-  return Math.min(
-    MAX_PROFILE_GAME_PROJECTION_RETRY_DELAY_SECONDS,
-    2 ** exponent,
   );
 }
 
@@ -733,27 +727,6 @@ async function repairInvalidAutomatchSweepEntry(
     : { kind: "removed" };
 }
 
-async function collectSuccessfulClaims<T>(
-  items: readonly T[],
-  claim: (item: T) => Promise<boolean>,
-): Promise<{ claimed: T[]; failure: Error | null }> {
-  const claimed: T[] = [];
-  let failure: Error | null = null;
-  for (const item of items) {
-    try {
-      if (await claim(item)) {
-        claimed.push(item);
-      }
-    } catch (error) {
-      failure ||=
-        error instanceof Error
-          ? error
-          : new Error("profile-game-projection-claim-failed");
-    }
-  }
-  return { claimed, failure };
-}
-
 export async function processRatingProfileGameProjection(
   operationId: string,
   rating: RatingProfileGameProjectionRepository,
@@ -979,11 +952,7 @@ async function sendProfileGameProjectionTasks(
   queue: Queue<ProfileGameProjectionTask>,
   tasks: ProfileGameProjectionTask[],
 ): Promise<void> {
-  for (let index = 0; index < tasks.length; index += 100) {
-    await queue.sendBatch(
-      tasks.slice(index, index + 100).map((task) => ({ body: task })),
-    );
-  }
+  return sendQueueTasks(queue, tasks);
 }
 
 async function forEachConcurrent<T>(
@@ -1139,8 +1108,10 @@ export async function sweepAutomatchProfileGameProjections(
   const candidates = entries.flatMap((entry) =>
     entry.kind === "candidate" ? [entry.value] : [],
   );
-  const claims = await collectSuccessfulClaims(candidates, (candidate) =>
-    claimAutomatchSweepCandidate(state, candidate, nowMs),
+  const claims = await collectSuccessfulClaims(
+    candidates,
+    (candidate) => claimAutomatchSweepCandidate(state, candidate, nowMs),
+    "profile-game-projection-claim-failed",
   );
   const tasks: ProfileGameProjectionTask[] = [
     ...repairedTasks,
@@ -1229,6 +1200,7 @@ export async function sweepEventProfileGameProjections(
   const claims = await collectSuccessfulClaims(
     Array.from(candidateByEventId.values()),
     (candidate) => claimEventSweepCandidate(state, candidate, nowMs),
+    "profile-game-projection-claim-failed",
   );
   const tasks: ProfileGameProjectionTask[] = [
     ...repairedTasks,
@@ -1266,8 +1238,16 @@ export async function sweepProfileLinkProfileGameProjections(
     nowMs - PROFILE_GAME_PROJECTION_RECOVERY_DELAY_MS,
     PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
   );
-  const claims = await collectSuccessfulClaims(candidates, (job) =>
-    jobs.claimDispatch(job.loginUid, job.requestId, job.lastQueuedAtMs, nowMs),
+  const claims = await collectSuccessfulClaims(
+    candidates,
+    (job) =>
+      jobs.claimDispatch(
+        job.loginUid,
+        job.requestId,
+        job.lastQueuedAtMs,
+        nowMs,
+      ),
+    "profile-game-projection-claim-failed",
   );
   await sendProfileGameProjectionTasks(
     env.PROFILE_GAME_PROJECTION_QUEUE,
@@ -1359,6 +1339,7 @@ export {
   claimAutomatchSweepCandidate,
   claimEventSweepCandidate,
   eventSweepEntries,
+  profileGameProjectionRetryDelaySeconds,
   repairInvalidEventSweepEntry,
   salvageEventCleanupOwnerProfileIds,
   repairInvalidAutomatchSweepEntry,

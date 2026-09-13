@@ -115,6 +115,11 @@ type RecordRow = {
   revision: number;
 };
 
+type MutationRecordRow = RecordRow & {
+  expiration_json: string | null;
+  expiration_revision: number;
+};
+
 export class AutomatchD1Failure extends Error {
   constructor(message = "automatch-state-unavailable", options?: ErrorOptions) {
     super(message, options);
@@ -643,6 +648,55 @@ export function createAutomatchD1Store(
       : { root, key, value: null, revision: 0 };
   }
 
+  async function readMutationRecords(
+    records: readonly { root: AutomatchRoot; key: string }[],
+    signal?: AbortSignal,
+  ): Promise<AutomatchRecordSnapshot[]> {
+    if (!records.length) return [];
+    signal?.throwIfAborted();
+    const session = db.withSession("first-primary");
+    const indices = new Map<string, number>();
+    const statements: D1PreparedStatement[] = [];
+    const locations = records.map(({ root, key }) => {
+      const { table } = requireRoot(root);
+      requireKey(key);
+      const identity = `${table}/${key}`;
+      let index = indices.get(identity);
+      if (index === undefined) {
+        index = statements.length;
+        indices.set(identity, index);
+        const expirationColumns =
+          table === AUTOMATCH_RECORD_TABLES.gameplayMutationReceipts.table
+            ? "expiration_json, expiration_revision"
+            : "NULL AS expiration_json, 0 AS expiration_revision";
+        statements.push(
+          session
+            .prepare(
+              `SELECT record_key, payload_json, revision, ${expirationColumns} FROM ${table} WHERE record_key = ?`,
+            )
+            .bind(key),
+        );
+      }
+      return { root, key, index };
+    });
+    const results = await session.batch<MutationRecordRow>(statements);
+    signal?.throwIfAborted();
+    return locations.map(({ root, key, index }) => {
+      const row = results[index].results[0];
+      if (!row) return { root, key, value: null, revision: 0 };
+      return decodeSnapshot(
+        root,
+        root === "gameplayMutationReceiptExpirations"
+          ? {
+              record_key: row.record_key,
+              payload_json: row.expiration_json,
+              revision: row.expiration_revision,
+            }
+          : row,
+      );
+    });
+  }
+
   async function list(
     root: AutomatchRoot,
     query: AutomatchCollectionQuery = {},
@@ -816,66 +870,66 @@ export function createAutomatchD1Store(
           add("gameplayMutationReceiptExpirations", change.operationId, change);
       }
     }
-    return Promise.all(
-      [...groups.values()].map(async ({ root, key, changes }) => {
-        const current = await read(root, key, signal);
-        let value = current.value;
-        for (const change of changes) {
-          if (change.kind === "mutation-receipt") {
-            value = resolveAutomatchServerValues(
-              root === "gameplayMutationReceipts"
-                ? change.value
-                : change.expiration,
-              current.value,
-              nowMs,
+    const entries = [...groups.values()];
+    const snapshots = await readMutationRecords(entries, signal);
+    return entries.map(({ root, changes }, index) => {
+      const current = snapshots[index];
+      let value = current.value;
+      for (const change of changes) {
+        if (change.kind === "mutation-receipt") {
+          value = resolveAutomatchServerValues(
+            root === "gameplayMutationReceipts"
+              ? change.value
+              : change.expiration,
+            current.value,
+            nowMs,
+          );
+        } else if (
+          change.kind === "telegram-source-merge" ||
+          change.kind === "profile-outbox-merge"
+        ) {
+          for (const [field, next] of Object.entries(change.value)) {
+            requireKey(field);
+            value = setNested(
+              value,
+              [field],
+              resolveAutomatchServerValues(
+                next,
+                nestedValue(current.value, [field]),
+                nowMs,
+              ),
             );
-          } else if (
-            change.kind === "telegram-source-merge" ||
-            change.kind === "profile-outbox-merge"
-          ) {
-            for (const [field, next] of Object.entries(change.value)) {
-              requireKey(field);
+          }
+          if (change.kind === "profile-outbox-merge")
+            for (const [matchId, next] of Object.entries(
+              change.historicalMatches || {},
+            )) {
+              requireKey(matchId);
               value = setNested(
                 value,
-                [field],
+                ["historicalMatches", matchId],
                 resolveAutomatchServerValues(
                   next,
-                  nestedValue(current.value, [field]),
+                  nestedValue(current.value, ["historicalMatches", matchId]),
                   nowMs,
                 ),
               );
             }
-            if (change.kind === "profile-outbox-merge")
-              for (const [matchId, next] of Object.entries(
-                change.historicalMatches || {},
-              )) {
-                requireKey(matchId);
-                value = setNested(
-                  value,
-                  ["historicalMatches", matchId],
-                  resolveAutomatchServerValues(
-                    next,
-                    nestedValue(current.value, ["historicalMatches", matchId]),
-                    nowMs,
-                  ),
-                );
-              }
-          } else if (
-            change.kind === "automatch-entry" ||
-            change.kind === "telegram-source" ||
-            change.kind === "telegram-outbox" ||
-            change.kind === "profile-outbox"
-          ) {
-            value = resolveAutomatchServerValues(
-              change.value,
-              current.value,
-              nowMs,
-            );
-          }
+        } else if (
+          change.kind === "automatch-entry" ||
+          change.kind === "telegram-source" ||
+          change.kind === "telegram-outbox" ||
+          change.kind === "profile-outbox"
+        ) {
+          value = resolveAutomatchServerValues(
+            change.value,
+            current.value,
+            nowMs,
+          );
         }
-        return { current, value };
-      }),
-    );
+      }
+      return { current, value };
+    });
   }
 
   async function transactRecord(

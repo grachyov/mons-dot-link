@@ -1,0 +1,160 @@
+import { MATERIAL_KEYS, type MiningMaterialName } from "@mons/shared/mining";
+import {
+  type CanonicalProjectionState,
+  CanonicalProfileCorruption,
+  type CanonicalRatingUpdateSnapshot,
+  type RatingRow,
+  type CanonicalWagerSettlement,
+  type WagerRow,
+  CanonicalProfileConflict,
+  type CanonicalRatingUpdateValue,
+} from "./types.ts";
+import {
+  record,
+  nonempty,
+  parseObjectJson,
+  nullableString,
+  safeInteger,
+  nullableSafeInteger,
+} from "./validation.ts";
+
+function projectionState(value: unknown): CanonicalProjectionState | null {
+  if (value === null) return null;
+  if (value !== "pending" && value !== "done" && value !== "dead") {
+    throw new CanonicalProfileCorruption();
+  }
+  return value;
+}
+
+export function parseCanonicalRatingUpdateRow(
+  value: unknown,
+): CanonicalRatingUpdateSnapshot {
+  const row = record(value) as RatingRow | null;
+  if (row?.status !== "processing" && row?.status !== "done") {
+    throw new CanonicalProfileCorruption();
+  }
+  return {
+    operationId: nonempty(row.operation_id),
+    payload: parseObjectJson(row.payload_json),
+    status: row.status,
+    inviteId: nonempty(row.invite_id),
+    matchId: nonempty(row.match_id),
+    playerId: nonempty(row.player_id),
+    opponentId: nonempty(row.opponent_id),
+    playerProfileId: nullableString(row.player_profile_id),
+    opponentProfileId: nullableString(row.opponent_profile_id),
+    ownerUid: nonempty(row.owner_uid),
+    ownerToken: nonempty(row.owner_token),
+    startedAtMs: safeInteger(row.started_at_ms),
+    updatedAtMs: safeInteger(row.updated_at_ms),
+    leaseExpiresAtMs: safeInteger(row.lease_expires_at_ms),
+    completedAtMs: nullableSafeInteger(row.completed_at_ms),
+    telegramProjectionState: projectionState(row.telegram_projection_state),
+    telegramProjectionUpdatedAtMs: nullableSafeInteger(
+      row.telegram_projection_updated_at_ms,
+    ),
+    telegramProjectionVersion: nullableSafeInteger(
+      row.telegram_projection_version,
+    ),
+    profileGameProjectionState: projectionState(
+      row.profile_game_projection_state,
+    ),
+    profileGameProjectionUpdatedAtMs: nullableSafeInteger(
+      row.profile_game_projection_updated_at_ms,
+    ),
+    profileGameProjectionVersion: nullableSafeInteger(
+      row.profile_game_projection_version,
+    ),
+    eventProgressState: projectionState(row.event_progress_state),
+    eventProgressUpdatedAtMs: nullableSafeInteger(
+      row.event_progress_updated_at_ms,
+    ),
+    eventProgressVersion: nullableSafeInteger(row.event_progress_version),
+    revision: safeInteger(row.revision, 1),
+  };
+}
+
+export function parseCanonicalWagerSettlementRow(
+  value: unknown,
+): CanonicalWagerSettlement {
+  const row = record(value) as WagerRow | null;
+  if (
+    !row ||
+    !(MATERIAL_KEYS as readonly string[]).includes(row.material) ||
+    (row.outcome !== "applied" && row.outcome !== "insufficient-materials") ||
+    row.revision !== 1
+  ) {
+    throw new CanonicalProfileCorruption();
+  }
+  return {
+    operationId: nonempty(row.operation_id),
+    fingerprint: nonempty(row.fingerprint),
+    winnerProfileId: nonempty(row.winner_profile_id),
+    loserProfileId: nonempty(row.loser_profile_id),
+    material: row.material as MiningMaterialName,
+    count: safeInteger(row.count, 1),
+    appliedAtMs: safeInteger(row.applied_at_ms),
+    outcome: row.outcome,
+    revision: 1,
+  };
+}
+
+export async function readCanonicalRatingUpdate(
+  db: D1Database,
+  operationId: string,
+): Promise<CanonicalRatingUpdateSnapshot | null> {
+  const row = await db
+    .prepare("SELECT * FROM rating_updates WHERE operation_id = ?")
+    .bind(operationId)
+    .first<RatingRow>();
+  return row ? parseCanonicalRatingUpdateRow(row) : null;
+}
+
+export async function readCanonicalWagerSettlement(
+  db: D1Database,
+  operationId: string,
+  fingerprint?: string,
+): Promise<CanonicalWagerSettlement | null> {
+  const row = await db
+    .prepare("SELECT * FROM wager_settlements WHERE operation_id = ?")
+    .bind(operationId)
+    .first<WagerRow>();
+  if (!row) return null;
+  const settlement = parseCanonicalWagerSettlementRow(row);
+  if (fingerprint !== undefined && settlement.fingerprint !== fingerprint) {
+    throw new CanonicalProfileConflict();
+  }
+  return settlement;
+}
+
+export function ratingWriteRow(
+  value: CanonicalRatingUpdateValue,
+): Omit<RatingRow, "revision"> {
+  return {
+    operation_id: value.operationId,
+    payload_json: JSON.stringify(value.payload),
+    status: value.status,
+    invite_id: value.inviteId,
+    match_id: value.matchId,
+    player_id: value.playerId,
+    opponent_id: value.opponentId,
+    player_profile_id: value.playerProfileId,
+    opponent_profile_id: value.opponentProfileId,
+    owner_uid: value.ownerUid,
+    owner_token: value.ownerToken,
+    started_at_ms: value.startedAtMs,
+    updated_at_ms: value.updatedAtMs,
+    lease_expires_at_ms: value.leaseExpiresAtMs,
+    completed_at_ms: value.completedAtMs,
+    telegram_projection_state: value.telegramProjectionState,
+    telegram_projection_updated_at_ms: value.telegramProjectionUpdatedAtMs,
+    telegram_projection_version: value.telegramProjectionVersion,
+    profile_game_projection_state: value.profileGameProjectionState,
+    profile_game_projection_updated_at_ms:
+      value.profileGameProjectionUpdatedAtMs,
+    profile_game_projection_version: value.profileGameProjectionVersion,
+    event_progress_state: value.eventProgressState,
+    event_progress_updated_at_ms: value.eventProgressUpdatedAtMs,
+    event_progress_version: value.eventProgressVersion,
+  };
+}

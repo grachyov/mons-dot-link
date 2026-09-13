@@ -47,10 +47,14 @@ import {
   sweepEventTelegramProjections,
 } from "./eventTelegramProjection.ts";
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
+import { collectSuccessfulClaims, sendQueueTasks } from "./projectionSweep.ts";
+import {
+  infrastructureRetryDelaySeconds as projectionRetryDelaySeconds,
+  MAX_INFRASTRUCTURE_RETRY_DELAY_SECONDS as MAX_PROJECTION_RETRY_DELAY_SECONDS,
+} from "./queueRetry.ts";
 
 const PROJECTION_SWEEP_LIMIT = PROFILE_BACKGROUND_SWEEP_LIMIT;
 const PROJECTION_INPUT_RETRIES = 5;
-const MAX_PROJECTION_RETRY_DELAY_SECONDS = 60;
 
 type AutomatchProjectionOutbox = {
   requestId: string;
@@ -316,11 +320,6 @@ async function processRatingTask(
   return mergeReason === "duplicate" ? "duplicate" : projection.status;
 }
 
-export function projectionRetryDelaySeconds(attempts: number): number {
-  const exponent = Math.max(0, Math.min(6, attempts - 1));
-  return Math.min(MAX_PROJECTION_RETRY_DELAY_SECONDS, 2 ** exponent);
-}
-
 export async function handleTelegramProjectionMessage(
   message: Message<unknown>,
   env: Env,
@@ -531,30 +530,7 @@ async function sendTaskBatches(
   queue: Queue<TelegramProjectionTask>,
   tasks: TelegramProjectionTask[],
 ): Promise<void> {
-  for (let index = 0; index < tasks.length; index += 100) {
-    await queue.sendBatch(
-      tasks.slice(index, index + 100).map((task) => ({ body: task })),
-    );
-  }
-}
-
-async function collectSuccessfulClaims<T>(
-  items: readonly T[],
-  claim: (item: T) => Promise<boolean>,
-): Promise<{ claimed: T[]; failure: Error | null }> {
-  const claimed: T[] = [];
-  let failure: Error | null = null;
-  for (const item of items) {
-    try {
-      if (await claim(item)) {
-        claimed.push(item);
-      }
-    } catch (error) {
-      failure ||=
-        error instanceof Error ? error : new Error("projection-claim-failed");
-    }
-  }
-  return { claimed, failure };
+  return sendQueueTasks(queue, tasks);
 }
 
 async function sweepAutomatchProjections(
@@ -586,8 +562,10 @@ async function sweepAutomatchProjections(
             : new Error("projection-invalid-record-failed");
       }
     }
-    const claims = await collectSuccessfulClaims(candidates, (candidate) =>
-      claimAutomatchSweepCandidate(state, candidate, nowMs),
+    const claims = await collectSuccessfulClaims(
+      candidates,
+      (candidate) => claimAutomatchSweepCandidate(state, candidate, nowMs),
+      "projection-claim-failed",
     );
     const tasks = claims.claimed.map(({ task }) => task);
     await sendTaskBatches(env.TELEGRAM_PROJECTION_QUEUE, tasks);
@@ -620,12 +598,15 @@ async function sweepRatingProjections(
       nowMs,
       PROJECTION_SWEEP_LIMIT,
     );
-    const claims = await collectSuccessfulClaims(records, (record) =>
-      rating.claimRatingTelegramProjection(
-        record.operationId,
-        record.updateTime,
-        nowMs,
-      ),
+    const claims = await collectSuccessfulClaims(
+      records,
+      (record) =>
+        rating.claimRatingTelegramProjection(
+          record.operationId,
+          record.updateTime,
+          nowMs,
+        ),
+      "projection-claim-failed",
     );
     const tasks: TelegramProjectionTask[] = claims.claimed.map((record) => ({
       kind: "rating-telegram-projection",
@@ -724,6 +705,7 @@ export {
   processAutomatchTask,
   processRatingTask,
   projectAutomatchSource,
+  projectionRetryDelaySeconds,
   sendTaskBatches,
   sweepAutomatchProjections,
   sweepRatingProjections,

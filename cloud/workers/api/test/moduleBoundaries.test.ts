@@ -27,16 +27,30 @@ test("canonical D1 modules have no direct Firestore runtime dependency", () => {
     "gameplayCanonicalRepository.ts",
     "profileCanonicalD1.ts",
   ]) {
-    const source = readFileSync(
+    for (const path of reachableRuntimeFiles(
       resolve(import.meta.dirname, "../src", filename),
-      "utf8",
-    );
-    assert.doesNotMatch(
-      source,
-      /(?:authFirestore|firestoreRest|createGoogleAccessToken|firestore\.googleapis\.com)/,
-      filename,
-    );
+    )) {
+      assert.doesNotMatch(
+        readFileSync(path, "utf8"),
+        /(?:authFirestore|firestoreRest|createGoogleAccessToken|firestore\.googleapis\.com)/,
+        relative(repositoryRoot, path),
+      );
+    }
   }
+});
+
+test("canonical profile internals never import their public facade", () => {
+  const facade = resolve(import.meta.dirname, "../src/profileCanonicalD1.ts");
+  const internalRoot = resolve(import.meta.dirname, "../src/profileCanonical");
+  const violations = reachableRuntimeFiles(facade)
+    .filter((path) => path.startsWith(`${internalRoot}/`))
+    .filter((path) =>
+      runtimeSpecifiers(path).some(
+        (specifier) => resolveRuntimeImport(path, specifier) === facade,
+      ),
+    )
+    .map((path) => relative(repositoryRoot, path));
+  assert.deepEqual(violations, []);
 });
 
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");

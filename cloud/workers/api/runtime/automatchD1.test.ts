@@ -31,6 +31,43 @@ async function writableStore() {
   return { admission, store };
 }
 
+function observeMutationReads(afterBatch?: () => void) {
+  const sessions: (D1SessionConstraint | D1SessionBookmark | undefined)[] = [];
+  const queries: string[] = [];
+  const batches: number[] = [];
+  const database = new Proxy(db, {
+    get(target, property) {
+      if (property === "withSession") {
+        return (constraint?: D1SessionConstraint | D1SessionBookmark) => {
+          sessions.push(constraint);
+          const session = target.withSession(constraint);
+          return {
+            prepare(query: string) {
+              queries.push(query);
+              return session.prepare(query);
+            },
+            async batch(statements: D1PreparedStatement[]) {
+              batches.push(statements.length);
+              const results = await session.batch(statements);
+              afterBatch?.();
+              return results;
+            },
+            getBookmark: session.getBookmark.bind(session),
+          };
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    store: createAutomatchD1Store(database),
+    sessions,
+    queries,
+    batches,
+  };
+}
+
 describe("D1 automatch state", () => {
   beforeAll(async () => {
     await applyD1Migrations(db, testEnv.TEST_D1_MIGRATIONS);
@@ -370,6 +407,196 @@ describe("D1 automatch state", () => {
         second: { finalizedAtMs: 2 },
       },
     });
+  });
+
+  it("preloads each physical record once in one primary batch and preserves mutation order", async () => {
+    const observed = observeMutationReads();
+    const prepared = await observed.store.prepareChanges(
+      [
+        {
+          kind: "telegram-source",
+          inviteId: "shared",
+          value: { generation: 2 },
+        },
+        {
+          kind: "mutation-receipt",
+          operationId: "shared",
+          value: { completedAtMs: { ".sv": "timestamp" } },
+          expiration: { completedAtMs: { ".sv": "timestamp" } },
+        },
+        { kind: "automatch-entry", inviteId: "shared", value: { uid: "host" } },
+        {
+          kind: "telegram-source-merge",
+          inviteId: "shared",
+          value: { lifecycle: "pending", updatedAtMs: { ".sv": "timestamp" } },
+        },
+      ],
+      500,
+    );
+    expect(observed.sessions).toEqual(["first-primary"]);
+    expect(observed.batches).toEqual([3]);
+    expect(observed.queries).toHaveLength(3);
+    expect(
+      observed.queries.filter((query) =>
+        query.includes("FROM game_session_mutation_receipts"),
+      ),
+    ).toHaveLength(1);
+    expect(prepared).toEqual([
+      {
+        current: {
+          root: "telegramAutomatches",
+          key: "shared",
+          value: null,
+          revision: 0,
+        },
+        value: { generation: 2, lifecycle: "pending", updatedAtMs: 500 },
+      },
+      {
+        current: {
+          root: "gameplayMutationReceipts",
+          key: "shared",
+          value: null,
+          revision: 0,
+        },
+        value: { completedAtMs: 500 },
+      },
+      {
+        current: {
+          root: "gameplayMutationReceiptExpirations",
+          key: "shared",
+          value: null,
+          revision: 0,
+        },
+        value: { completedAtMs: 500 },
+      },
+      {
+        current: { root: "automatch", key: "shared", value: null, revision: 0 },
+        value: { uid: "host" },
+      },
+    ]);
+  });
+
+  it("preloads receipt tombstones and expiration revisions independently", async () => {
+    const { store } = await writableStore();
+    await store.patchRoot({
+      "gameplayMutationReceipts/operation": { completedAtMs: 10 },
+      "gameplayMutationReceiptExpirations/operation": { completedAtMs: 10 },
+    });
+    await store.patchRoot({ "gameplayMutationReceipts/operation": null });
+    const prepared = await store.prepareChanges([
+      {
+        kind: "mutation-receipt",
+        operationId: "operation",
+        value: { completedAtMs: 20 },
+        expiration: { completedAtMs: 20 },
+      },
+    ]);
+    expect(prepared.map(({ current }) => current)).toEqual([
+      {
+        root: "gameplayMutationReceipts",
+        key: "operation",
+        value: null,
+        revision: 2,
+      },
+      {
+        root: "gameplayMutationReceiptExpirations",
+        key: "operation",
+        value: { completedAtMs: 10 },
+        revision: 1,
+      },
+    ]);
+    expect(await store.commit(prepared)).toBe(true);
+    expect(
+      await store.read("gameplayMutationReceipts", "operation"),
+    ).toMatchObject({
+      value: { completedAtMs: 20 },
+      revision: 3,
+    });
+    expect(
+      await store.read("gameplayMutationReceiptExpirations", "operation"),
+    ).toMatchObject({
+      value: { completedAtMs: 20 },
+      revision: 2,
+    });
+  });
+
+  it.each([
+    "gameplayMutationReceipts",
+    "gameplayMutationReceiptExpirations",
+  ] as const)(
+    "rolls back batched mutations when %s changes after preload",
+    async (root) => {
+      const { store } = await writableStore();
+      await store.patchRoot({
+        "gameplayMutationReceipts/operation": { completedAtMs: 10 },
+        "gameplayMutationReceiptExpirations/operation": { completedAtMs: 10 },
+      });
+      const prepared = await store.prepareChanges([
+        { kind: "automatch-entry", inviteId: "invite", value: { uid: "host" } },
+        {
+          kind: "mutation-receipt",
+          operationId: "operation",
+          value: { completedAtMs: 20 },
+          expiration: { completedAtMs: 20 },
+        },
+      ]);
+      await store.patchRoot({ [`${root}/operation`]: { completedAtMs: 30 } });
+      expect(await store.commit(prepared)).toBe(false);
+      expect(await store.read("automatch", "invite")).toMatchObject({
+        value: null,
+        revision: 0,
+      });
+      for (const component of [
+        "gameplayMutationReceipts",
+        "gameplayMutationReceiptExpirations",
+      ] as const) {
+        expect(await store.read(component, "operation")).toMatchObject({
+          value: { completedAtMs: component === root ? 30 : 10 },
+          revision: component === root ? 2 : 1,
+        });
+      }
+    },
+  );
+
+  it("does no database work for an empty preload or a canceled mutation", async () => {
+    const observed = observeMutationReads();
+    expect(await observed.store.prepareChanges([])).toEqual([]);
+    const controller = new AbortController();
+    const reason = new Error("mutation-canceled");
+    controller.abort(reason);
+    await expect(
+      observed.store.prepareChanges(
+        [{ kind: "automatch-entry", inviteId: "invite", value: null }],
+        nowMs,
+        controller.signal,
+      ),
+    ).rejects.toBe(reason);
+    expect(observed.sessions).toEqual([]);
+    expect(observed.queries).toEqual([]);
+    expect(observed.batches).toEqual([]);
+  });
+
+  it("rejects a mutation canceled while its preload is in flight", async () => {
+    const controller = new AbortController();
+    const reason = new Error("mutation-canceled");
+    const observed = observeMutationReads(() => controller.abort(reason));
+    await expect(
+      observed.store.prepareChanges(
+        [
+          {
+            kind: "automatch-entry",
+            inviteId: "invite",
+            value: { uid: "host" },
+          },
+        ],
+        nowMs,
+        controller.signal,
+      ),
+    ).rejects.toBe(reason);
+    expect(observed.batches).toEqual([1]);
+    expect(
+      await createAutomatchD1Store(db).read("automatch", "invite"),
+    ).toMatchObject({ value: null, revision: 0 });
   });
 
   it("retries a conflicted transaction and fences stale queue settlement", async () => {
