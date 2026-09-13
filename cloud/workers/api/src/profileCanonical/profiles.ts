@@ -419,7 +419,7 @@ export async function readCanonicalMergeTarget(
   return row ? parseCanonicalMergeTargetRow(row) : null;
 }
 
-async function resolveCanonicalProfileUsing<
+async function resolveCanonicalProfileIteratively<
   T extends Pick<
     CanonicalPublicProfileSnapshot,
     "mergedIntoProfileId" | "state"
@@ -484,6 +484,16 @@ export function resolveCanonicalProfile(
   redirectLimit = CANONICAL_PROFILE_INTERNAL_REDIRECT_LIMIT,
   onRedirectFailure: "null" | "throw" = "throw",
 ): Promise<CanonicalProfileSnapshot | null> {
+  if (!Number.isFinite(redirectLimit)) {
+    return resolveCanonicalProfileIteratively(
+      db,
+      profileId,
+      redirectLimit,
+      onRedirectFailure,
+      "*",
+      parseCanonicalProfileRow,
+    );
+  }
   return resolveCanonicalProfileUsing(
     db,
     profileId,
@@ -494,20 +504,27 @@ export function resolveCanonicalProfile(
   );
 }
 
-export async function resolveCanonicalPublicProfile(
+async function resolveCanonicalProfileUsing<
+  T extends Pick<
+    CanonicalPublicProfileSnapshot,
+    "mergedIntoProfileId" | "state"
+  >,
+>(
   db: D1Database,
   profileId: string,
-  redirectLimit = CANONICAL_PROFILE_INTERNAL_REDIRECT_LIMIT,
-  onRedirectFailure: "null" | "throw" = "throw",
-): Promise<CanonicalPublicProfileSnapshot | null> {
+  redirectLimit: number,
+  onRedirectFailure: "null" | "throw",
+  columns: string,
+  parseProfile: (value: unknown) => T,
+): Promise<T | null> {
   if (!profileId.isWellFormed()) {
-    return resolveCanonicalProfileUsing(
+    return resolveCanonicalProfileIteratively(
       db,
       profileId,
       redirectLimit,
       onRedirectFailure,
-      CANONICAL_PUBLIC_PROFILE_COLUMNS,
-      parseCanonicalPublicProfileRow,
+      columns,
+      parseProfile,
     );
   }
   if (!(redirectLimit >= 0)) {
@@ -517,12 +534,15 @@ export async function resolveCanonicalPublicProfile(
   const { results } = await db
     .prepare(
       `${canonicalProfileRedirectCte("profile")}
-       SELECT ${CANONICAL_PUBLIC_PROFILE_COLUMNS.split(",")
+       SELECT ${columns
+         .split(",")
          .map((column) => `profile.${column.trim()}`)
          .join(", ")},
               chain.chain_profile_id, chain.depth AS chain_depth,
-              target.source_profile_id, target.target_profile_id,
-              target.merged_at_ms, target.op_id
+              target.source_profile_id AS redirect_source_profile_id,
+              target.target_profile_id AS redirect_target_profile_id,
+              target.merged_at_ms AS redirect_merged_at_ms,
+              target.op_id AS redirect_op_id
        FROM chain
        LEFT JOIN profile_records profile
          ON profile.profile_id = chain.chain_profile_id
@@ -548,10 +568,16 @@ export async function resolveCanonicalPublicProfile(
     ) {
       throw new CanonicalProfileCorruption();
     }
-    const profile =
-      row.profile_id === null ? null : parseCanonicalPublicProfileRow(row);
+    const profile = row.profile_id === null ? null : parseProfile(row);
     const mergeTarget =
-      row.source_profile_id === null ? null : parseCanonicalMergeTargetRow(row);
+      row.redirect_source_profile_id === null
+        ? null
+        : parseCanonicalMergeTargetRow({
+            source_profile_id: row.redirect_source_profile_id,
+            target_profile_id: row.redirect_target_profile_id,
+            merged_at_ms: row.redirect_merged_at_ms,
+            op_id: row.redirect_op_id,
+          });
     if (!mergeTarget) {
       if (profile?.state === "retiring" || hop + 1 !== results.length) {
         throw new CanonicalProfileCorruption();
@@ -569,6 +595,22 @@ export async function resolveCanonicalPublicProfile(
   }
   if (onRedirectFailure === "null") return null;
   throw new CanonicalProfileCorruption();
+}
+
+export function resolveCanonicalPublicProfile(
+  db: D1Database,
+  profileId: string,
+  redirectLimit = CANONICAL_PROFILE_INTERNAL_REDIRECT_LIMIT,
+  onRedirectFailure: "null" | "throw" = "throw",
+): Promise<CanonicalPublicProfileSnapshot | null> {
+  return resolveCanonicalProfileUsing(
+    db,
+    profileId,
+    redirectLimit,
+    onRedirectFailure,
+    CANONICAL_PUBLIC_PROFILE_COLUMNS,
+    parseCanonicalPublicProfileRow,
+  );
 }
 
 function leaderboardColumns(type: LeaderboardReadType): {

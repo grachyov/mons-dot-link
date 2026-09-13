@@ -80,18 +80,29 @@ function parseRow(row: HistoricalMatchRow): HistoricalMatchSnapshot {
   };
 }
 
+function historicalMatchReadStatement(
+  db: D1Database,
+  inviteId: string,
+  matchId: string,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `SELECT * FROM historical_match_pairs
+       WHERE invite_id = ? AND match_id = ?`,
+    )
+    .bind(inviteId, matchId);
+}
+
 export async function readHistoricalMatchSnapshot(
   db: D1Database,
   inviteId: string,
   matchId: string,
 ): Promise<HistoricalMatchSnapshot | null> {
-  const row = await db
-    .prepare(
-      `SELECT * FROM historical_match_pairs
-       WHERE invite_id = ? AND match_id = ?`,
-    )
-    .bind(inviteId, matchId)
-    .first<HistoricalMatchRow>();
+  const row = await historicalMatchReadStatement(
+    db,
+    inviteId,
+    matchId,
+  ).first<HistoricalMatchRow>();
   return row ? parseRow(row) : null;
 }
 
@@ -126,9 +137,10 @@ export async function writeHistoricalMatchSnapshot(
     throw new TypeError("invalid-historical-match-snapshot");
   }
   const snapshotJson = JSON.stringify(pair);
-  await db
-    .prepare(
-      `INSERT INTO historical_match_pairs (
+  const results = await db.batch<HistoricalMatchRow>([
+    db
+      .prepare(
+        `INSERT INTO historical_match_pairs (
          invite_id, match_id, snapshot_json, source_kind, finalized_at_ms,
          archived_at_ms, schema_version, revision
        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -142,25 +154,23 @@ export async function writeHistoricalMatchSnapshot(
        WHERE excluded.source_kind = 'rating'
          AND historical_match_pairs.source_kind != 'rating'
          AND (? IS NULL OR historical_match_pairs.revision = ?)`,
-    )
-    .bind(
-      input.inviteId,
-      pair.matchId,
-      snapshotJson,
-      input.source,
-      input.finalizedAtMs,
-      input.archivedAtMs,
-      HISTORICAL_MATCH_SCHEMA_VERSION,
-      input.expectedRevision === null ? 0 : (input.expectedRevision ?? null),
-      input.expectedRevision === null ? 0 : (input.expectedRevision ?? null),
-    )
-    .run();
-  const stored = await readHistoricalMatchSnapshot(
-    db,
-    input.inviteId,
-    pair.matchId,
-  );
-  if (!stored) throw new HistoricalMatchCorruption();
+      )
+      .bind(
+        input.inviteId,
+        pair.matchId,
+        snapshotJson,
+        input.source,
+        input.finalizedAtMs,
+        input.archivedAtMs,
+        HISTORICAL_MATCH_SCHEMA_VERSION,
+        input.expectedRevision === null ? 0 : (input.expectedRevision ?? null),
+        input.expectedRevision === null ? 0 : (input.expectedRevision ?? null),
+      ),
+    historicalMatchReadStatement(db, input.inviteId, pair.matchId),
+  ]);
+  const row = results[1]?.results[0];
+  if (!row) throw new HistoricalMatchCorruption();
+  const stored = parseRow(row);
   if (stored.source === "rating" && input.source !== "rating") return stored;
   if (input.source === "rating" && stored.source !== "rating") {
     throw new HistoricalMatchConflict();

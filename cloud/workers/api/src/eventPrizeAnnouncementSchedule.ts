@@ -9,10 +9,10 @@ import {
 } from "./eventAnnouncementKinds.ts";
 import {
   buildEventProgressPlan,
-  ensureEventProgressWorkflow,
   parseEventProgressOutbox,
   type EventProgressPlan,
-} from "./eventProgress.ts";
+} from "./eventProgressCodec.ts";
+import { ensureEventProgressWorkflow } from "./eventProgressDispatch.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import type { EventProgressWorkExecutor } from "./eventProgressExecution.ts";

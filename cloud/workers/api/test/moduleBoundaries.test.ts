@@ -6,6 +6,8 @@ import typescript from "typescript";
 import * as entrypoint from "../src/workerHandler.ts";
 import { extractIdFromJsonUri } from "../src/helius.ts";
 import { handleRequest } from "../src/router.ts";
+import * as eventProgress from "../src/eventProgress.ts";
+import * as eventProgressDispatch from "../src/eventProgressDispatch.ts";
 
 test("the Worker entrypoint remains a thin exact compatibility facade", () => {
   assert.deepEqual(Object.keys(entrypoint).sort(), [
@@ -51,6 +53,51 @@ test("canonical profile internals never import their public facade", () => {
     )
     .map((path) => relative(repositoryRoot, path));
   assert.deepEqual(violations, []);
+});
+
+test("event persistence internals have no facade dependencies or runtime cycles", () => {
+  const facade = resolve(import.meta.dirname, "../src/eventD1.ts");
+  const internalRoot = resolve(import.meta.dirname, "../src/eventD1");
+  const internals = reachableRuntimeFiles(facade).filter((path) =>
+    path.startsWith(`${internalRoot}/`),
+  );
+  assert.ok(internals.length > 0);
+  for (const path of internals) {
+    const dependencies = runtimeSpecifiers(path)
+      .map((specifier) => resolveRuntimeImport(path, specifier))
+      .filter((dependency): dependency is string => dependency !== null);
+    for (const dependency of dependencies) {
+      const reachable = reachableRuntimeFiles(dependency);
+      assert.ok(!reachable.includes(facade), relative(repositoryRoot, path));
+      assert.ok(!reachable.includes(path), relative(repositoryRoot, path));
+    }
+  }
+});
+
+test("event announcement scheduling and dispatch do not depend on recovery orchestration", () => {
+  const recovery = resolve(import.meta.dirname, "../src/eventProgress.ts");
+  for (const entry of [
+    "eventPrizeAnnouncementSchedule.ts",
+    "eventProgressDispatch.ts",
+  ]) {
+    assert.ok(
+      !reachableRuntimeFiles(
+        resolve(import.meta.dirname, "../src", entry),
+      ).includes(recovery),
+      entry,
+    );
+  }
+});
+
+test("event progress retains its public dispatch function identities", () => {
+  assert.strictEqual(
+    eventProgress.ensureEventProgressWorkflow,
+    eventProgressDispatch.ensureEventProgressWorkflow,
+  );
+  assert.strictEqual(
+    eventProgress.removeOutbox,
+    eventProgressDispatch.removeOutbox,
+  );
 });
 
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");

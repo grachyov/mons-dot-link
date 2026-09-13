@@ -12,11 +12,59 @@ import {
 } from "../src/profileGamesD1.ts";
 import {
   HistoricalMatchConflict,
+  HistoricalMatchCorruption,
   readHistoricalMatchSnapshot,
   writeHistoricalMatchSnapshot,
 } from "../src/historicalMatchesD1.ts";
 
 const testEnv = env as Env & { TEST_D1_MIGRATIONS: D1Migration[] };
+
+function observeHistoricalBatches() {
+  type Statement = {
+    query: string;
+    values: unknown[];
+    statement: D1PreparedStatement;
+  };
+  const batches: Statement[][] = [];
+  const statements = new WeakMap<D1PreparedStatement, Statement>();
+  const wrap = (
+    statement: D1PreparedStatement,
+    query: string,
+    values: unknown[] = [],
+  ): D1PreparedStatement => {
+    const wrapped = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind") {
+          return (...bound: unknown[]) =>
+            wrap(target.bind(...bound), query, bound);
+        }
+        throw new Error("unexpected-historical-statement-operation");
+      },
+    });
+    statements.set(wrapped, { query, values, statement });
+    return wrapped;
+  };
+  const database = new Proxy(env.PROFILE_GAMES_DB, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (query: string) => wrap(target.prepare(query), query);
+      }
+      if (property === "batch") {
+        return (input: D1PreparedStatement[]) => {
+          const batch = input.map((statement) => {
+            const prepared = statements.get(statement);
+            if (!prepared) throw new Error("unknown-historical-statement");
+            return prepared;
+          });
+          batches.push(batch);
+          return target.batch(batch.map(({ statement }) => statement));
+        };
+      }
+      throw new Error("unexpected-historical-database-operation");
+    },
+  });
+  return { database, batches };
+}
 
 function observeProjectionReads() {
   const reads: Array<{ query: string; values: unknown[] }> = [];
@@ -137,7 +185,8 @@ describe("profile game projection D1 repository", () => {
 
   it("stores immutable historical matches with rating precedence", async () => {
     const pair = historicalPair();
-    const first = await writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+    const observed = observeHistoricalBatches();
+    const first = await writeHistoricalMatchSnapshot(observed.database, {
       archivedAtMs: 2_000,
       finalizedAtMs: 1_000,
       inviteId: "invite-1",
@@ -145,6 +194,15 @@ describe("profile game projection D1 repository", () => {
       source: "backfill",
     });
     expect(first.revision).toBe(1);
+    expect(observed.batches).toHaveLength(1);
+    expect(observed.batches[0]).toHaveLength(2);
+    expect(observed.batches[0][0].query).toContain(
+      "INSERT INTO historical_match_pairs",
+    );
+    expect(observed.batches[0][1].query).toContain(
+      "SELECT * FROM historical_match_pairs",
+    );
+    expect(observed.batches[0][1].values).toEqual(["invite-1", "invite-1"]);
     const reordered = {
       guestMatch: pair.guestMatch
         ? {
@@ -176,7 +234,7 @@ describe("profile game projection D1 repository", () => {
       hostPlayerId: pair.hostPlayerId,
       matchId: pair.matchId,
     };
-    const replay = await writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+    const replay = await writeHistoricalMatchSnapshot(observed.database, {
       archivedAtMs: 2_000,
       finalizedAtMs: 1_000,
       inviteId: "invite-1",
@@ -188,7 +246,7 @@ describe("profile game projection D1 repository", () => {
       ...pair,
       hostMatch: { ...pair.hostMatch!, status: "rated" },
     };
-    const upgraded = await writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+    const upgraded = await writeHistoricalMatchSnapshot(observed.database, {
       archivedAtMs: 3_000,
       finalizedAtMs: 1_500,
       inviteId: "invite-1",
@@ -198,7 +256,7 @@ describe("profile game projection D1 repository", () => {
     expect(upgraded.source).toBe("rating");
     expect(upgraded.revision).toBe(2);
     expect(upgraded.pair.hostMatch?.status).toBe("rated");
-    const preserved = await writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+    const preserved = await writeHistoricalMatchSnapshot(observed.database, {
       archivedAtMs: 4_000,
       finalizedAtMs: 2_000,
       inviteId: "invite-1",
@@ -207,7 +265,89 @@ describe("profile game projection D1 repository", () => {
     });
     expect(preserved.source).toBe("rating");
     expect(preserved.pair.hostMatch?.status).toBe("rated");
+    expect(observed.batches).toHaveLength(4);
+    expect(observed.batches.every((batch) => batch.length === 2)).toBe(true);
   });
+
+  it.each([1, 2, null])(
+    "preserves rating promotion with expected revision %s",
+    async (expectedRevision) => {
+      const input = {
+        archivedAtMs: 2_000,
+        finalizedAtMs: 1_000,
+        inviteId: "invite-1",
+        pair: historicalPair(),
+        source: "backfill" as const,
+      };
+      const first = await writeHistoricalMatchSnapshot(
+        env.PROFILE_GAMES_DB,
+        input,
+      );
+      const promotion = writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+        ...input,
+        expectedRevision,
+        source: "rating",
+      });
+      if (expectedRevision === first.revision) {
+        await expect(promotion).resolves.toMatchObject({
+          revision: 2,
+          source: "rating",
+        });
+      } else {
+        await expect(promotion).rejects.toBeInstanceOf(HistoricalMatchConflict);
+        await expect(
+          readHistoricalMatchSnapshot(
+            env.PROFILE_GAMES_DB,
+            "invite-1",
+            "invite-1",
+          ),
+        ).resolves.toEqual(first);
+      }
+    },
+  );
+
+  it.each([1, null])(
+    "allows initial archive creation with expected revision %s",
+    async (expectedRevision) => {
+      await expect(
+        writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+          archivedAtMs: 2_000,
+          expectedRevision,
+          finalizedAtMs: 1_000,
+          inviteId: "invite-1",
+          pair: historicalPair(),
+          source: "rating",
+        }),
+      ).resolves.toMatchObject({ revision: 1, source: "rating" });
+    },
+  );
+
+  it.each([
+    ["missing", "DELETE FROM historical_match_pairs"],
+    ["corrupt", "UPDATE historical_match_pairs SET snapshot_json = '{}'"],
+  ])(
+    "rejects a %s archive verification row",
+    async (_description, mutation) => {
+      await env.PROFILE_GAMES_DB.exec(
+        `CREATE TRIGGER alter_historical_archive AFTER INSERT ON historical_match_pairs BEGIN ${mutation}; END`,
+      );
+      try {
+        await expect(
+          writeHistoricalMatchSnapshot(env.PROFILE_GAMES_DB, {
+            archivedAtMs: 2_000,
+            finalizedAtMs: 1_000,
+            inviteId: "invite-1",
+            pair: historicalPair(),
+            source: "backfill",
+          }),
+        ).rejects.toBeInstanceOf(HistoricalMatchCorruption);
+      } finally {
+        await env.PROFILE_GAMES_DB.exec(
+          "DROP TRIGGER alter_historical_archive",
+        );
+      }
+    },
+  );
 
   it("rejects conflicting same-priority historical snapshots", async () => {
     const pair = historicalPair();

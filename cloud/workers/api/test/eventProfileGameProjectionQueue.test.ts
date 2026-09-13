@@ -239,7 +239,7 @@ test("the dedicated event queue fails unreadable profile control closed", async 
 
 test("the dedicated event queue rejects unrelated work", async (t) => {
   const logs: string[] = [];
-  t.mock.method(console, "error", (value) => logs.push(String(value)));
+  t.mock.method(console, "error", (value: unknown) => logs.push(String(value)));
   const tracked = delivery({
     kind: "rating-profile-game-projection",
     operationId: "invite-1__match-1",
