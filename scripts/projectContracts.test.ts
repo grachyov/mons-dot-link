@@ -231,6 +231,10 @@ test("API Wrangler configuration preserves its route, secrets, and bindings", ()
         binding: "PROFILE_GAME_PROJECTION_QUEUE",
         queue: "mons-link-profile-game-projection",
       },
+      {
+        binding: "EVENT_PROFILE_GAME_PROJECTION_QUEUE",
+        queue: "mons-link-event-profile-game-projection",
+      },
     ],
     consumers: [
       {
@@ -267,6 +271,13 @@ test("API Wrangler configuration preserves its route, secrets, and bindings", ()
       },
       {
         queue: "mons-link-profile-game-projection",
+        max_batch_size: 1,
+        max_batch_timeout: 1,
+        max_retries: 100,
+        max_concurrency: 5,
+      },
+      {
+        queue: "mons-link-event-profile-game-projection",
         max_batch_size: 1,
         max_batch_timeout: 1,
         max_retries: 100,

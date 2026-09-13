@@ -355,6 +355,7 @@ export const TELEGRAM_TEST_ENV = {
   HELIUS_RPC_API_KEY: "test-helius-key",
   NFT_RATE_LIMITER: rateLimit,
   PROFILE_GAME_PROJECTION_QUEUE: queue,
+  EVENT_PROFILE_GAME_PROJECTION_QUEUE: queue,
   PROFILE_DB: profileDb,
   PROFILE_GAMES_DB: profileGamesDb,
   TELEGRAM_BOT_TOKEN: "test-telegram-token",

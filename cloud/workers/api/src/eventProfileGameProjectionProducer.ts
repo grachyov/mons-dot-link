@@ -67,7 +67,7 @@ export async function prepareEventProfileGameProjection(
   const enqueue =
     dependencies.enqueue ||
     ((task: EventProfileGameProjectionTask) =>
-      env.PROFILE_GAME_PROJECTION_QUEUE.send(task));
+      env.EVENT_PROFILE_GAME_PROJECTION_QUEUE.send(task));
   const logger = dependencies.logger || console;
   const now = dependencies.now || Date.now;
   const eventIds = eventIdsFromProfileGameProjectionUpdates(updates);
@@ -145,7 +145,10 @@ export async function prepareEventProfileGameProjection(
           logger.error(
             JSON.stringify({
               event: "event_profile_game_projection_enqueue_failed",
+              kind: tasks[index].kind,
               eventId: tasks[index].eventId,
+              requestId: tasks[index].requestId,
+              outcome: "failed",
             }),
           );
         }

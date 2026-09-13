@@ -1,7 +1,7 @@
 import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
 import {
   buildHistoricalMatchPair,
-  buildTransitionHistoricalMatchPair,
+  classifyTransitionHistoricalMatchPair,
   HISTORICAL_MATCH_ARCHIVE_VERSION,
   type HistoricalMatchDescriptor,
 } from "./historicalMatches.ts";
@@ -20,6 +20,7 @@ import {
   parseAutomatchProfileGameProjectionOutbox,
   parseEventProfileGameProjectionOutbox,
   salvageHistoricalMatchDescriptors,
+  type AutomatchProfileGameProjectionOutbox,
 } from "./profileGameProjectionOutbox.ts";
 import {
   createEventProfileGameProjectionRuntime,
@@ -69,7 +70,7 @@ async function archiveHistoricalDescriptor(
   inviteId: string,
   state: ProfileGameProjectionState,
   runtime: ProfileGameProjectionRuntime,
-): Promise<void> {
+): Promise<"archived" | "unready" | "unavailable"> {
   const alreadyArchived = runtime.hasHistoricalMatch
     ? await runtime.hasHistoricalMatch(inviteId, descriptor.matchId)
     : false;
@@ -83,22 +84,25 @@ async function archiveHistoricalDescriptor(
       opponentId: descriptor.guestPlayerId,
     });
   } catch (error) {
-    if (alreadyArchived) return;
+    if (alreadyArchived) return "archived";
     throw error;
   }
-  if (hostMatch == null && guestMatch == null && alreadyArchived) return;
-  const buildPair =
-    descriptor.source === "transition"
-      ? buildTransitionHistoricalMatchPair
-      : buildHistoricalMatchPair;
-  const pair = buildPair({
+  if (hostMatch == null && guestMatch == null && alreadyArchived)
+    return "archived";
+  const input = {
     matchId: descriptor.matchId,
     hostPlayerId: descriptor.hostPlayerId,
     guestPlayerId: descriptor.guestPlayerId,
     hostMatch,
     guestMatch,
-  });
-  if (!pair) throw new Error("historical-match-source-unavailable");
+  };
+  const result =
+    descriptor.source === "transition"
+      ? classifyTransitionHistoricalMatchPair(input)
+      : { status: "ready" as const, pair: buildHistoricalMatchPair(input) };
+  if (result.status !== "ready") return result.status;
+  const pair = result.pair;
+  if (!pair) return "unavailable";
   if (!runtime.archiveHistoricalMatch) {
     throw new Error("historical-match-archive-unavailable");
   }
@@ -108,12 +112,14 @@ async function archiveHistoricalDescriptor(
     pair,
     source: descriptor.source,
   });
+  return "archived";
 }
 
 async function settleHistoricalDescriptor(
   task: AutomatchProfileGameProjectionTask,
   descriptor: HistoricalMatchDescriptor,
   state: ProfileGameProjectionState,
+  retryNotBeforeMs?: number,
 ): Promise<boolean> {
   const result = await state.transactAutomatchProfileOutbox(
     task.inviteId,
@@ -126,20 +132,97 @@ async function settleHistoricalDescriptor(
       const historicalMatches = {
         ...(toRecord(record.historicalMatches) || {}),
       };
-      if (!Object.hasOwn(historicalMatches, descriptor.matchId)) {
+      const stored = outbox.historicalMatches?.find(
+        ({ matchId }) => matchId === descriptor.matchId,
+      );
+      if (
+        !stored ||
+        stored.finalizedAtMs !== descriptor.finalizedAtMs ||
+        stored.hostPlayerId !== descriptor.hostPlayerId ||
+        stored.guestPlayerId !== descriptor.guestPlayerId ||
+        stored.source !== descriptor.source ||
+        stored.retryNotBeforeMs !== descriptor.retryNotBeforeMs
+      ) {
         return { commit: false, decision: "changed" };
       }
-      delete historicalMatches[descriptor.matchId];
+      if (retryNotBeforeMs === undefined)
+        delete historicalMatches[descriptor.matchId];
+      else
+        historicalMatches[descriptor.matchId] = {
+          ...toRecord(historicalMatches[descriptor.matchId]),
+          retryNotBeforeMs,
+        };
       const next = { ...record };
       if (Object.keys(historicalMatches).length > 0) {
         next.historicalMatches = historicalMatches;
       } else {
         delete next.historicalMatches;
       }
-      return { value: next, decision: "settled" };
+      return {
+        value: next,
+        decision: retryNotBeforeMs === undefined ? "settled" : "deferred",
+      };
     },
   );
   return result.committed;
+}
+
+function archiveRetryIsPending(
+  outbox: AutomatchProfileGameProjectionOutbox,
+  nowMs: number,
+): boolean {
+  const retry = outbox.archiveRetry;
+  const descriptors = outbox.historicalMatches || [];
+  return Boolean(
+    retry &&
+    retry.requestId === outbox.requestId &&
+    retry.notBeforeMs > nowMs &&
+    descriptors.length > 0 &&
+    descriptors.every(
+      ({ retryNotBeforeMs }) =>
+        retryNotBeforeMs !== undefined && retryNotBeforeMs >= retry.notBeforeMs,
+    ),
+  );
+}
+
+async function finishAutomatchProjectionBatch(
+  task: AutomatchProfileGameProjectionTask,
+  state: ProfileGameProjectionState,
+  nowMs: number,
+): Promise<"continued" | "deferred" | "projected" | "superseded"> {
+  const result = await state.transactAutomatchProfileOutbox(
+    task.inviteId,
+    (current) => {
+      const outbox = parseAutomatchProfileGameProjectionOutbox(current);
+      if (!outbox || outbox.requestId !== task.requestId)
+        return { commit: false, decision: "superseded" };
+      const descriptors = outbox.historicalMatches || [];
+      if (descriptors.length === 0)
+        return { value: null, decision: "projected" };
+      if (
+        descriptors.some(
+          ({ retryNotBeforeMs }) => (retryNotBeforeMs || 0) <= nowMs,
+        )
+      )
+        return { commit: false, decision: "continued" };
+      return {
+        value: {
+          ...toRecord(current),
+          lastQueuedAtMs: nowMs,
+          archiveRetry: {
+            requestId: task.requestId,
+            notBeforeMs: Math.min(
+              ...descriptors.map(({ retryNotBeforeMs }) => retryNotBeforeMs!),
+            ),
+          },
+        },
+        decision: "deferred",
+      };
+    },
+  );
+  if (result.decision === "continued") return "continued";
+  if (!result.committed) return "superseded";
+  return result.decision === "deferred" ? "deferred" : "projected";
 }
 
 type ProfileGameProjectionLogger = Pick<Console, "error" | "info">;
@@ -172,6 +255,7 @@ type ProfileLinkProjectionJobs = Pick<
 >;
 
 export type ProfileGameProjectionDependencies = {
+  forwardEventTasks?: boolean;
   createLocks?: (env: Env) => ProfileGameProjectionLockStore;
   createProfileLinkJobs?: (env: Env) => ProfileLinkProjectionJobs;
   createEventRuntime?: (env: Env) => EventProfileGameProjectionRuntime;
@@ -272,7 +356,13 @@ export async function processAutomatchProfileGameProjection(
   ownerId: string = crypto.randomUUID(),
   now: () => number = Date.now,
   logger: ProfileGameProjectionLogger = console,
-): Promise<"continued" | "projected" | "stale" | "superseded"> {
+): Promise<"continued" | "deferred" | "projected" | "stale" | "superseded"> {
+  const initialOutbox = parseAutomatchProfileGameProjectionOutbox(
+    await state.readAutomatchProfileOutbox(task.inviteId),
+  );
+  if (!initialOutbox || initialOutbox.requestId !== task.requestId)
+    return "stale";
+  if (archiveRetryIsPending(initialOutbox, now())) return "deferred";
   const lock: ProfileGameProjectionLock = {
     scope: "invite",
     resourceId: task.inviteId,
@@ -283,35 +373,57 @@ export async function processAutomatchProfileGameProjection(
     const outbox = parseAutomatchProfileGameProjectionOutbox(
       await state.readAutomatchProfileOutbox(task.inviteId),
     );
-    if (!outbox || outbox.requestId !== task.requestId) {
-      return "stale";
-    }
+    if (!outbox || outbox.requestId !== task.requestId) return "stale";
+    if (archiveRetryIsPending(outbox, now())) return "deferred";
     await runtime.recomputeInviteProjection(task.inviteId, outbox.reason, {
       eventTimestampMs: outbox.sourceUpdatedAtMs,
     });
-    const descriptors = (outbox.historicalMatches || []).slice(
-      0,
-      HISTORICAL_MATCH_ARCHIVE_BATCH_SIZE,
-    );
+    const batchNowMs = now();
+    const descriptors = (outbox.historicalMatches || [])
+      .filter(({ retryNotBeforeMs }) => (retryNotBeforeMs || 0) <= batchNowMs)
+      .slice(0, HISTORICAL_MATCH_ARCHIVE_BATCH_SIZE);
     let firstArchiveFailure: unknown;
     let archiveFailed = false;
     for (const descriptor of descriptors) {
       try {
-        await archiveHistoricalDescriptor(
+        const status = await archiveHistoricalDescriptor(
           descriptor,
           task.inviteId,
           state,
           runtime,
         );
-        if (!(await settleHistoricalDescriptor(task, descriptor, state))) {
+        const retryNotBeforeMs =
+          status === "archived"
+            ? undefined
+            : now() + PROFILE_GAME_PROJECTION_RECOVERY_DELAY_MS;
+        if (
+          !(await settleHistoricalDescriptor(
+            task,
+            descriptor,
+            state,
+            retryNotBeforeMs,
+          ))
+        ) {
           return "superseded";
         }
+        if (status !== "archived")
+          logger.info(
+            JSON.stringify({
+              event: "historical_match_archive_descriptor_deferred",
+              inviteId: task.inviteId,
+              matchId: descriptor.matchId,
+              requestId: task.requestId,
+              reason: status,
+              retryNotBeforeMs,
+            }),
+          );
       } catch (error) {
         logger.error(
           JSON.stringify({
             event: "historical_match_archive_descriptor_failed",
             inviteId: task.inviteId,
             matchId: descriptor.matchId,
+            requestId: task.requestId,
             code: error instanceof Error ? error.message : "unknown",
           }),
         );
@@ -322,15 +434,7 @@ export async function processAutomatchProfileGameProjection(
       }
     }
     if (archiveFailed) throw firstArchiveFailure;
-    if (
-      (outbox.historicalMatches || []).length >
-      HISTORICAL_MATCH_ARCHIVE_BATCH_SIZE
-    ) {
-      return "continued";
-    }
-    return (await settleAutomatchProfileGameProjectionOutbox(task, state))
-      ? "projected"
-      : "superseded";
+    return await finishAutomatchProjectionBatch(task, state, now());
   } finally {
     await locks.release(lock, ownerId);
   }
@@ -705,6 +809,9 @@ async function repairInvalidAutomatchSweepEntry(
                       guestPlayerId: descriptor.guestPlayerId,
                       hostPlayerId: descriptor.hostPlayerId,
                       source: descriptor.source,
+                      ...(descriptor.retryNotBeforeMs === undefined
+                        ? {}
+                        : { retryNotBeforeMs: descriptor.retryNotBeforeMs }),
                     },
                   ]),
                 ),
@@ -815,7 +922,29 @@ export async function handleProfileGameProjectionMessage(
     return;
   }
   const now = dependencies.now || Date.now;
+  const taskContext = {
+    kind: task.kind,
+    ...("eventId" in task ? { eventId: task.eventId } : {}),
+    ...("inviteId" in task ? { inviteId: task.inviteId } : {}),
+    ...("requestId" in task ? { requestId: task.requestId } : {}),
+    ...("operationId" in task ? { operationId: task.operationId } : {}),
+  };
   try {
+    if (
+      task.kind === "event-profile-game-projection" &&
+      dependencies.forwardEventTasks
+    ) {
+      await env.EVENT_PROFILE_GAME_PROJECTION_QUEUE.send(task);
+      message.ack();
+      logger.info(
+        JSON.stringify({
+          event: "profile_game_projection_queue_processed",
+          ...taskContext,
+          status: "forwarded",
+        }),
+      );
+      return;
+    }
     const ownerId = crypto.randomUUID();
     const state = (
       dependencies.createStateRepository ||
@@ -910,7 +1039,7 @@ export async function handleProfileGameProjectionMessage(
     logger.info(
       JSON.stringify({
         event: "profile_game_projection_queue_processed",
-        kind: task.kind,
+        ...taskContext,
         status,
       }),
     );
@@ -921,7 +1050,8 @@ export async function handleProfileGameProjectionMessage(
     logger.error(
       JSON.stringify({
         event: "profile_game_projection_queue_failed",
-        kind: task.kind,
+        ...taskContext,
+        status: "retrying",
         ...(error instanceof ProfileGameProjectionLockFailure
           ? { lockScope: error.scope }
           : {}),
@@ -931,9 +1061,10 @@ export async function handleProfileGameProjectionMessage(
   }
 }
 
-export async function handleProfileGameProjectionQueue(
+async function handleProjectionQueue(
   batch: MessageBatch<unknown>,
   env: Env,
+  forwardEventTasks: boolean,
 ): Promise<void> {
   const state = createEventGameplayRepository(env);
   const rating = createRatingRepository(env, state);
@@ -941,7 +1072,21 @@ export async function handleProfileGameProjectionQueue(
   const eventRuntime = createEventProfileGameProjectionRuntime(env, { state });
   const locks = createProfileGameProjectionLockStore(env.PROFILE_GAMES_DB);
   for (const message of batch.messages) {
+    if (
+      !forwardEventTasks &&
+      parseProfileGameProjectionTask(message.body)?.kind !==
+        "event-profile-game-projection"
+    ) {
+      message.ack();
+      console.error(
+        JSON.stringify({
+          event: "event_profile_game_projection_queue_invalid_message",
+        }),
+      );
+      continue;
+    }
     await handleProfileGameProjectionMessage(message, env, {
+      forwardEventTasks,
       createLocks: () => locks,
       createEventRuntime: () => eventRuntime,
       createRating: () => rating,
@@ -949,6 +1094,20 @@ export async function handleProfileGameProjectionQueue(
       createRuntime: () => runtime,
     });
   }
+}
+
+export async function handleProfileGameProjectionQueue(
+  batch: MessageBatch<unknown>,
+  env: Env,
+): Promise<void> {
+  await handleProjectionQueue(batch, env, true);
+}
+
+export async function handleEventProfileGameProjectionQueue(
+  batch: MessageBatch<unknown>,
+  env: Env,
+): Promise<void> {
+  await handleProjectionQueue(batch, env, false);
 }
 
 async function sendProfileGameProjectionTasks(
@@ -1199,7 +1358,7 @@ export async function sweepEventProfileGameProjections(
     candidates: Array.from(candidateByEventId.values()),
     claim: (candidate) => claimEventSweepCandidate(state, candidate, nowMs),
     toTask: ({ task }) => task,
-    queue: env.PROFILE_GAME_PROJECTION_QUEUE,
+    queue: env.EVENT_PROFILE_GAME_PROJECTION_QUEUE,
     initialTasks: repairedTasks,
     fallbackErrorMessage: "profile-game-projection-claim-failed",
   });

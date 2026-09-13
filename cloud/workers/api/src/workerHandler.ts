@@ -27,10 +27,12 @@ import {
 } from "./telegramProjectionTasks.ts";
 import { sweepEventProgress } from "./eventProgress.ts";
 import {
+  handleEventProfileGameProjectionQueue,
   handleProfileGameProjectionQueue,
   handleProfileGameProjectionSweep,
 } from "./profileGameProjection.ts";
 import {
+  EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME,
   PROFILE_GAME_PROJECTION_QUEUE_NAME,
   type ProfileGameProjectionTask,
 } from "./profileGameProjectionTasks.ts";
@@ -226,6 +228,7 @@ async function handleQueue(
 ): Promise<void> {
   if (
     (batch.queue === PROFILE_GAME_PROJECTION_QUEUE_NAME ||
+      batch.queue === EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME ||
       batch.queue === TELEGRAM_PROJECTION_QUEUE_NAME) &&
     (await readAutomatchRuntimeControl(env.PROFILE_GAMES_DB)).state === "frozen"
   ) {
@@ -235,6 +238,7 @@ async function handleQueue(
   if (
     batch.queue === AUTH_RECOVERY_QUEUE_NAME ||
     batch.queue === PROFILE_GAME_PROJECTION_QUEUE_NAME ||
+    batch.queue === EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME ||
     batch.queue === TELEGRAM_PROJECTION_QUEUE_NAME
   ) {
     if (!(await profileBackgroundMutationsEnabled(env))) {
@@ -250,6 +254,9 @@ async function handleQueue(
   }
   if (batch.queue === PROFILE_GAME_PROJECTION_QUEUE_NAME) {
     return handleProfileGameProjectionQueue(batch, env);
+  }
+  if (batch.queue === EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME) {
+    return handleEventProfileGameProjectionQueue(batch, env);
   }
   if (batch.queue === WAGER_SETTLEMENT_QUEUE_NAME) {
     return handleWagerSettlementQueue(batch, env);

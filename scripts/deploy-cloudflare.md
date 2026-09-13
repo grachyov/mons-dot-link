@@ -117,6 +117,31 @@ Legacy wager messages forward unchanged to `WAGER_SETTLEMENT_QUEUE` without adde
 
 For rollback, retain both settlement queues and the attached consumer. Promote only the recorded compatible pre-split Worker version after verifying that its queue fallback handles unchanged wager payloads; it can consume the new queue using its existing settlement handler. Do not remove or purge queues, or apply old trigger configuration. Legacy Telegram DLQ entries can still contain settlement work and require canonical-state reconciliation before a specific replay.
 
+## Event navigation Queue rollout
+
+Event navigation previews use `EVENT_PROFILE_GAME_PROJECTION_QUEUE`, bound to `mons-link-event-profile-game-projection`, independently of rating, invite, automatch, and profile-link work in `mons-link-profile-game-projection`. The split preserves event task payloads, canonical event records, projection generations, and durable outboxes; it needs no database migration, write freeze, or Queue pause.
+
+Before promotion, prepare and validate a compatible rollback candidate with the new producer binding and an explicit route for the new queue to an event-capable projection consumer. Record its Version ID separately from the unmodified pre-split version. The old Worker routes unknown queue names to Telegram delivery, so that unmodified version is not a safe rollback after the new consumer is attached.
+
+Inspect the queue first and create it only if missing. Preserve an existing queue and its settings. Upload the validated rollback and release candidates during preparation:
+
+```sh
+npx wrangler queues create mons-link-event-profile-game-projection --message-retention-period-secs 345600 --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
+```
+
+Promote the explicit release Version ID, then attach only the new consumer and verify its settings. Keep existing delivery running; messages sent before attachment remain queued. Avoid `deploy:api:triggers` for this attachment because it also changes unrelated triggers:
+
+```sh
+npx wrangler queues consumer add mons-link-event-profile-game-projection mons-link-api --batch-size 1 --batch-timeout 1 --message-retries 100 --max-concurrency 5 --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
+npx wrangler queues consumer list mons-link-event-profile-game-projection --json --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
+```
+
+Resolve uncertain provisioning or attachment responses by inspecting remote state before retrying. Publish the affected Workflow definitions after promotion when their event repository or producer dependencies changed. Existing version-pinned Workflow instances can continue producing legacy tasks: the shared consumer forwards event tasks unchanged and acknowledges them only after the dedicated enqueue succeeds.
+
+Run `smoke:api`, authenticated reads of the affected scheduled event, and an isolated event preview check. Prepare the required authentication before promotion: event creation requires an approved admin profile. Use a new fixture event absent from the prize catalog with `isSundayMons: false` and `telegramAnnouncements: {invite: false, matches: false, results: false}`. Confirm its creator sees two participants in `/navigation/games/read` after a dedicated test profile joins, compare both preview identities with `/events/snapshot`, and remove the test participant before the scheduled start. Verify the legacy forwarding path using only the fixture's exact event/task identity. Check the approved live event read-only; do not join, remove, postpone, or resync it for verification. Correlate pending outbox recovery and queue processing with current projection generations, without artificial observation windows.
+
+Keep the new queue, its producer binding, and consumer attachment on rollback. Promote only the prepared compatible rollback Version ID, verify the dedicated and legacy paths again, and do not apply old trigger configuration. During recovery, preserve `EVENT_DB.event_profile_game_projection_outboxes` and projection fences. Its scheduled sweep can re-enqueue pending work after a delivery failure; investigate the exact event and request before replaying. Never purge queues, delete pending outboxes, or redirect event work into an unknown queue handler.
+
 ## Coordinated maintenance release
 
 Use maintenance only for a concrete schema, state-compatibility, resource-lifecycle, or incident requirement. Specify the affected stores, writer gates, Queues, leases, and recovery condition before applying controls. Prepare and validate candidates first. Preserve any maintenance or Queue pause state that predates the operation.
@@ -162,6 +187,7 @@ Pause the permanent profile-related Queues when a migration changes profile sche
 ```sh
 npx wrangler queues pause-delivery mons-link-auth-recovery --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 npx wrangler queues pause-delivery mons-link-profile-game-projection --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
+npx wrangler queues pause-delivery mons-link-event-profile-game-projection --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 npx wrangler queues pause-delivery mons-link-telegram-projection --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 npx wrangler queues pause-delivery mons-link-wager-settlement --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 ```
@@ -172,6 +198,7 @@ After applying the migration, inspect the expected schema, run `PRAGMA foreign_k
 npm run manage:profile-canonical -- --resume
 npx wrangler queues resume-delivery mons-link-auth-recovery --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 npx wrangler queues resume-delivery mons-link-profile-game-projection --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
+npx wrangler queues resume-delivery mons-link-event-profile-game-projection --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 npx wrangler queues resume-delivery mons-link-telegram-projection --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 npx wrangler queues resume-delivery mons-link-wager-settlement --config cloud/workers/api/wrangler.jsonc --env-file cloud/workers/api/release.env
 ```
@@ -264,7 +291,7 @@ The preflight must complete with `{"ok":true,"status":"ready"}`. It validates th
 
 ## Queue and Workflow operations
 
-`mons-link-profile-game-projection` owns rating, invite, automatch, event, and profile-link projections. `mons-link-telegram-projection` owns automatch, rating, and event Telegram projections. Profile-link catch-up jobs are written atomically with canonical ownership changes in `PROFILE_DB`; their Queue dispatch is recovered by the scheduled D1 sweep. Automatch and manual-session outboxes live in `PROFILE_GAMES_DB`; a durable transition journal coordinates create-only Durable Object match effects with canonical invite metadata, session receipts, and outboxes. Event transitions retain their own D1 intents and use idempotent invite-effect receipts. Event and rating outboxes remain in their owning D1 databases. Do not purge Queues or delete pending jobs or outboxes during incidents.
+`mons-link-profile-game-projection` owns rating, invite, automatch, and profile-link projections. `mons-link-event-profile-game-projection` owns event navigation previews; the shared queue forwards legacy event tasks to it. `mons-link-telegram-projection` owns automatch, rating, and event Telegram projections. Profile-link catch-up jobs are written atomically with canonical ownership changes in `PROFILE_DB`; their Queue dispatch is recovered by the scheduled D1 sweep. Automatch and manual-session outboxes live in `PROFILE_GAMES_DB`; a durable transition journal coordinates create-only Durable Object match effects with canonical invite metadata, session receipts, and outboxes. Event transitions retain their own D1 intents and use idempotent invite-effect receipts. Event and rating outboxes remain in their owning D1 databases. Do not purge Queues or delete pending jobs or outboxes during incidents.
 
 `mons-link-event-progress` owns scheduled event starts and retriable synchronization. Inspect every page of Workflow instances before schema maintenance when version-pinned work could still be active:
 

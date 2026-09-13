@@ -20,6 +20,7 @@ export type HistoricalMatchDescriptor = {
   guestPlayerId: string;
   hostPlayerId: string;
   matchId: string;
+  retryNotBeforeMs?: number;
   source: HistoricalMatchSource;
 };
 
@@ -62,13 +63,17 @@ export function buildHistoricalMatchPair(input: {
   return isHistoricalMatchPair(pair) ? pair : null;
 }
 
-export function buildTransitionHistoricalMatchPair(input: {
+export type TransitionHistoricalMatchClassification =
+  | { status: "ready"; pair: HistoricalMatchPair }
+  | { status: "unready" | "unavailable" };
+
+export function classifyTransitionHistoricalMatchPair(input: {
   guestMatch: unknown;
   guestPlayerId: unknown;
   hostMatch: unknown;
   hostPlayerId: unknown;
   matchId: unknown;
-}): HistoricalMatchPair | null {
+}): TransitionHistoricalMatchClassification {
   const pair = buildHistoricalMatchPair(input);
   const hostMatch = pair?.hostMatch;
   const guestMatch = pair?.guestMatch;
@@ -78,7 +83,7 @@ export function buildTransitionHistoricalMatchPair(input: {
     !guestMatch ||
     hostMatch.color === guestMatch.color
   ) {
-    return null;
+    return { status: "unavailable" };
   }
   let hostGame: Game | undefined;
   let guestGame: Game | undefined;
@@ -86,10 +91,10 @@ export function buildTransitionHistoricalMatchPair(input: {
     hostGame = parseGameFromMatchData({ Game }, hostMatch);
     guestGame = parseGameFromMatchData({ Game }, guestMatch);
   } catch {
-    return null;
+    return { status: "unavailable" };
   }
   if (!hostGame || !guestGame || hostGame.variant !== guestGame.variant) {
-    return null;
+    return { status: "unavailable" };
   }
   const history = buildOrderedMoveHistory(
     hostMatch,
@@ -108,22 +113,24 @@ export function buildTransitionHistoricalMatchPair(input: {
   ) {
     let move: string;
     if (replay.activeColor === Color.White) {
-      if (whiteIndex >= history.white.length) return null;
+      if (whiteIndex >= history.white.length) return { status: "unavailable" };
       move = history.white[whiteIndex++];
     } else if (replay.activeColor === Color.Black) {
-      if (blackIndex >= history.black.length) return null;
+      if (blackIndex >= history.black.length) return { status: "unavailable" };
       move = history.black[blackIndex++];
     } else {
-      return null;
+      return { status: "unavailable" };
     }
-    if (replay.playFen(move).kind === "invalid") return null;
+    if (replay.playFen(move).kind === "invalid")
+      return { status: "unavailable" };
     const replayFen = replay.toFen();
     hostFenSeen ||= hostMatch.fen === replayFen;
     guestFenSeen ||= guestMatch.fen === replayFen;
   }
-  if (!hostFenSeen || !guestFenSeen) return null;
+  if (!hostFenSeen || !guestFenSeen) return { status: "unavailable" };
   const finalFen = replay.toFen();
-  if (hostMatch.fen !== finalFen && guestMatch.fen !== finalFen) return null;
+  if (hostMatch.fen !== finalFen && guestMatch.fen !== finalFen)
+    return { status: "unavailable" };
   const stablePair = {
     ...pair,
     hostMatch: { ...hostMatch, gameVariant: hostGame.variant },
@@ -134,5 +141,14 @@ export function buildTransitionHistoricalMatchPair(input: {
     guestMatch.status === "surrendered" ||
     hostMatch.timer === MATCH_TIMER_TERMINAL ||
     guestMatch.timer === MATCH_TIMER_TERMINAL;
-  return externallyFinal || replay.winner !== undefined ? stablePair : null;
+  return externallyFinal || replay.winner !== undefined
+    ? { status: "ready", pair: stablePair }
+    : { status: "unready" };
+}
+
+export function buildTransitionHistoricalMatchPair(
+  input: Parameters<typeof classifyTransitionHistoricalMatchPair>[0],
+): HistoricalMatchPair | null {
+  const result = classifyTransitionHistoricalMatchPair(input);
+  return result.status === "ready" ? result.pair : null;
 }

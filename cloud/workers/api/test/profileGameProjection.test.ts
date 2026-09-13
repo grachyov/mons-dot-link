@@ -893,7 +893,7 @@ test("automatch projection settles descriptors already archived in D1", async ()
   assert.equal(values.get(outboxPath), null);
 });
 
-test("automatch projection retries partial sources even when D1 has a row", async () => {
+test("automatch projection defers partial sources even when D1 has a row", async () => {
   const outboxPath = "profileGameProjectionOutbox/automatch/auto_aaaaaaaaaaa";
   const values = new Map<string, unknown>([
     [
@@ -925,8 +925,8 @@ test("automatch projection retries partial sources even when D1 has a row", asyn
       },
     ],
   ]);
-  await assert.rejects(
-    processAutomatchProfileGameProjection(
+  assert.equal(
+    await processAutomatchProfileGameProjection(
       automatchTask(),
       projectionLockState(values),
       {
@@ -947,7 +947,7 @@ test("automatch projection retries partial sources even when D1 has a row", asyn
       () => 300,
       silentLogger,
     ),
-    /historical-match-source-unavailable/,
+    "deferred",
   );
   assert.notEqual(values.get(outboxPath), null);
 });
@@ -1075,8 +1075,8 @@ test("automatch projection settles later descriptors when an earlier one retries
     ],
   ]);
   const archived: string[] = [];
-  await assert.rejects(
-    processAutomatchProfileGameProjection(
+  assert.equal(
+    await processAutomatchProfileGameProjection(
       automatchTask(),
       projectionLockState(values),
       {
@@ -1096,7 +1096,7 @@ test("automatch projection settles later descriptors when an earlier one retries
       () => 300,
       silentLogger,
     ),
-    /historical-match-source-unavailable/,
+    "deferred",
   );
   assert.deepEqual(archived, [finalMatchId]);
   assert.deepEqual(
@@ -2231,6 +2231,7 @@ test("event recovery claims due outboxes and repairs malformed records", async (
       {
         ...TELEGRAM_TEST_ENV,
         PROFILE_GAME_PROJECTION_QUEUE: queue,
+        EVENT_PROFILE_GAME_PROJECTION_QUEUE: queue,
       },
       {
         createRequestId: () => requestIds.shift() || "unexpected",
@@ -2388,6 +2389,7 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
       {
         ...TELEGRAM_TEST_ENV,
         PROFILE_GAME_PROJECTION_QUEUE: queue,
+        EVENT_PROFILE_GAME_PROJECTION_QUEUE: queue,
       },
       {
         createRequestId: () => requestIds.shift() || "unexpected",
@@ -2500,9 +2502,15 @@ for (const kind of ["automatch", "event"] as const) {
         sweep(
           {
             ...TELEGRAM_TEST_ENV,
-            PROFILE_GAME_PROJECTION_QUEUE: {
+            [kind === "event"
+              ? "EVENT_PROFILE_GAME_PROJECTION_QUEUE"
+              : "PROFILE_GAME_PROJECTION_QUEUE"]: {
               ...TELEGRAM_TEST_ENV.PROFILE_GAME_PROJECTION_QUEUE,
-              async sendBatch(messages) {
+              async sendBatch(
+                messages: Iterable<
+                  MessageSendRequest<ProfileGameProjectionTask>
+                >,
+              ) {
                 batches.push(Array.from(messages, ({ body }) => body));
                 if (failSend) throw queueFailure;
                 return {
@@ -2608,6 +2616,7 @@ test("profile-link recovery claims due markers on the existing Queue", async () 
       {
         ...TELEGRAM_TEST_ENV,
         PROFILE_GAME_PROJECTION_QUEUE: queue,
+        EVENT_PROFILE_GAME_PROJECTION_QUEUE: queue,
       },
       {
         createProfileLinkJobs: () => profileLinkJobs(values),

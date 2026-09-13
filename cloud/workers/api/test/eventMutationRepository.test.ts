@@ -69,8 +69,8 @@ function fixture(
   };
   const env: Env = {
     ...TELEGRAM_TEST_ENV,
-    PROFILE_GAME_PROJECTION_QUEUE: {
-      ...TELEGRAM_TEST_ENV.PROFILE_GAME_PROJECTION_QUEUE,
+    EVENT_PROFILE_GAME_PROJECTION_QUEUE: {
+      ...TELEGRAM_TEST_ENV.EVENT_PROFILE_GAME_PROJECTION_QUEUE,
       async send(task) {
         await dispatch("profile", task);
         return TELEGRAM_TEST_ENV.PROFILE_GAME_PROJECTION_QUEUE.send();

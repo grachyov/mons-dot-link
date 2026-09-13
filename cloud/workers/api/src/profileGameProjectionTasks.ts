@@ -3,6 +3,8 @@ import { isSafeOperationId } from "./operationIds.ts";
 
 export const PROFILE_GAME_PROJECTION_QUEUE_NAME =
   "mons-link-profile-game-projection";
+export const EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME =
+  "mons-link-event-profile-game-projection";
 export const PROFILE_GAME_PROJECTION_SCHEMA_VERSION = 1;
 
 export type RatingProfileGameProjectionTask = {

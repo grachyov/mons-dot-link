@@ -3,6 +3,7 @@ import { PROFILE_GAME_PROJECTION_SCHEMA_VERSION } from "./profileGameProjectionT
 import type { HistoricalMatchDescriptor } from "./historicalMatches.ts";
 
 export type AutomatchProfileGameProjectionOutbox = {
+  archiveRetry?: { requestId: string; notBeforeMs: number };
   historicalMatches?: HistoricalMatchDescriptor[];
   lastQueuedAtMs: number;
   reason: string;
@@ -38,6 +39,7 @@ export function salvageHistoricalMatchDescriptors(
     const hostPlayerId = record?.hostPlayerId;
     const guestPlayerId = record?.guestPlayerId;
     const source = record?.source;
+    const retryNotBeforeMs = record?.retryNotBeforeMs;
     return isSafeRecordKey(matchId) &&
       typeof hostPlayerId === "string" &&
       isSafeRecordKey(hostPlayerId) &&
@@ -55,6 +57,11 @@ export function salvageHistoricalMatchDescriptors(
             guestPlayerId,
             finalizedAtMs,
             source,
+            ...(typeof retryNotBeforeMs === "number" &&
+            Number.isSafeInteger(retryNotBeforeMs) &&
+            retryNotBeforeMs >= 0
+              ? { retryNotBeforeMs }
+              : {}),
           },
         ]
       : [];
@@ -65,6 +72,7 @@ export function parseAutomatchProfileGameProjectionOutbox(
   value: unknown,
 ): AutomatchProfileGameProjectionOutbox | null {
   const record = toRecord(value);
+  const archiveRetry = toRecord(record?.archiveRetry);
   const sourceUpdatedAtMs = record?.sourceUpdatedAtMs;
   const lastQueuedAtMs = record?.lastQueuedAtMs;
   const reason =
@@ -97,6 +105,18 @@ export function parseAutomatchProfileGameProjectionOutbox(
         sourceUpdatedAtMs: Math.floor(sourceUpdatedAtMs),
         lastQueuedAtMs: Math.floor(lastQueuedAtMs),
         ...(historicalMatches.length > 0 ? { historicalMatches } : {}),
+        ...(typeof archiveRetry?.requestId === "string" &&
+        isSafeRecordKey(archiveRetry.requestId) &&
+        typeof archiveRetry.notBeforeMs === "number" &&
+        Number.isSafeInteger(archiveRetry.notBeforeMs) &&
+        archiveRetry.notBeforeMs >= 0
+          ? {
+              archiveRetry: {
+                requestId: archiveRetry.requestId,
+                notBeforeMs: archiveRetry.notBeforeMs,
+              },
+            }
+          : {}),
       }
     : null;
 }
