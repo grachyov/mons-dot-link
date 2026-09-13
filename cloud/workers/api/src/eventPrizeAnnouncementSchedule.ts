@@ -15,6 +15,7 @@ import {
 } from "./eventProgress.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
+import type { EventProgressWorkExecutor } from "./eventProgressExecution.ts";
 import {
   commitPreparedEventMutation,
   createEventMutationReads,
@@ -102,6 +103,7 @@ async function scheduleEventAnnouncement(
   event: unknown,
   nowMs: number,
   kind: EventAnnouncementKind,
+  execute: EventProgressWorkExecutor = (_workflowId, work) => work(),
 ): Promise<void> {
   const candidate = await buildEventAnnouncementPlan(
     eventId,
@@ -110,11 +112,13 @@ async function scheduleEventAnnouncement(
     kind,
   );
   if (!candidate) return;
-  const plan = await preserveSchedule(repository, candidate);
-  await repository.commitEventPlan([
-    { kind: "progress-outbox", outboxId: plan.outboxId, value: plan.outbox },
-  ]);
-  await ensureEventProgressWorkflow(env, plan);
+  await execute(candidate.workflowId, async () => {
+    const plan = await preserveSchedule(repository, candidate);
+    await repository.commitEventPlan([
+      { kind: "progress-outbox", outboxId: plan.outboxId, value: plan.outbox },
+    ]);
+    await ensureEventProgressWorkflow(env, plan);
+  });
 }
 
 export const scheduleEventPrizeAnnouncement = (
@@ -132,10 +136,19 @@ export async function scheduleEventAnnouncements(
   eventId: string,
   event: unknown,
   nowMs: number,
+  execute?: EventProgressWorkExecutor,
 ): Promise<void> {
   const results = await Promise.allSettled(
     EVENT_ANNOUNCEMENT_KINDS.map((kind) =>
-      scheduleEventAnnouncement(env, repository, eventId, event, nowMs, kind),
+      scheduleEventAnnouncement(
+        env,
+        repository,
+        eventId,
+        event,
+        nowMs,
+        kind,
+        execute,
+      ),
     ),
   );
   const failures = results.flatMap((result) =>

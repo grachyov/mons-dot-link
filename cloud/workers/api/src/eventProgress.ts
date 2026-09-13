@@ -1,3 +1,11 @@
+import {
+  buildEventProgressPlan,
+  parseEventProgressOutbox,
+  parseEventProgressParams,
+  workflowIdFromOutboxId,
+  type EventProgressPlan,
+  type EventProgressWorkflowParams,
+} from "./eventProgressCodec.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import type {
   WorkflowEvent,
@@ -11,10 +19,7 @@ import {
   type RatingEventProgressRepository,
 } from "./gameplayRepository.ts";
 import { createD1EventPrizeWithdrawalReader } from "./eventPrizeWithdrawalD1.ts";
-import {
-  createEventRuntime,
-  type EventProgressOutboxRecord,
-} from "../../../runtime/events.js";
+import { createEventRuntime } from "../../../runtime/events.js";
 import { createEventLockManagerCore } from "../../../runtime/events/lockManagerCore.js";
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
 import { requireProfileOwnershipSnapshot } from "./profileOwnership.ts";
@@ -25,6 +30,10 @@ import {
 import { createEventMutationRepository } from "./eventMutationRepository.ts";
 import { scheduleEventAnnouncements } from "./eventPrizeAnnouncementSchedule.ts";
 import { EVENT_ANNOUNCEMENT_SPECS } from "./eventAnnouncementKinds.ts";
+import {
+  createEventProgressWorkExecutor,
+  type EventProgressWorkExecutor,
+} from "./eventProgressExecution.ts";
 import {
   createEventScheduledRecoveryStore,
   SCHEDULED_EVENT_RECOVERY_MARGIN_MS,
@@ -39,30 +48,23 @@ import {
   type EventWriteAdmission,
 } from "./eventD1.ts";
 
+export {
+  buildEventProgressPlan,
+  parseEventProgressOutbox,
+  parseEventProgressParams,
+  type EventProgressPlan,
+  type EventProgressWorkflowParams,
+} from "./eventProgressCodec.ts";
+
 const EVENT_PROGRESS_OUTBOX_ROOT = "eventProgressOutbox";
 const EVENT_PROGRESS_OUTBOX_DEAD_ROOT = "eventProgressOutboxDead";
-const EVENT_PROGRESS_SCHEMA_VERSION = 1;
 const EVENT_PROGRESS_WORKER_UID = "event-progress-worker";
 const EVENT_PROGRESS_SWEEP_LIMIT = PROFILE_BACKGROUND_SWEEP_LIMIT;
 const EVENT_PROGRESS_SWEEP_CONCURRENCY = 10;
+const EVENT_PROGRESS_OUTBOX_CONCURRENCY = 5;
+const EVENT_PROGRESS_RATING_CONCURRENCY = 5;
 const EVENT_PROGRESS_TIMEOUT_MS = 30_000;
 const RATING_EVENT_PROGRESS_SCHEMA_VERSION = 1;
-
-export type EventProgressWorkflowParams = {
-  schemaVersion: 1;
-  eventId: string;
-  outboxId: string;
-  reason: string;
-  runAtMs: number | null;
-  sourceKey: string;
-};
-
-export type EventProgressPlan = {
-  outbox: EventProgressOutboxRecord;
-  outboxId: string;
-  params: EventProgressWorkflowParams;
-  workflowId: string;
-};
 
 export type EventProgressWorkflowResult = {
   status: "applied" | "not-found";
@@ -110,12 +112,6 @@ export class EventProgressRetryableError extends Error {
   }
 }
 
-function toRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
 export function createEventRuntimeStore(
   repository: EventGameplayRepository,
   signal?: AbortSignal,
@@ -132,138 +128,6 @@ export function createEventRuntimeStore(
     transactProfileEventPrize: (profileId, eventId, updater) =>
       repository.transactProfileEventPrize(profileId, eventId, updater, signal),
   };
-}
-
-function bytesToHex(value: ArrayBuffer): string {
-  return Array.from(new Uint8Array(value), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
-async function digestIdentity(eventId: string, sourceKey: string) {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(`${eventId}\n${sourceKey}`),
-  );
-  return bytesToHex(digest);
-}
-
-export async function buildEventProgressPlan(
-  input: {
-    eventId: string;
-    sourceKey: string;
-    reason: string;
-    runAtMs?: number | null;
-  },
-  nowMs = Date.now(),
-): Promise<EventProgressPlan> {
-  const digest = await digestIdentity(input.eventId, input.sourceKey);
-  const outboxId = `ep_${digest}`;
-  const workflowId = `event-progress-${digest}`;
-  const runAtMs = input.runAtMs ?? null;
-  const outbox = {
-    schemaVersion: EVENT_PROGRESS_SCHEMA_VERSION,
-    eventId: input.eventId,
-    sourceKey: input.sourceKey,
-    reason: input.reason,
-    runAtMs,
-    firstQueuedAtMs: nowMs,
-    lastQueuedAtMs: nowMs,
-  } satisfies EventProgressOutboxRecord;
-  return {
-    outbox,
-    outboxId,
-    workflowId,
-    params: {
-      schemaVersion: EVENT_PROGRESS_SCHEMA_VERSION,
-      eventId: input.eventId,
-      outboxId,
-      reason: input.reason,
-      runAtMs,
-      sourceKey: input.sourceKey,
-    },
-  };
-}
-
-export async function parseEventProgressOutbox(
-  outboxId: string,
-  value: unknown,
-): Promise<EventProgressPlan | null> {
-  const record = toRecord(value);
-  const runAtMs = record?.runAtMs;
-  const firstQueuedAtMs = record?.firstQueuedAtMs;
-  const lastQueuedAtMs = record?.lastQueuedAtMs;
-  if (
-    !record ||
-    record.schemaVersion !== EVENT_PROGRESS_SCHEMA_VERSION ||
-    !isSafeRecordKey(record.eventId) ||
-    typeof record.sourceKey !== "string" ||
-    !record.sourceKey.trim() ||
-    typeof record.reason !== "string" ||
-    !record.reason.trim() ||
-    (runAtMs !== null &&
-      (typeof runAtMs !== "number" ||
-        !Number.isSafeInteger(runAtMs) ||
-        runAtMs < 0)) ||
-    typeof firstQueuedAtMs !== "number" ||
-    !Number.isSafeInteger(firstQueuedAtMs) ||
-    typeof lastQueuedAtMs !== "number" ||
-    !Number.isSafeInteger(lastQueuedAtMs)
-  ) {
-    return null;
-  }
-  const digest = outboxId.startsWith("ep_") ? outboxId.slice(3) : "";
-  if (
-    !/^[0-9a-f]{64}$/.test(digest) ||
-    digest !== (await digestIdentity(record.eventId, record.sourceKey))
-  ) {
-    return null;
-  }
-  const outbox = {
-    schemaVersion: EVENT_PROGRESS_SCHEMA_VERSION,
-    eventId: record.eventId,
-    sourceKey: record.sourceKey,
-    reason: record.reason,
-    runAtMs,
-    firstQueuedAtMs,
-    lastQueuedAtMs,
-  } satisfies EventProgressOutboxRecord;
-  return {
-    outbox,
-    outboxId,
-    workflowId: `event-progress-${digest}`,
-    params: {
-      schemaVersion: EVENT_PROGRESS_SCHEMA_VERSION,
-      eventId: outbox.eventId,
-      outboxId,
-      reason: outbox.reason,
-      runAtMs: outbox.runAtMs,
-      sourceKey: outbox.sourceKey,
-    },
-  };
-}
-
-export async function parseEventProgressParams(
-  value: unknown,
-): Promise<EventProgressWorkflowParams | null> {
-  const record = toRecord(value);
-  if (
-    !record ||
-    Object.keys(record).length !== 6 ||
-    typeof record.outboxId !== "string"
-  ) {
-    return null;
-  }
-  const plan = await parseEventProgressOutbox(record.outboxId, {
-    schemaVersion: record.schemaVersion,
-    eventId: record.eventId,
-    sourceKey: record.sourceKey,
-    reason: record.reason,
-    runAtMs: record.runAtMs,
-    firstQueuedAtMs: 0,
-    lastQueuedAtMs: 0,
-  });
-  return plan?.params || null;
 }
 
 async function withEventProgressDispatchAdmission(
@@ -391,19 +255,27 @@ async function forEachConcurrent<T>(
   operation: (value: T) => Promise<void>,
 ): Promise<void> {
   let index = 0;
+  const failures: unknown[] = [];
   const runners = Array.from(
     { length: Math.min(limit, values.length) },
     async () => {
       while (index < values.length) {
         const value = values[index];
         index += 1;
-        await operation(value);
+        try {
+          await operation(value);
+        } catch (error) {
+          failures.push(error);
+        }
       }
     },
   );
   const results = await Promise.allSettled(runners);
-  const failure = results.find((result) => result.status === "rejected");
-  if (failure?.status === "rejected") throw failure.reason;
+  failures.push(...rejectedReasons(results));
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "event-progress-records-failed");
+  }
 }
 
 async function reconcileScheduledEvents(
@@ -411,6 +283,7 @@ async function reconcileScheduledEvents(
   repository: EventProgressSweepRepository,
   recovery: EventScheduledRecoveryStore,
   now: () => number,
+  execute: EventProgressWorkExecutor,
 ): Promise<void> {
   const discoveredAtMs = now();
   const maxLeadMs = Math.max(
@@ -441,6 +314,7 @@ async function reconcileScheduledEvents(
         eventId,
         event,
         discoveredAtMs,
+        execute,
       ),
       (async () => {
         const plan = await buildEventProgressPlan(
@@ -452,19 +326,21 @@ async function reconcileScheduledEvents(
           },
           discoveredAtMs,
         );
-        const existing = await repository.readEventProgressOutbox(
-          plan.outboxId,
-        );
-        if (existing === null) {
-          await repository.commitEventPlan([
-            {
-              kind: "progress-outbox",
-              outboxId: plan.outboxId,
-              value: plan.outbox,
-            },
-          ]);
-        }
-        await dispatchOutboxPlan(env, repository, plan, now);
+        await execute(plan.workflowId, async () => {
+          const existing = await repository.readEventProgressOutbox(
+            plan.outboxId,
+          );
+          if (existing === null) {
+            await repository.commitEventPlan([
+              {
+                kind: "progress-outbox",
+                outboxId: plan.outboxId,
+                value: plan.outbox,
+              },
+            ]);
+          }
+          await dispatchOutboxPlan(env, repository, plan, now);
+        });
       })(),
     ]);
     const eventFailures = rejectedReasons(results);
@@ -527,6 +403,7 @@ async function recoverRatingEventProgress(
   repository: EventProgressSweepRepository,
   ratingRepository: EventProgressRatingRepository,
   now: () => number,
+  execute: EventProgressWorkExecutor,
 ): Promise<void> {
   const nowMs = now();
   const records = await ratingRepository.listDueRatingEventProgress(
@@ -535,7 +412,7 @@ async function recoverRatingEventProgress(
   );
   await forEachConcurrent(
     records,
-    EVENT_PROGRESS_SWEEP_CONCURRENCY,
+    EVENT_PROGRESS_RATING_CONCURRENCY,
     async (record) => {
       const claimed = await ratingRepository.claimRatingEventProgress(
         record.operationId,
@@ -568,19 +445,21 @@ async function recoverRatingEventProgress(
         },
         nowMs,
       );
-      await repository.commitEventPlan([
-        {
-          kind: "progress-outbox",
-          outboxId: plan.outboxId,
-          value: plan.outbox,
-        },
-      ]);
-      await dispatchOutboxPlan(env, repository, plan, now);
-      await ratingRepository.markRatingEventProgress(
-        record.operationId,
-        "done",
-        now(),
-      );
+      await execute(plan.workflowId, async () => {
+        await repository.commitEventPlan([
+          {
+            kind: "progress-outbox",
+            outboxId: plan.outboxId,
+            value: plan.outbox,
+          },
+        ]);
+        await dispatchOutboxPlan(env, repository, plan, now);
+        await ratingRepository.markRatingEventProgress(
+          record.operationId,
+          "done",
+          now(),
+        );
+      });
     },
   );
 }
@@ -601,6 +480,46 @@ export async function sweepEventProgress(
   );
 }
 
+async function sweepPersistedEventProgressOutboxes(
+  env: Env,
+  repository: EventProgressSweepRepository,
+  now: () => number,
+  execute: EventProgressWorkExecutor,
+): Promise<void> {
+  const records = await repository.listDueEventProgressOutboxes(
+    Number.MAX_SAFE_INTEGER,
+    EVENT_PROGRESS_SWEEP_LIMIT,
+  );
+  await forEachConcurrent(
+    records,
+    EVENT_PROGRESS_OUTBOX_CONCURRENCY,
+    async ({ outboxId: rawOutboxId, record }) => {
+      const outboxId = String(rawOutboxId);
+      const plan = await parseEventProgressOutbox(outboxId, record);
+      if (plan) {
+        await execute(plan.workflowId, () =>
+          dispatchOutboxPlan(env, repository, plan, now),
+        );
+      } else {
+        const workflowId = workflowIdFromOutboxId(outboxId);
+        if (workflowId) {
+          await execute(workflowId, async () => {
+            const current = await repository.readEventProgressOutbox(outboxId);
+            if (
+              current === null ||
+              (await parseEventProgressOutbox(outboxId, current))
+            )
+              return;
+            await deadLetterOutbox(repository, outboxId, current, now());
+          });
+        } else {
+          await deadLetterOutbox(repository, outboxId, record, now());
+        }
+      }
+    },
+  );
+}
+
 async function sweepAdmittedEventProgress(
   env: Env,
   dependencies: EventProgressSweepDependencies,
@@ -614,45 +533,30 @@ async function sweepAdmittedEventProgress(
       ? null
       : dependencies.ratingRepository ||
         createRatingRepository(env, createEventGameplayRepository(env));
-  const records = await repository.listDueEventProgressOutboxes(
-    Number.MAX_SAFE_INTEGER,
-    EVENT_PROGRESS_SWEEP_LIMIT,
-  );
-  const plans: EventProgressPlan[] = [];
-  const invalidRecords: Array<{ outboxId: string; record: unknown }> = [];
-  for (const { outboxId: rawOutboxId, record } of records) {
-    const outboxId = String(rawOutboxId);
-    const plan = await parseEventProgressOutbox(outboxId, record);
-    if (plan) {
-      plans.push(plan);
-    } else {
-      invalidRecords.push({ outboxId, record });
-    }
-  }
-  const sweepResults = await Promise.allSettled([
-    forEachConcurrent(
-      invalidRecords,
-      EVENT_PROGRESS_SWEEP_CONCURRENCY,
-      async ({ outboxId, record }) =>
-        deadLetterOutbox(repository, outboxId, record, now()),
-    ),
-    forEachConcurrent(plans, EVENT_PROGRESS_SWEEP_CONCURRENCY, async (plan) =>
-      dispatchOutboxPlan(env, repository, plan, now),
-    ),
-  ]);
-  const reconciliationResults = await Promise.allSettled([
+  const execute = createEventProgressWorkExecutor();
+  const results = await Promise.allSettled([
+    sweepPersistedEventProgressOutboxes(env, repository, now, execute),
     reconcileScheduledEvents(
       env,
       repository,
       dependencies.scheduledRecovery ||
         createEventScheduledRecoveryStore(env.EVENT_DB, admission),
       now,
+      execute,
     ),
     ...(ratingRepository
-      ? [recoverRatingEventProgress(env, repository, ratingRepository, now)]
+      ? [
+          recoverRatingEventProgress(
+            env,
+            repository,
+            ratingRepository,
+            now,
+            execute,
+          ),
+        ]
       : []),
   ]);
-  const failures = rejectedReasons([...sweepResults, ...reconciliationResults]);
+  const failures = rejectedReasons(results);
   if (failures.length === 1) {
     throw failures[0];
   }

@@ -4,6 +4,7 @@ import {
 } from "./eventTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { EventJsonRecord } from "../../../runtime/eventReads.js";
 import {
   buildEventPrizeAnnouncementPlan,
   buildSundayMonsReminderPlan,
@@ -148,6 +149,429 @@ async function validOutbox() {
   );
   return { plan, value: { [plan.outboxId]: plan.outbox } };
 }
+
+function ratingRecoveryRecords(count = 1) {
+  return Array.from({ length: count }, (_, index) => ({
+    eventId: `rating-event-${index}`,
+    inviteId: `rating-invite-${index}`,
+    matchId: "match-1",
+    operationId: `rating-invite-${index}__match-1`,
+    updateTime: "2026-08-25T00:00:00Z",
+    version: 1,
+  }));
+}
+
+for (const scenario of ["outbox-read", "outbox-dispatch"] as const) {
+  test(
+    `scheduled and rating recovery continue while ${scenario} stalls and fails`,
+    { timeout: 10_000 },
+    async () => {
+      const nowMs = 1_000_000;
+      const eventId = "z3oj52Iiime";
+      const outbox = await validOutbox();
+      const healthyDispatched = Promise.withResolvers<void>();
+      const reasons = new Set<string>();
+      const failure = new Error(`${scenario}-failed`);
+      const environment = workflowEnvironment();
+      const create = environment.EVENT_PROGRESS_WORKFLOW.createBatch;
+      const get = environment.EVENT_PROGRESS_WORKFLOW.get;
+      environment.EVENT_PROGRESS_WORKFLOW.createBatch = async (items) => {
+        if (
+          scenario === "outbox-dispatch" &&
+          items[0].id === outbox.plan.workflowId
+        ) {
+          await healthyDispatched.promise;
+          throw failure;
+        }
+        for (const item of items) reasons.add(item.params!.reason);
+        if (reasons.size === 4) healthyDispatched.resolve();
+        return create(items);
+      };
+      environment.EVENT_PROGRESS_WORKFLOW.get = async (id) => {
+        if (scenario === "outbox-dispatch" && id === outbox.plan.workflowId)
+          throw failure;
+        return get(id);
+      };
+      const repository = sweepRepository(
+        scenario === "outbox-dispatch" ? outbox.value : {},
+      );
+      if (scenario === "outbox-read") {
+        repository.value.listDueEventProgressOutboxes = async () => {
+          await healthyDispatched.promise;
+          throw failure;
+        };
+      }
+      const recovery = scheduledRecovery({
+        [eventId]: {
+          isSundayMons: true,
+          startAtMs: nowMs + 14_400_000 + 30_000,
+        },
+      });
+      let ratingDone = false;
+      await assert.rejects(
+        sweepEventProgress(environment, {
+          now: () => nowMs,
+          repository: repository.value,
+          scheduledRecovery: recovery,
+          ratingRepository: {
+            listDueRatingEventProgress: async () => ratingRecoveryRecords(),
+            claimRatingEventProgress: async () => true,
+            markRatingEventProgress: async (_id, status) => {
+              ratingDone = status === "done";
+            },
+          },
+        }),
+        (error) => error === failure,
+      );
+      assert.deepEqual(
+        reasons,
+        new Set([
+          "scheduled-start-reconciliation",
+          "sunday-mons-reminder",
+          "event-prize-announcement",
+          "match-rating-updated",
+        ]),
+      );
+      assert.equal(ratingDone, true);
+      assert.equal((await recovery.readCursor()).revision, 1);
+    },
+  );
+}
+
+test(
+  "outbox and scheduled recovery continue while the rating query stalls and fails",
+  { timeout: 10_000 },
+  async () => {
+    const outbox = await validOutbox();
+    const healthyDispatched = Promise.withResolvers<void>();
+    const reasons = new Set<string>();
+    const environment = workflowEnvironment();
+    const create = environment.EVENT_PROGRESS_WORKFLOW.createBatch;
+    environment.EVENT_PROGRESS_WORKFLOW.createBatch = async (items) => {
+      for (const item of items) reasons.add(item.params!.reason);
+      if (reasons.size === 2) healthyDispatched.resolve();
+      return create(items);
+    };
+    await assert.rejects(
+      sweepEventProgress(environment, {
+        now: () => 1_000,
+        repository: sweepRepository(outbox.value).value,
+        scheduledRecovery: scheduledRecovery({
+          scheduled: { startAtMs: 10_000 },
+        }),
+        ratingRepository: {
+          listDueRatingEventProgress: async () => {
+            await healthyDispatched.promise;
+            throw new Error("rating-read-failed");
+          },
+          claimRatingEventProgress: async () => true,
+          markRatingEventProgress: async () => {},
+        },
+      }),
+      /rating-read-failed/,
+    );
+    assert.deepEqual(
+      reasons,
+      new Set(["test", "scheduled-start-reconciliation"]),
+    );
+  },
+);
+
+test(
+  "recovery reserves ten scheduled slots and five slots each for mixed outboxes and ratings",
+  { timeout: 10_000 },
+  async () => {
+    const release = Promise.withResolvers<void>();
+    const full = Promise.withResolvers<void>();
+    const active = { outbox: 0, rating: 0, scheduled: 0 };
+    const maximum = { ...active };
+    const wait = async (lane: keyof typeof active) => {
+      active[lane]++;
+      maximum[lane] = Math.max(maximum[lane], active[lane]);
+      if (active.outbox === 5 && active.rating === 5 && active.scheduled === 10)
+        full.resolve();
+      await release.promise;
+      active[lane]--;
+    };
+    const outboxes = await Promise.all(
+      Array.from({ length: 10 }, async (_, index) => {
+        if (index % 2) return [`bad-${index}`, { schemaVersion: 2 }] as const;
+        const plan = await buildEventProgressPlan(
+          {
+            eventId: `outbox-${index}`,
+            sourceKey: `test-${index}`,
+            reason: "outbox",
+          },
+          100,
+        );
+        return [plan.outboxId, plan.outbox] as const;
+      }),
+    );
+    const environment = workflowEnvironment();
+    const create = environment.EVENT_PROGRESS_WORKFLOW.createBatch;
+    environment.EVENT_PROGRESS_WORKFLOW.createBatch = async (items) => {
+      const reason = items[0].params!.reason;
+      if (reason === "outbox") await wait("outbox");
+      if (reason === "scheduled-start-reconciliation") await wait("scheduled");
+      return create(items);
+    };
+    const repository = sweepRepository(
+      Object.fromEntries(outboxes),
+      async (updates) => {
+        if (
+          Object.keys(updates).some((path) =>
+            path.startsWith(`${EVENT_PROGRESS_OUTBOX_DEAD_ROOT}/`),
+          )
+        )
+          await wait("outbox");
+      },
+    );
+    const events = Object.fromEntries(
+      Array.from({ length: 25 }, (_, index) => [
+        `scheduled-${index}`,
+        { startAtMs: 10_000 },
+      ]),
+    );
+    const sweep = sweepEventProgress(environment, {
+      now: () => 1_000,
+      repository: repository.value,
+      scheduledRecovery: scheduledRecovery(events),
+      ratingRepository: {
+        listDueRatingEventProgress: async () => ratingRecoveryRecords(10),
+        claimRatingEventProgress: async () => {
+          await wait("rating");
+          return true;
+        },
+        markRatingEventProgress: async () => {},
+      },
+    });
+    await full.promise;
+    assert.deepEqual(maximum, { outbox: 5, rating: 5, scheduled: 10 });
+    release.resolve();
+    await sweep;
+    assert.deepEqual(maximum, { outbox: 5, rating: 5, scheduled: 10 });
+  },
+);
+
+test("failed records cannot exhaust outbox or rating runners before the rest of the page", async () => {
+  const outboxes = await Promise.all(
+    Array.from({ length: 10 }, async (_, index) => {
+      if (index < 5) return [`bad-${index}`, { schemaVersion: 2 }] as const;
+      const plan = await buildEventProgressPlan(
+        {
+          eventId: `outbox-${index}`,
+          sourceKey: `test-${index}`,
+          reason: "outbox",
+        },
+        100,
+      );
+      return [plan.outboxId, plan.outbox] as const;
+    }),
+  );
+  let dispatched = 0;
+  const claimed: string[] = [];
+  const done: string[] = [];
+  const repository = sweepRepository(
+    Object.fromEntries(outboxes),
+    async (updates) => {
+      if (
+        Object.keys(updates).some((path) =>
+          path.startsWith(`${EVENT_PROGRESS_OUTBOX_DEAD_ROOT}/`),
+        )
+      )
+        throw new Error("invalid-outbox-write-failed");
+    },
+  );
+  await assert.rejects(
+    sweepEventProgress(workflowEnvironment({ onCreate: () => dispatched++ }), {
+      now: () => 1_000,
+      repository: repository.value,
+      scheduledRecovery: scheduledRecovery({}),
+      ratingRepository: {
+        listDueRatingEventProgress: async () => ratingRecoveryRecords(10),
+        claimRatingEventProgress: async (id) => {
+          claimed.push(id);
+          if (claimed.length <= 5) throw new Error("rating-claim-failed");
+          return true;
+        },
+        markRatingEventProgress: async (id, status) => {
+          if (status === "done") done.push(id);
+        },
+      },
+    }),
+    (error) => error instanceof AggregateError && error.errors.length === 2,
+  );
+  assert.equal(dispatched, 10);
+  assert.equal(claimed.length, 10);
+  assert.equal(done.length, 5);
+});
+
+for (const kind of ["start", "reminder"] as const) {
+  test(
+    `same-ID ${kind} scheduling waits for outbox recreation and executes freshly`,
+    { timeout: 10_000 },
+    async () => {
+      const nowMs = 1_000_000;
+      const eventId = "z3oj52Iiime";
+      const event = {
+        isSundayMons: kind === "reminder",
+        startAtMs: nowMs + 14_400_000 + 30_000,
+      };
+      const plan =
+        kind === "start"
+          ? await buildEventProgressPlan(
+              {
+                eventId,
+                sourceKey: `start:${eventId}:${event.startAtMs}`,
+                reason: "scheduled-start-reconciliation",
+                runAtMs: event.startAtMs,
+              },
+              100,
+            )
+          : await buildSundayMonsReminderPlan(
+              eventId,
+              { ...event, status: "scheduled" },
+              100,
+            );
+      assert.ok(plan);
+      const providerStarted = Promise.withResolvers<void>();
+      const candidatesRead = Promise.withResolvers<void>();
+      const recovery = scheduledRecovery({ [eventId]: event });
+      const listUrgent = recovery.listUrgent;
+      recovery.listUrgent = async (throughMs) => {
+        await providerStarted.promise;
+        const rows = await listUrgent(throughMs);
+        candidatesRead.resolve();
+        return rows;
+      };
+      let recreating = false;
+      let creates = 0;
+      let current: EventJsonRecord | null = plan.outbox;
+      const operations: string[] = [];
+      const repository: EventProgressSweepRepository = {
+        readEvent: async () => null,
+        listDueEventProgressOutboxes: async () => [
+          { outboxId: plan.outboxId, record: plan.outbox },
+        ],
+        readEventProgressOutbox: async (id) => {
+          if (id !== plan.outboxId) return null;
+          assert.equal(recreating, false);
+          operations.push("read");
+          return current;
+        },
+        commitEventPlan: async (commands) => {
+          for (const command of commands) {
+            if (
+              command.kind !== "progress-outbox" ||
+              command.outboxId !== plan.outboxId
+            )
+              continue;
+            assert.equal(recreating, false);
+            current = command.value;
+            operations.push(command.value === null ? "remove" : "publish");
+          }
+        },
+      };
+      const environment = workflowEnvironment();
+      const create = environment.EVENT_PROGRESS_WORKFLOW.createBatch;
+      const get = environment.EVENT_PROGRESS_WORKFLOW.get;
+      const original = await get(plan.workflowId);
+      environment.EVENT_PROGRESS_WORKFLOW.createBatch = async (items) => {
+        if (items[0].id === plan.workflowId) {
+          creates++;
+          operations.push(`create-${creates}`);
+          if (creates === 1) {
+            recreating = true;
+            providerStarted.resolve();
+            await candidatesRead.promise;
+          } else if (creates === 2) {
+            recreating = false;
+          }
+        }
+        return create(items);
+      };
+      environment.EVENT_PROGRESS_WORKFLOW.get = async (id) =>
+        id === plan.workflowId
+          ? {
+              ...original,
+              pause: () => original.pause(),
+              resume: () => original.resume(),
+              terminate: () => original.terminate(),
+              restart: () => original.restart(),
+              sendEvent: (event) => original.sendEvent(event),
+              status: async () => ({
+                status: creates === 1 ? "errored" : "complete",
+              }),
+              delete: async () => {
+                operations.push("delete");
+              },
+            }
+          : get(id);
+      await sweepEventProgress(environment, {
+        now: () => nowMs,
+        repository,
+        scheduledRecovery: recovery,
+        ratingRepository: null,
+      });
+      assert.equal(creates, 3);
+      assert.deepEqual(
+        operations,
+        kind === "start"
+          ? ["create-1", "delete", "create-2", "read", "create-3", "remove"]
+          : ["create-1", "delete", "create-2", "read", "publish", "create-3"],
+      );
+      assert.deepEqual(current, kind === "start" ? null : plan.outbox);
+    },
+  );
+}
+
+test(
+  "stale malformed outbox snapshots cannot delete an announcement repaired by another lane",
+  { timeout: 10_000 },
+  async () => {
+    const nowMs = 1_000_000;
+    const eventId = "z3oj52Iiime";
+    const event = {
+      status: "scheduled",
+      isSundayMons: true,
+      startAtMs: nowMs + 14_400_000 + 30_000,
+    };
+    const plan = await buildSundayMonsReminderPlan(eventId, event, nowMs);
+    assert.ok(plan);
+    const published = Promise.withResolvers<void>();
+    const malformed = { schemaVersion: 2 };
+    let current: EventJsonRecord | null = malformed;
+    const repository: EventProgressSweepRepository = {
+      readEvent: async () => null,
+      listDueEventProgressOutboxes: async () => {
+        await published.promise;
+        return [{ outboxId: plan.outboxId, record: malformed }];
+      },
+      readEventProgressOutbox: async (id) =>
+        id === plan.outboxId ? current : null,
+      commitEventPlan: async (commands) => {
+        for (const command of commands) {
+          assert.notEqual(command.kind, "progress-dead");
+          if (
+            command.kind === "progress-outbox" &&
+            command.outboxId === plan.outboxId
+          ) {
+            assert.notEqual(command.value, null);
+            current = command.value;
+            published.resolve();
+          }
+        }
+      },
+    };
+    await sweepEventProgress(workflowEnvironment(), {
+      now: () => nowMs,
+      repository,
+      scheduledRecovery: scheduledRecovery({ [eventId]: event }),
+      ratingRepository: null,
+    });
+    assert.deepEqual(current, plan.outbox);
+  },
+);
 
 test("scheduled-event sweep discovers both announcements and retains their first scheduling time", async () => {
   const eventId = "z3oj52Iiime";
@@ -381,7 +805,7 @@ test("a failed or malformed event cannot block later recovery rows or cursor pro
 for (const method of ["readCursor", "listPage"] as const) {
   test(
     `urgent recovery proceeds while ${method} stalls and then fails`,
-    { timeout: 2_000 },
+    { timeout: 10_000 },
     async () => {
       const nowMs = 1_000_000;
       const eventId = "z3oj52Iiime";
@@ -751,6 +1175,7 @@ test("dead-letters outbox records whose key mismatches their source", async () =
   const repository = sweepRepository({
     [mismatchedOutboxId]: outbox.plan.outbox,
   });
+  repository.value.readEventProgressOutbox = async () => outbox.plan.outbox;
   let workflowCreates = 0;
   await sweepEventProgress(
     workflowEnvironment({ onCreate: () => workflowCreates++ }),

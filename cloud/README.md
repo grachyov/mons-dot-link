@@ -22,6 +22,8 @@ Canonical ownership changes create catch-up work atomically in D1. The scheduled
 
 `AUTH_MUTATIONS_DISABLED` is the tracked auth maintenance switch. Change it through candidate upload and explicit promotion. Auth intents are consume-once and revision-fenced; do not manually edit active rows.
 
+The five-minute auth cleanup sweep processes at most 1,000 rows per deletion or compaction phase, ordered by age and ID. Retention periods and replay dependencies remain enforced; any remaining backlog continues on the next scheduled sweep.
+
 ### Auth recovery quarantine
 
 The recovery sweep quarantines malformed jobs by their raw profile ID and `CAST(revision AS TEXT)` token in `PROFILE_DB.profile_auth_recovery_quarantine`. It retains the canonical job unchanged and skips that revision on later sweeps; a changed revision is eligible again. Raw identifiers and snapshot comparisons preserve database bytes, including BLOBs and invalid UTF-8. Quarantine logs identify jobs using `profileIdHex` and `revisionHex`. Deleting a completed canonical job also removes its quarantine marker.
@@ -95,6 +97,8 @@ Match mutations notify subscribers immediately; the server checks for missed mat
 Event control supports `d1` and `frozen`. The event-progress Workflow owns scheduled starts and retriable synchronization; existing instances retain their IDs, payloads, and versioned code during compatible releases. Event mutation intents and both receipt stages preserve exact replay and cross-database consistency. Never bulk-delete admissions or detach pending intents.
 
 Scheduled-event recovery checks up to 1,000 events within the longest announcement lead plus ten minutes, then advances through 100 scheduled events using `EVENT_DB.event_scheduled_recovery_cursor`. The cursor wraps after the final page. Both lanes share concurrency ten and preserve existing Workflow and outbox identities. Urgent recovery runs independently of cursor and background reads; a failed recovery query preserves the cursor while available work still runs. Individual event failures are reported without blocking cursor progress; canonical events and outboxes remain available for retry. Checkpoint updates use revision comparisons under the event-write admission, so overlapping sweeps cannot overwrite newer progress. Do not manually reset the cursor to replay announcements.
+
+Scheduled-event recovery, persisted progress outboxes, and rating recovery run independently with reserved concurrency of ten, five, and five records respectively. Each sweep serializes work targeting the same Workflow ID and retains its write admission until every recovery task settles.
 
 `PROFILE_DB.invite_wager_states` owns proposals, agreements, settlement state, and resolution markers. Reserved balances, consumed operation tombstones, pending settlements, and replay records are current application data. Current wager incidents use `manage:wager-reservations` and canonical-profile maintenance. Reconcile uncertain effects before settling an expired admission.
 

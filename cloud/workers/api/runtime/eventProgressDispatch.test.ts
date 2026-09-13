@@ -1,11 +1,13 @@
 import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import { env } from "cloudflare:workers";
+import type { WorkflowStep } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { applyStrictMatchStateTestMigrations } from "./strictMatchStateTestFixture.ts";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   buildEventProgressPlan,
   ensureEventProgressWorkflow,
+  parseEventProgressOutbox,
   sweepEventProgress,
   type EventProgressPlan,
   type EventProgressSweepRepository,
@@ -13,6 +15,8 @@ import {
 import { readEventOwnedPath } from "./eventD1Fixture.ts";
 import { createEventStateRepository } from "../src/eventRepository.ts";
 import { applyEventTestMigrations } from "./eventTestMigrations.ts";
+import { buildSundayMonsReminderPlan } from "../src/eventPrizeAnnouncementSchedule.ts";
+import { runEventAnnouncementWorkflow } from "../src/eventPrizeAnnouncementWorkflow.ts";
 
 const testEnv = env as Env & {
   TEST_EVENT_D1_MIGRATIONS: D1Migration[];
@@ -213,6 +217,191 @@ describe("event-progress Workflow dispatch admissions", () => {
     expect(await admissionCount()).toBe(0);
   });
 
+  it.each(
+    (["publication-first", "cleanup-first"] as const).flatMap((order) => [
+      {
+        lane: "announcement" as const,
+        field: "firstQueuedAtMs" as const,
+        order,
+      },
+      ...(["schemaVersion", "sourceKey", "reason"] as const).flatMap((field) =>
+        (["announcement", "rating"] as const).map((lane) => ({
+          lane,
+          field,
+          order,
+        })),
+      ),
+    ]),
+  )(
+    "retains malformed $field audit for $lane with $order recovery",
+    async ({ lane, field, order }) => {
+      const { repository } = await seedOutbox();
+      const nowMs = 1_000_000;
+      const event = {
+        eventId,
+        status: "scheduled" as const,
+        isSundayMons: true,
+        startAtMs: nowMs + 14_400_000 + 30_000,
+      };
+      const plan =
+        lane === "announcement"
+          ? await buildSundayMonsReminderPlan(eventId, event, nowMs)
+          : await buildEventProgressPlan(
+              {
+                eventId,
+                sourceKey: "rating:rating-invite:match-1",
+                reason: "match-rating-updated",
+              },
+              nowMs,
+            );
+      if (!plan) throw new Error("missing-recovery-plan");
+      await repository.commitEventPlan([
+        { kind: "event-field", eventId, field: "status", value: event.status },
+        {
+          kind: "event-field",
+          eventId,
+          field: "startAtMs",
+          value: event.startAtMs,
+        },
+        { kind: "event-field", eventId, field: "isSundayMons", value: true },
+        {
+          kind: "progress-outbox",
+          outboxId: plan.outboxId,
+          value: plan.outbox,
+        },
+      ]);
+      const malformed: Record<string, unknown> = { ...plan.outbox };
+      if (field === "firstQueuedAtMs") delete malformed.firstQueuedAtMs;
+      else
+        malformed[field] =
+          field === "schemaVersion"
+            ? 2
+            : field === "sourceKey"
+              ? "mismatched-source"
+              : { invalid: true };
+      await testEnv.EVENT_DB.prepare(
+        "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+      )
+        .bind(JSON.stringify(malformed), plan.outboxId)
+        .run();
+      const published = Promise.withResolvers<void>();
+      const cleaned = Promise.withResolvers<void>();
+      const f = environment();
+      const ratingOutcomes: string[] = [];
+      await sweepEventProgress(f.value, {
+        now: () => nowMs,
+        ratingRepository:
+          lane === "rating"
+            ? {
+                listDueRatingEventProgress: async () => {
+                  if (order === "cleanup-first") await cleaned.promise;
+                  return [
+                    {
+                      eventId,
+                      inviteId: "rating-invite",
+                      matchId: "match-1",
+                      operationId: "rating-invite__match-1",
+                      updateTime: "1",
+                      version: 1,
+                    },
+                  ];
+                },
+                claimRatingEventProgress: async () => true,
+                markRatingEventProgress: async (operationId, state) => {
+                  expect(operationId).toBe("rating-invite__match-1");
+                  ratingOutcomes.push(state);
+                },
+              }
+            : null,
+        repository: {
+          ...repository,
+          async listDueEventProgressOutboxes() {
+            if (order === "publication-first") await published.promise;
+            return [{ outboxId: plan.outboxId, record: malformed }];
+          },
+          async commitEventPlan(commands) {
+            await repository.commitEventPlan(commands);
+            for (const command of commands) {
+              if (
+                command.kind !== "progress-outbox" ||
+                command.outboxId !== plan.outboxId
+              )
+                continue;
+              if (command.value === null) cleaned.resolve();
+              else published.resolve();
+            }
+          },
+        },
+        scheduledRecovery: {
+          readCursor: async () => ({ cursor: null, revision: 0 }),
+          listPage: async () => [],
+          listUrgent: async () => {
+            if (lane === "rating") return [];
+            if (order === "cleanup-first") await cleaned.promise;
+            return [{ cursor: { eventId, startAtMs: event.startAtMs }, event }];
+          },
+          checkpoint: async () => true,
+        },
+      });
+      expect(await repository.readEventProgressOutbox(plan.outboxId)).toEqual(
+        plan.outbox,
+      );
+      expect(
+        await parseEventProgressOutbox(
+          plan.outboxId,
+          await repository.readEventProgressOutbox(plan.outboxId),
+        ),
+      ).toEqual(plan);
+      expect(
+        await readEventOwnedPath(
+          testEnv.EVENT_DB,
+          `eventProgressOutboxDead/${plan.outboxId}`,
+        ),
+      ).toMatchObject({
+        reason: "invalid-event-progress-outbox",
+        originalRecord: malformed,
+      });
+      expect(await admissionCount()).toBe(0);
+      if (lane === "rating") {
+        expect(ratingOutcomes).toEqual(["done"]);
+        return;
+      }
+
+      const step = Object.create(null) as WorkflowStep;
+      step.sleepUntil = async () => {};
+      step.do = (async (
+        _name: string,
+        _options: unknown,
+        work: () => Promise<unknown>,
+      ) => work()) as WorkflowStep["do"];
+      let deliveries = 0;
+      const result = await runEventAnnouncementWorkflow(
+        {
+          payload: plan.params,
+          instanceId: plan.workflowId,
+          timestamp: new Date(nowMs),
+          workflowName: "mons-link-event-progress",
+        },
+        step,
+        {
+          now: () => plan.params.runAtMs!,
+          readOutbox: repository.readEventProgressOutbox,
+          acknowledge: (outboxId) =>
+            repository.commitEventPlan([
+              { kind: "progress-outbox", outboxId, value: null },
+            ]),
+          deliver: async () => {
+            deliveries++;
+            return { status: "sent" };
+          },
+          refreshReminder: async () => ({ status: "skipped" }),
+        },
+      );
+      expect(result).toEqual({ status: "sent" });
+      expect(deliveries).toBe(1);
+    },
+  );
+
   for (const status of ["waiting", "complete", "errored"] as const) {
     it(`prevents the gate from closing during ${status} dispatch and outbox publication`, async () => {
       const { plan, repository } = await seedOutbox();
@@ -272,6 +461,65 @@ describe("event-progress Workflow dispatch admissions", () => {
     await dispatch;
     expect(await admissionCount()).toBe(0);
     expect(await freezeEventGate()).toBe(true);
+  });
+
+  it("keeps the sweep admitted across a failed outbox lane and a delayed scheduled lane", async () => {
+    const { plan, repository } = await seedOutbox();
+    await repository.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}/status`]: "scheduled",
+        [`events/${eventId}/startAtMs`]: 10_000,
+      }),
+    );
+    const started = Promise.withResolvers<void>();
+    const failed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const f = environment();
+    const create = f.value.EVENT_PROGRESS_WORKFLOW.createBatch;
+    const get = f.value.EVENT_PROGRESS_WORKFLOW.get;
+    f.value.EVENT_PROGRESS_WORKFLOW.createBatch = async (items) => {
+      if (items[0].id === plan.workflowId)
+        throw new Error("outbox-dispatch-failed");
+      started.resolve();
+      await finish.promise;
+      return create(items);
+    };
+    f.value.EVENT_PROGRESS_WORKFLOW.get = async (id) => {
+      if (id === plan.workflowId) {
+        failed.resolve();
+        throw new Error("outbox-workflow-missing");
+      }
+      return get(id);
+    };
+    let completed = false;
+    const sweep = sweepEventProgress(f.value, {
+      repository,
+      now: () => 200,
+      ratingRepository: null,
+    }).then(
+      () => {
+        completed = true;
+        return null;
+      },
+      (error: unknown) => {
+        completed = true;
+        return error;
+      },
+    );
+    await Promise.all([started.promise, failed.promise]);
+    expect(completed).toBe(false);
+    expect(await admissionCount()).toBeGreaterThan(0);
+    expect(await freezeEventGate()).toBe(false);
+    finish.resolve();
+    expect(await sweep).toMatchObject({ message: "outbox-dispatch-failed" });
+    expect(await admissionCount()).toBe(0);
+    expect(await freezeEventGate()).toBe(true);
+    expect(
+      await readEventOwnedPath(
+        testEnv.EVENT_DB,
+        `eventProgressOutbox/${plan.outboxId}`,
+      ),
+    ).toEqual(plan.outbox);
   });
 
   it("retains the outbox and releases the admission when provider dispatch fails", async () => {

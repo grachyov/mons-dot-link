@@ -6,6 +6,7 @@ import {
   type LeaderboardReadType,
 } from "@mons/shared/profiles";
 import { buildUsernameLookupKey } from "@mons/shared/usernames";
+import { canonicalProfileRedirectCte } from "./redirectSql.ts";
 import {
   type CanonicalSortKey,
   CanonicalProfileCorruption,
@@ -493,20 +494,81 @@ export function resolveCanonicalProfile(
   );
 }
 
-export function resolveCanonicalPublicProfile(
+export async function resolveCanonicalPublicProfile(
   db: D1Database,
   profileId: string,
   redirectLimit = CANONICAL_PROFILE_INTERNAL_REDIRECT_LIMIT,
   onRedirectFailure: "null" | "throw" = "throw",
 ): Promise<CanonicalPublicProfileSnapshot | null> {
-  return resolveCanonicalProfileUsing(
-    db,
-    profileId,
-    redirectLimit,
-    onRedirectFailure,
-    CANONICAL_PUBLIC_PROFILE_COLUMNS,
-    parseCanonicalPublicProfileRow,
-  );
+  if (!profileId.isWellFormed()) {
+    return resolveCanonicalProfileUsing(
+      db,
+      profileId,
+      redirectLimit,
+      onRedirectFailure,
+      CANONICAL_PUBLIC_PROFILE_COLUMNS,
+      parseCanonicalPublicProfileRow,
+    );
+  }
+  if (!(redirectLimit >= 0)) {
+    if (onRedirectFailure === "null") return null;
+    throw new CanonicalProfileCorruption();
+  }
+  const { results } = await db
+    .prepare(
+      `${canonicalProfileRedirectCte("profile")}
+       SELECT ${CANONICAL_PUBLIC_PROFILE_COLUMNS.split(",")
+         .map((column) => `profile.${column.trim()}`)
+         .join(", ")},
+              chain.chain_profile_id, chain.depth AS chain_depth,
+              target.source_profile_id, target.target_profile_id,
+              target.merged_at_ms, target.op_id
+       FROM chain
+       LEFT JOIN profile_records profile
+         ON profile.profile_id = chain.chain_profile_id
+       LEFT JOIN profile_merge_targets target
+         ON target.source_profile_id = chain.chain_profile_id
+       ORDER BY chain.depth ASC`,
+    )
+    .bind(JSON.stringify([profileId]), Math.floor(redirectLimit))
+    .all<Record<string, unknown>>();
+  const visited = new Set<string>();
+  let currentProfileId = profileId;
+  for (let hop = 0; hop <= redirectLimit; hop++) {
+    if (visited.has(currentProfileId)) {
+      if (onRedirectFailure === "null") return null;
+      throw new CanonicalProfileCorruption();
+    }
+    visited.add(currentProfileId);
+    const row = results[hop];
+    if (
+      !row ||
+      row.chain_depth !== hop ||
+      row.chain_profile_id !== currentProfileId
+    ) {
+      throw new CanonicalProfileCorruption();
+    }
+    const profile =
+      row.profile_id === null ? null : parseCanonicalPublicProfileRow(row);
+    const mergeTarget =
+      row.source_profile_id === null ? null : parseCanonicalMergeTargetRow(row);
+    if (!mergeTarget) {
+      if (profile?.state === "retiring" || hop + 1 !== results.length) {
+        throw new CanonicalProfileCorruption();
+      }
+      return profile;
+    }
+    if (
+      profile?.state === "active" ||
+      (profile?.mergedIntoProfileId &&
+        profile.mergedIntoProfileId !== mergeTarget.targetProfileId)
+    ) {
+      throw new CanonicalProfileCorruption();
+    }
+    currentProfileId = mergeTarget.targetProfileId;
+  }
+  if (onRedirectFailure === "null") return null;
+  throw new CanonicalProfileCorruption();
 }
 
 function leaderboardColumns(type: LeaderboardReadType): {

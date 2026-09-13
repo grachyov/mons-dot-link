@@ -1,5 +1,6 @@
 import { commitEventMutations } from "../src/eventD1.ts";
 import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import { buildEventProgressPlan } from "../src/eventProgressCodec.ts";
 import type { EventMutation } from "../../../runtime/eventCommands.js";
 import { classifyD1Failure } from "../src/d1Failure.ts";
 import { observeD1FailureDatabase } from "./d1FailureTestUtils.ts";
@@ -2552,16 +2553,15 @@ describe("event D1 store", () => {
   it.each(["event-prize-announcement", "sunday-mons-reminder"])(
     "retains the earliest %s scheduling proof across competing upserts",
     async (reason) => {
-      const outboxId = `ep_${"a".repeat(64)}`;
-      const marker = {
-        schemaVersion: 1,
-        eventId,
-        sourceKey: `prizes:${eventId}:3601000`,
-        reason,
-        runAtMs: 1000,
-        firstQueuedAtMs: 100,
-        lastQueuedAtMs: 100,
-      };
+      const { outboxId, outbox: marker } = await buildEventProgressPlan(
+        {
+          eventId,
+          sourceKey: `prizes:${eventId}:3601000`,
+          reason,
+          runAtMs: 1000,
+        },
+        100,
+      );
       await patchEventOwnedPaths(testEnv.EVENT_DB, {
         [`events/${eventId}`]: eventRecord(),
         [`eventProgressOutbox/${outboxId}`]: marker,
@@ -2581,6 +2581,381 @@ describe("event D1 store", () => {
       ).toMatchObject({ firstQueuedAtMs: 100, lastQueuedAtMs: 300 });
     },
   );
+
+  it.each([
+    ["missing", null],
+    ["null", "null"],
+    ["boolean", "true"],
+    ["string", '"100"'],
+    ["fraction", "100.5"],
+    ["too large", "9007199254740992"],
+    ["too small", "-9007199254740992"],
+    ["array", "[]"],
+    ["object", "{}"],
+  ])(
+    "repairs and archives an announcement with a %s first scheduling time",
+    async (_name, timestamp) => {
+      const { outboxId, outbox } = await buildEventProgressPlan(
+        {
+          eventId,
+          sourceKey: "reminder:test",
+          reason: "sunday-mons-reminder",
+          runAtMs: 1_000,
+        },
+        200,
+      );
+      const path = `eventProgressOutbox/${outboxId}`;
+      await patchEventOwnedPaths(testEnv.EVENT_DB, {
+        [`events/${eventId}`]: eventRecord(),
+        [path]: outbox,
+      });
+      const storedJson = JSON.stringify(outbox).replace(
+        ',"firstQueuedAtMs":200',
+        timestamp === null ? "" : `,"firstQueuedAtMs":${timestamp}`,
+      );
+      await testEnv.EVENT_DB.prepare(
+        "UPDATE event_progress_outboxes SET record_json = ? WHERE outbox_id = ? AND status = 'pending'",
+      )
+        .bind(storedJson, outboxId)
+        .run();
+      await patchEventOwnedPaths(testEnv.EVENT_DB, { [path]: outbox });
+      expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual(outbox);
+      expect(
+        await readEventOwnedPath(
+          testEnv.EVENT_DB,
+          `eventProgressOutboxDead/${outboxId}`,
+        ),
+      ).toMatchObject({
+        reason: "invalid-event-progress-outbox",
+        originalRecord: JSON.parse(storedJson),
+      });
+    },
+  );
+
+  it.each(["1.0", "-1", "0", "100", "9007199254740991", "-9007199254740991"])(
+    "retains the earliest valid announcement time for stored %s",
+    async (timestamp) => {
+      const { outboxId, outbox } = await buildEventProgressPlan(
+        {
+          eventId,
+          sourceKey: "prizes:test",
+          reason: "event-prize-announcement",
+          runAtMs: 1_000,
+        },
+        200,
+      );
+      const path = `eventProgressOutbox/${outboxId}`;
+      await patchEventOwnedPaths(testEnv.EVENT_DB, {
+        [`events/${eventId}`]: eventRecord(),
+        [path]: outbox,
+      });
+      await testEnv.EVENT_DB.prepare(
+        "UPDATE event_progress_outboxes SET record_json = ? WHERE outbox_id = ? AND status = 'pending'",
+      )
+        .bind(
+          JSON.stringify(outbox).replace(
+            '"firstQueuedAtMs":200',
+            `"firstQueuedAtMs":${timestamp}`,
+          ),
+          outboxId,
+        )
+        .run();
+      await patchEventOwnedPaths(testEnv.EVENT_DB, { [path]: outbox });
+      expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual({
+        ...outbox,
+        firstQueuedAtMs: Math.min(Number(timestamp), outbox.firstQueuedAtMs),
+      });
+      expect(
+        await readEventOwnedPath(
+          testEnv.EVENT_DB,
+          `eventProgressOutboxDead/${outboxId}`,
+        ),
+      ).toBeNull();
+    },
+  );
+
+  it.each([
+    ["schemaVersion", 2],
+    ["sourceKey", "wrong-source-digest"],
+    ["reason", { malformed: true }],
+    ["eventId", "wrong-event"],
+    ["runAtMs", "1000"],
+    ["lastQueuedAtMs", null],
+  ])(
+    "archives an invalid %s before replacing any progress marker",
+    async (field, invalid) => {
+      for (const reason of ["sunday-mons-reminder", "match-rating-updated"]) {
+        const { outboxId, outbox } = await buildEventProgressPlan(
+          { eventId, sourceKey: `${reason}:test`, reason, runAtMs: 1_000 },
+          200,
+        );
+        const path = `eventProgressOutbox/${outboxId}`;
+        await patchEventOwnedPaths(testEnv.EVENT_DB, {
+          [`events/${eventId}`]: eventRecord(),
+          [path]: outbox,
+        });
+        const malformed = {
+          ...outbox,
+          firstQueuedAtMs: 50,
+          [field]: invalid,
+          unknownFutureField: { evidence: [1, 2, 3] },
+        };
+        await testEnv.EVENT_DB.prepare(
+          "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+        )
+          .bind(JSON.stringify(malformed), outboxId)
+          .run();
+        await patchEventOwnedPaths(testEnv.EVENT_DB, { [path]: outbox });
+        expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual(
+          outbox,
+        );
+        expect(
+          await readEventOwnedPath(
+            testEnv.EVENT_DB,
+            `eventProgressOutboxDead/${outboxId}`,
+          ),
+        ).toMatchObject({
+          reason: "invalid-event-progress-outbox",
+          originalRecord: malformed,
+        });
+      }
+    },
+  );
+
+  it("compares valid stored JSON bytes without normalizing whitespace or numeric spelling", async () => {
+    const { outboxId, outbox } = await buildEventProgressPlan(
+      {
+        eventId,
+        sourceKey: "raw-json:test",
+        reason: "sunday-mons-reminder",
+        runAtMs: 1_000,
+      },
+      200,
+    );
+    const path = `eventProgressOutbox/${outboxId}`;
+    await patchEventOwnedPaths(testEnv.EVENT_DB, {
+      [`events/${eventId}`]: eventRecord(),
+      [path]: outbox,
+    });
+    const raw = JSON.stringify(outbox, null, 2).replace(
+      '"firstQueuedAtMs": 200',
+      '"firstQueuedAtMs": 200.0',
+    );
+    await testEnv.EVENT_DB.prepare(
+      "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+    )
+      .bind(raw, outboxId)
+      .run();
+    const observed = observeD1FailureDatabase(testEnv.EVENT_DB);
+    await patchEventOwnedPaths(observed.database, {
+      [path]: { ...outbox, firstQueuedAtMs: 400, lastQueuedAtMs: 400 },
+    });
+    expect(observed.batches).toHaveLength(1);
+    expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual({
+      ...outbox,
+      lastQueuedAtMs: 400,
+    });
+    expect(
+      await readEventOwnedPath(
+        testEnv.EVENT_DB,
+        `eventProgressOutboxDead/${outboxId}`,
+      ),
+    ).toBeNull();
+  });
+
+  it.each(["absent", "valid", "invalid"] as const)(
+    "retries a changed %s progress snapshot and archives only the actual replaced value",
+    async (state) => {
+      const { outboxId, outbox } = await buildEventProgressPlan(
+        {
+          eventId,
+          sourceKey: "snapshot-race:test",
+          reason: "match-rating-updated",
+        },
+        200,
+      );
+      const path = `eventProgressOutbox/${outboxId}`;
+      await patchEventOwnedPaths(testEnv.EVENT_DB, {
+        [`events/${eventId}`]: eventRecord(),
+      });
+      if (state !== "absent") {
+        await testEnv.EVENT_DB.prepare(
+          "INSERT INTO event_progress_outboxes (outbox_id, event_id, status, run_at_ms, last_queued_at_ms, record_json) VALUES (?, ?, 'pending', NULL, ?, ?)",
+        )
+          .bind(
+            outboxId,
+            eventId,
+            200,
+            JSON.stringify(
+              state === "valid" ? outbox : { ...outbox, schemaVersion: 2 },
+            ),
+          )
+          .run();
+      }
+      const raced = {
+        ...outbox,
+        reason: { broken: true },
+        evidence: "concurrent-record",
+      };
+      const observed = observeD1FailureDatabase(testEnv.EVENT_DB, {
+        async beforeBatch(attempt) {
+          if (attempt !== 1) return;
+          await testEnv.EVENT_DB.prepare(
+            "INSERT INTO event_progress_outboxes (outbox_id, event_id, status, run_at_ms, last_queued_at_ms, record_json) VALUES (?, ?, 'pending', NULL, ?, ?) ON CONFLICT (status, outbox_id) DO UPDATE SET record_json = excluded.record_json",
+          )
+            .bind(outboxId, eventId, 200, JSON.stringify(raced, null, 2))
+            .run();
+        },
+      });
+      await patchEventOwnedPaths(observed.database, { [path]: outbox });
+      expect(observed.batches).toHaveLength(2);
+      expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual(outbox);
+      expect(
+        await readEventOwnedPath(
+          testEnv.EVENT_DB,
+          `eventProgressOutboxDead/${outboxId}`,
+        ),
+      ).toMatchObject({ originalRecord: raced });
+    },
+  );
+
+  it("preserves a concurrent valid repair and its timestamp without auditing it as malformed", async () => {
+    const { outboxId, outbox } = await buildEventProgressPlan(
+      {
+        eventId,
+        sourceKey: "valid-repair:test",
+        reason: "sunday-mons-reminder",
+      },
+      200,
+    );
+    const path = `eventProgressOutbox/${outboxId}`;
+    await patchEventOwnedPaths(testEnv.EVENT_DB, {
+      [`events/${eventId}`]: eventRecord(),
+      [path]: outbox,
+    });
+    await testEnv.EVENT_DB.prepare(
+      "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+    )
+      .bind(JSON.stringify({ ...outbox, schemaVersion: 2 }), outboxId)
+      .run();
+    const repaired = { ...outbox, firstQueuedAtMs: 50 };
+    const observed = observeD1FailureDatabase(testEnv.EVENT_DB, {
+      async beforeBatch(attempt) {
+        if (attempt !== 1) return;
+        await testEnv.EVENT_DB.prepare(
+          "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+        )
+          .bind(JSON.stringify(repaired), outboxId)
+          .run();
+      },
+    });
+    await patchEventOwnedPaths(observed.database, { [path]: outbox });
+    expect(observed.batches).toHaveLength(2);
+    expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual(repaired);
+    expect(
+      await readEventOwnedPath(
+        testEnv.EVENT_DB,
+        `eventProgressOutboxDead/${outboxId}`,
+      ),
+    ).toBeNull();
+  });
+
+  it.each(["mixed-plan", "explicit-expectation"] as const)(
+    "does not retry a changed progress snapshot in a %s",
+    async (scope) => {
+      const { outboxId, outbox } = await buildEventProgressPlan(
+        {
+          eventId,
+          sourceKey: "snapshot-guard:test",
+          reason: "match-rating-updated",
+        },
+        200,
+      );
+      const path = `eventProgressOutbox/${outboxId}`;
+      await patchEventOwnedPaths(testEnv.EVENT_DB, {
+        [`events/${eventId}`]: eventRecord(),
+        [path]: outbox,
+      });
+      const raced = { ...outbox, schemaVersion: 2 };
+      const observed = observeD1FailureDatabase(testEnv.EVENT_DB, {
+        async beforeBatch() {
+          await testEnv.EVENT_DB.prepare(
+            "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+          )
+            .bind(JSON.stringify(raced), outboxId)
+            .run();
+        },
+      });
+      await expect(
+        patchEventOwnedPaths(
+          observed.database,
+          {
+            [path]: outbox,
+            ...(scope === "mixed-plan"
+              ? { [`events/${eventId}/status`]: "active" }
+              : {}),
+          },
+          scope === "explicit-expectation"
+            ? { expectedRecords: { progress: { [outboxId]: outbox } } }
+            : {},
+        ),
+      ).rejects.toBeInstanceOf(EventD1Conflict);
+      expect(observed.batches).toHaveLength(1);
+      expect(
+        (await readEventSnapshot(testEnv.EVENT_DB, eventId)).event?.status,
+      ).toBe("scheduled");
+      expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual(raced);
+      expect(
+        await readEventOwnedPath(
+          testEnv.EVENT_DB,
+          `eventProgressOutboxDead/${outboxId}`,
+        ),
+      ).toBeNull();
+    },
+  );
+
+  it("bounds pure outbox snapshot conflicts without leaving a partial audit or replacement", async () => {
+    const { outboxId, outbox } = await buildEventProgressPlan(
+      {
+        eventId,
+        sourceKey: "retry-limit:test",
+        reason: "match-rating-updated",
+      },
+      200,
+    );
+    const path = `eventProgressOutbox/${outboxId}`;
+    await patchEventOwnedPaths(testEnv.EVENT_DB, {
+      [`events/${eventId}`]: eventRecord(),
+      [path]: outbox,
+    });
+    const observed = observeD1FailureDatabase(testEnv.EVENT_DB, {
+      async beforeBatch(attempt) {
+        await testEnv.EVENT_DB.prepare(
+          "UPDATE event_progress_outboxes SET record_json = ? WHERE status = 'pending' AND outbox_id = ?",
+        )
+          .bind(
+            JSON.stringify({ ...outbox, schemaVersion: 2, attempt }),
+            outboxId,
+          )
+          .run();
+      },
+    });
+    await expect(
+      patchEventOwnedPaths(observed.database, { [path]: outbox }),
+    ).rejects.toBeInstanceOf(EventD1Conflict);
+    expect(observed.batches).toHaveLength(12);
+    expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual({
+      ...outbox,
+      schemaVersion: 2,
+      attempt: 12,
+    });
+    expect(
+      await readEventOwnedPath(
+        testEnv.EVENT_DB,
+        `eventProgressOutboxDead/${outboxId}`,
+      ),
+    ).toBeNull();
+  });
 
   it("rejects stale outbox deletion without other revision guards", async () => {
     const path = `profileGameProjectionOutbox/event/${eventId}`;

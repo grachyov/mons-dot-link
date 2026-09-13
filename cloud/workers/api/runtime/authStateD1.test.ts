@@ -58,6 +58,68 @@ function xFlow(
   };
 }
 
+type CleanupCounter = keyof Awaited<ReturnType<typeof sweepExpiredAuthState>>;
+
+async function seedCleanupBacklog(counter: CleanupCounter, nowMs: number) {
+  const db = testEnv.AUTH_STATE_DB;
+  const statements = [
+    db
+      .prepare(
+        `WITH RECURSIVE items(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM items WHERE n < 1003
+         )
+         INSERT INTO auth_intents (
+           intent_id, uid, method, nonce, state, created_at_ms,
+           expires_at_ms, consumed_at_ms, consumed_by_op_id
+         )
+         SELECT printf('cleanup-%04d', n), 'login-uid', 'x',
+                CASE WHEN ? OR n % 2 = 0 THEN 'retired' ELSE 'nonce' END,
+                CASE WHEN ? OR n % 2 = 1 THEN 'retired' ELSE 'state' END,
+                1, ? - CASE WHEN n = 1003 THEN 2 ELSE 1 END,
+                1, 'operation-1'
+         FROM items`,
+      )
+      .bind(
+        counter === "flowsCompacted" ? 1 : 0,
+        counter === "flowsCompacted" ? 1 : 0,
+        nowMs - AUTH_STATE_NONTERMINAL_RETENTION_MS,
+      ),
+  ];
+  if (counter !== "intentsDeleted") {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO x_redirect_flows (
+             flow_id, intent_id, uid, method, callback_uri, code_challenge,
+             code_verifier, consent_source, return_url, status,
+             result_profile_id, result_op_id, created_at_ms, expires_at_ms,
+             updated_at_ms, revision
+           )
+           SELECT intent_id, intent_id, uid, 'x',
+                  'https://api.mons.link/auth/x/callback',
+                  CASE WHEN ? OR CAST(substr(intent_id, -4) AS INTEGER) % 2 = 0
+                       THEN 'retired' ELSE 'challenge' END,
+                  CASE WHEN ? OR CAST(substr(intent_id, -4) AS INTEGER) % 2 = 1
+                       THEN 'retired' ELSE 'verifier' END,
+                  'signin', 'https://mons.link/', ?, 'profile-1', 'operation-1',
+                  created_at_ms, expires_at_ms,
+                  ? - CASE WHEN intent_id = 'cleanup-1003' THEN 2 ELSE 1 END,
+                  4
+           FROM auth_intents`,
+        )
+        .bind(
+          counter === "intentsCompacted" ? 1 : 0,
+          counter === "intentsCompacted" ? 1 : 0,
+          counter === "flowsDeleted" ? "created" : "completed",
+          counter === "terminalFlowsDeleted"
+            ? nowMs - AUTH_STATE_TERMINAL_RETENTION_MS
+            : nowMs,
+        ),
+    );
+  }
+  await db.batch(statements);
+}
+
 describe("auth state D1 repository", () => {
   beforeAll(async () => {
     await applyD1Migrations(
@@ -337,4 +399,211 @@ describe("auth state D1 repository", () => {
       repository.getXFlow("verified-flow-1234567890"),
     ).resolves.toBeNull();
   });
+
+  it.each([
+    [
+      "flowsDeleted",
+      "SELECT flow_id AS id FROM x_redirect_flows ORDER BY flow_id",
+    ],
+    [
+      "terminalFlowsDeleted",
+      "SELECT flow_id AS id FROM x_redirect_flows ORDER BY flow_id",
+    ],
+    [
+      "intentsDeleted",
+      "SELECT intent_id AS id FROM auth_intents ORDER BY intent_id",
+    ],
+    [
+      "flowsCompacted",
+      `SELECT flow_id AS id FROM x_redirect_flows
+       WHERE code_challenge <> 'retired' OR code_verifier <> 'retired'
+       ORDER BY flow_id`,
+    ],
+    [
+      "intentsCompacted",
+      `SELECT intent_id AS id FROM auth_intents
+       WHERE nonce <> 'retired' OR state <> 'retired'
+       ORDER BY intent_id`,
+    ],
+  ] as const)(
+    "bounds %s and progresses oldest records first",
+    async (counter, pendingSql) => {
+      const db = testEnv.AUTH_STATE_DB;
+      const nowMs = AUTH_STATE_TERMINAL_RETENTION_MS + 10_000_000;
+      await seedCleanupBacklog(counter, nowMs);
+      const repository = createAuthStateRepository(db);
+      const beforeFlow = await repository.getXFlow("cleanup-0001");
+      const beforeIntent = await repository.getAuthIntent("cleanup-0001");
+      const first = await sweepExpiredAuthState(db, nowMs);
+      expect(first[counter]).toBe(1_000);
+      expect(Object.values(first).every((count) => count <= 1_000)).toBe(true);
+      expect(
+        (await db.prepare(pendingSql).all<{ id: string }>()).results,
+      ).toEqual([
+        { id: "cleanup-1000" },
+        { id: "cleanup-1001" },
+        { id: "cleanup-1002" },
+      ]);
+      expect(
+        (await db.prepare("PRAGMA foreign_key_check").all()).results,
+      ).toEqual([]);
+      if (counter === "flowsCompacted" || counter === "intentsCompacted") {
+        expect(await repository.getXFlow("cleanup-0001")).toEqual({
+          ...beforeFlow,
+          codeChallenge: "retired",
+          codeVerifier: "retired",
+        });
+        expect(await repository.getAuthIntent("cleanup-0001")).toEqual({
+          ...beforeIntent,
+          nonce: "retired",
+          state: "retired",
+        });
+      }
+      expect((await sweepExpiredAuthState(db, nowMs))[counter]).toBe(3);
+      expect((await db.prepare(pendingSql).all()).results).toEqual([]);
+      expect(
+        (await db.prepare("PRAGMA foreign_key_check").all()).results,
+      ).toEqual([]);
+      expect(await sweepExpiredAuthState(db, nowMs)).toEqual({
+        flowsCompacted: 0,
+        flowsDeleted: 0,
+        intentsCompacted: 0,
+        intentsDeleted: 0,
+        terminalFlowsDeleted: 0,
+      });
+    },
+  );
+
+  it.each([-1, 0, 1])(
+    "preserves expiry eligibility at cutoff offset %i",
+    async (offsetMs) => {
+      const db = testEnv.AUTH_STATE_DB;
+      const repository = createAuthStateRepository(db);
+      const nowMs = AUTH_STATE_TERMINAL_RETENTION_MS + 10_000_000;
+      const expiresAtMs =
+        nowMs - AUTH_STATE_NONTERMINAL_RETENTION_MS + offsetMs;
+      const statuses = [
+        "created",
+        "processing",
+        "verified",
+        "completed",
+        "failed",
+      ] as const;
+      for (const status of statuses) {
+        await repository.createAuthIntent(
+          authIntent({ intentId: status, expiresAtMs }),
+        );
+        await repository.createXFlow(
+          xFlow({ flowId: status, intentId: status, expiresAtMs }),
+        );
+        await repository.updateXFlow(status, { status, updatedAtMs: nowMs }, 1);
+      }
+      await repository.createAuthIntent(
+        authIntent({ intentId: "orphan", expiresAtMs }),
+      );
+      await repository.createAuthIntent(
+        authIntent({ intentId: "protected", expiresAtMs: 1_300_000 }),
+      );
+      await repository.createXFlow(
+        xFlow({
+          flowId: "protected",
+          intentId: "protected",
+          expiresAtMs: nowMs + 1,
+        }),
+      );
+      const before = await Promise.all(
+        statuses.map(async (status) => ({
+          flow: await repository.getXFlow(status),
+          intent: await repository.getAuthIntent(status),
+        })),
+      );
+
+      expect(await sweepExpiredAuthState(db, nowMs)).toEqual({
+        flowsCompacted: offsetMs < 0 ? 3 : 0,
+        flowsDeleted: offsetMs < 0 ? 2 : 0,
+        intentsCompacted: offsetMs < 0 ? 3 : 0,
+        intentsDeleted: offsetMs < 0 ? 3 : 0,
+        terminalFlowsDeleted: 0,
+      });
+      for (const [index, status] of statuses.entries()) {
+        const deleted =
+          offsetMs < 0 && (status === "created" || status === "processing");
+        expect(await repository.getXFlow(status)).toEqual(
+          deleted
+            ? null
+            : {
+                ...before[index].flow,
+                ...(offsetMs < 0
+                  ? { codeChallenge: "retired", codeVerifier: "retired" }
+                  : {}),
+              },
+        );
+        expect(await repository.getAuthIntent(status)).toEqual(
+          deleted
+            ? null
+            : {
+                ...before[index].intent,
+                ...(offsetMs < 0 ? { nonce: "retired", state: "retired" } : {}),
+              },
+        );
+      }
+      expect(await repository.getAuthIntent("protected")).toMatchObject({
+        nonce: "nonce",
+        state: "state",
+      });
+      expect(await repository.getXFlow("protected")).toMatchObject({
+        status: "created",
+        codeChallenge: "challenge",
+        codeVerifier: "verifier",
+      });
+      expect(
+        (await db.prepare("PRAGMA foreign_key_check").all()).results,
+      ).toEqual([]);
+    },
+  );
+
+  it.each([-1, 0, 1])(
+    "preserves terminal retention at cutoff offset %i",
+    async (offsetMs) => {
+      const db = testEnv.AUTH_STATE_DB;
+      const repository = createAuthStateRepository(db);
+      const nowMs = AUTH_STATE_TERMINAL_RETENTION_MS + 10_000_000;
+      for (const status of ["verified", "completed", "failed"] as const) {
+        await repository.createAuthIntent(
+          authIntent({ intentId: status, expiresAtMs: nowMs + 1 }),
+        );
+        await repository.createXFlow(
+          xFlow({ flowId: status, intentId: status, expiresAtMs: nowMs + 1 }),
+        );
+        await repository.updateXFlow(
+          status,
+          {
+            status,
+            updatedAtMs: nowMs - AUTH_STATE_TERMINAL_RETENTION_MS + offsetMs,
+          },
+          1,
+        );
+      }
+      expect(await sweepExpiredAuthState(db, nowMs)).toEqual({
+        flowsCompacted: 0,
+        flowsDeleted: 0,
+        intentsCompacted: 0,
+        intentsDeleted: 0,
+        terminalFlowsDeleted: offsetMs < 0 ? 3 : 0,
+      });
+      expect(
+        await db
+          .prepare("SELECT COUNT(*) AS count FROM x_redirect_flows")
+          .first("count"),
+      ).toBe(offsetMs < 0 ? 0 : 3);
+      expect(
+        await db
+          .prepare("SELECT COUNT(*) AS count FROM auth_intents")
+          .first("count"),
+      ).toBe(3);
+      expect(
+        (await db.prepare("PRAGMA foreign_key_check").all()).results,
+      ).toEqual([]);
+    },
+  );
 });

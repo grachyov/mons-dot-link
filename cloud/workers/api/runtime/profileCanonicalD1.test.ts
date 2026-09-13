@@ -36,6 +36,7 @@ import { ProfileWritesDisabledFailure } from "../src/authErrors.ts";
 import { classifyD1Failure } from "../src/d1Failure.ts";
 import { createProfileCustomizationRepository } from "../src/profileCustomizationRepository.ts";
 import { observeD1FailureDatabase } from "./d1FailureTestUtils.ts";
+import { profileWriteRow } from "../src/profileCanonical/profiles.ts";
 
 const testEnv = env as Env & { TEST_PROFILE_D1_MIGRATIONS: D1Migration[] };
 
@@ -119,20 +120,36 @@ function observeAggregateDatabase(
     mapFirst?: (
       row: Record<string, unknown> | null,
     ) => Record<string, unknown> | null;
+    mapAll?: (rows: Record<string, unknown>[]) => Record<string, unknown>[];
   } = {},
 ) {
   const batches: string[][] = [];
+  const allQueries: string[] = [];
+  const allBindings: unknown[][] = [];
   const statements = new WeakMap<object, D1PreparedStatement>();
   const queries = new WeakMap<object, string>();
-  const wrap = (statement: D1PreparedStatement, query: string) => {
+  const wrap = (
+    statement: D1PreparedStatement,
+    query: string,
+    values: unknown[] = [],
+  ) => {
     const wrapped: D1PreparedStatement = new Proxy(statement, {
       get(target, property) {
         if (property === "bind") {
-          return (...values: unknown[]) => wrap(target.bind(...values), query);
+          return (...bound: unknown[]) =>
+            wrap(target.bind(...bound), query, bound);
         }
         if (property === "first" && options.mapFirst) {
           return async () =>
             options.mapFirst!(await target.first<Record<string, unknown>>());
+        }
+        if (property === "all" && options.mapAll) {
+          return async () => {
+            allQueries.push(query);
+            allBindings.push(values);
+            const result = await target.all<Record<string, unknown>>();
+            return { ...result, results: options.mapAll!(result.results) };
+          };
         }
         if (["first", "all", "run", "raw"].includes(String(property))) {
           return () => {
@@ -170,7 +187,7 @@ function observeAggregateDatabase(
       return typeof member === "function" ? member.bind(target) : member;
     },
   });
-  return { database, batches };
+  return { database, batches, allQueries, allBindings };
 }
 
 function observeRecoveryDatabase(failure?: Error) {
@@ -518,6 +535,148 @@ describe("canonical profile D1 store", () => {
       expect(observed.reads[0].query).not.toContain("legacy_fields_json");
     });
 
+    it("reads public profiles with one query and preserves exact keys", async () => {
+      const value = await seedLookup();
+      for (const profileId of [
+        value.profile.id,
+        ` ${value.profile.id}' OR 1 = 1 -- `,
+        "",
+        "é",
+        "e\u0301",
+        "\ud83d\ude00",
+      ]) {
+        const observed = observeAggregateDatabase({ mapAll: (rows) => rows });
+        const result = await resolveCanonicalPublicProfile(
+          observed.database,
+          profileId,
+          4,
+        );
+        expect(result?.profileId ?? null).toBe(
+          profileId === value.profile.id ? profileId : null,
+        );
+        expect(observed.allQueries).toHaveLength(1);
+        expect(observed.allBindings).toEqual([
+          [JSON.stringify([profileId]), 4],
+        ]);
+        expect(observed.batches).toHaveLength(0);
+      }
+    });
+
+    it.each(["\ud800", "\udc00"])(
+      "preserves direct binding for a lone surrogate %j",
+      async (surrogate) => {
+        const profileId = `a${surrogate}b`;
+        for (const policy of ["null", "throw"] as const) {
+          await expect(
+            resolveCanonicalProfile(testEnv.PROFILE_DB, profileId, 4, policy),
+          ).resolves.toBeNull();
+          const observed = observeAggregateDatabase();
+          await expect(
+            resolveCanonicalPublicProfile(
+              observed.database,
+              profileId,
+              4,
+              policy,
+            ),
+          ).resolves.toBeNull();
+          expect(observed.batches).toHaveLength(1);
+          for (const query of observed.batches[0]) {
+            expect(query).not.toContain("legacy_fields_json");
+            expect(query).not.toContain("SELECT *");
+          }
+        }
+      },
+    );
+
+    it.each([
+      ["payload_json", "{}"],
+      ["rating_sort", 99],
+      ["merged_into_profile_id", "wrong-target"],
+      ["merged_at_ms", -1],
+      ["op_id", false],
+    ])(
+      "validates intermediate public redirect %s even with null failure policy",
+      async (column, invalid) => {
+        const source = profileValue("public-invalid-source", {
+          state: "retiring",
+          mergedIntoProfileId: "public-valid-target",
+          mergedAtMs: 2_000,
+          updatedAtMs: 2_000,
+        });
+        const target = profileValue("public-valid-target");
+        const observed = observeAggregateDatabase({
+          mapAll: () => [
+            {
+              ...profileWriteRow(source),
+              chain_profile_id: source.profile.id,
+              chain_depth: 0,
+              source_profile_id: source.profile.id,
+              target_profile_id: target.profile.id,
+              merged_at_ms: 2_000,
+              op_id: null,
+              [column]: invalid,
+            },
+            {
+              ...profileWriteRow(target),
+              chain_profile_id: target.profile.id,
+              chain_depth: 1,
+              source_profile_id: null,
+              target_profile_id: null,
+              merged_at_ms: null,
+              op_id: null,
+            },
+          ],
+        });
+        await expect(
+          resolveCanonicalPublicProfile(
+            observed.database,
+            source.profile.id,
+            4,
+            "null",
+          ),
+        ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+        expect(observed.allQueries).toHaveLength(1);
+      },
+    );
+
+    it("preserves public null results for dangling redirects", async () => {
+      const sourceId = "public-dangling-source";
+      const observed = observeAggregateDatabase({
+        mapAll: () => [
+          {
+            profile_id: null,
+            chain_profile_id: sourceId,
+            chain_depth: 0,
+            source_profile_id: sourceId,
+            target_profile_id: "missing-target",
+            merged_at_ms: 2_000,
+            op_id: null,
+          },
+          {
+            profile_id: null,
+            chain_profile_id: "missing-target",
+            chain_depth: 1,
+            source_profile_id: null,
+          },
+        ],
+      });
+      await expect(
+        resolveCanonicalPublicProfile(observed.database, sourceId),
+      ).resolves.toBeNull();
+    });
+
+    it("preserves public chain read failures", async () => {
+      const failure = new Error("D1 unavailable");
+      const observed = observeAggregateDatabase({
+        mapAll: () => {
+          throw failure;
+        },
+      });
+      await expect(
+        resolveCanonicalPublicProfile(observed.database, "missing", 4, "null"),
+      ).rejects.toBe(failure);
+    });
+
     it("returns null for an unknown login with one unchanged bound lookup", async () => {
       await seedLookup();
       const missingLogin = ` ${loginUid}' OR 1 = 1 -- `;
@@ -585,41 +744,39 @@ describe("canonical profile D1 store", () => {
           ],
           mutations: [{ kind: "insert-active-profile", value: target }],
         });
+        const targetRow = await testEnv.PROFILE_DB.prepare(
+          "SELECT * FROM profile_records WHERE profile_id = ?",
+        )
+          .bind(target.profile.id)
+          .first<Record<string, unknown>>();
         const observed = observeAggregateDatabase({
           mapFirst: (row) => ({
             ...row,
             lookup_merge_source_profile_id: value.profile.id,
           }),
-          mapResults: (_queries, results) => {
-            const source = results[0].results[0];
-            if (source?.profile_id !== value.profile.id) return results;
+          mapAll: (rows) => {
+            const source = rows[0];
             return [
               {
-                ...results[0],
-                results:
-                  sourceState === "deleted"
-                    ? []
-                    : [
-                        {
-                          ...source,
-                          state: sourceState,
-                          merged_into_profile_id:
-                            sourceState === "retiring"
-                              ? target.profile.id
-                              : null,
-                        },
-                      ],
+                ...source,
+                profile_id:
+                  sourceState === "deleted" ? null : source.profile_id,
+                state: sourceState,
+                merged_into_profile_id:
+                  sourceState === "retiring" ? target.profile.id : null,
+                source_profile_id: value.profile.id,
+                target_profile_id: target.profile.id,
+                merged_at_ms: 2_000,
+                op_id: null,
               },
               {
-                ...results[1],
-                results: [
-                  {
-                    source_profile_id: value.profile.id,
-                    target_profile_id: target.profile.id,
-                    merged_at_ms: 2_000,
-                    op_id: null,
-                  },
-                ],
+                ...targetRow,
+                chain_profile_id: target.profile.id,
+                chain_depth: 1,
+                source_profile_id: null,
+                target_profile_id: null,
+                merged_at_ms: null,
+                op_id: null,
               },
             ];
           },
@@ -632,13 +789,13 @@ describe("canonical profile D1 store", () => {
           await expect(result).rejects.toBeInstanceOf(
             CanonicalProfileCorruption,
           );
-          expect(observed.batches).toHaveLength(1);
         } else {
           await expect(result).resolves.toMatchObject({
             profileId: target.profile.id,
           });
-          expect(observed.batches).toHaveLength(2);
         }
+        expect(observed.batches).toHaveLength(0);
+        expect(observed.allQueries).toHaveLength(1);
       },
     );
 
@@ -646,40 +803,43 @@ describe("canonical profile D1 store", () => {
       "keeps the original source and rejects redirect %s failures",
       async (failure) => {
         const value = await seedLookup();
-        let hop = 0;
         const observed = observeAggregateDatabase({
           mapFirst: (row) => ({
             ...row,
             lookup_merge_source_profile_id: value.profile.id,
           }),
-          mapResults: (_queries, results) => {
-            const source =
-              hop === 0 ? value.profile.id : `deleted-source-${hop}`;
-            const target =
-              failure === "cycle" && hop === 1
-                ? value.profile.id
-                : `deleted-source-${hop + 1}`;
-            hop += 1;
-            return [
-              { ...results[0], results: [] },
-              {
-                ...results[1],
-                results: [
-                  {
-                    source_profile_id: source,
-                    target_profile_id: target,
-                    merged_at_ms: 2_000,
-                    op_id: null,
-                  },
-                ],
-              },
-            ];
-          },
+          mapAll: () =>
+            Array.from({ length: 33 }, (_, hop) => {
+              const source =
+                hop === 0 ? value.profile.id : `deleted-source-${hop}`;
+              const target =
+                failure === "cycle" && hop === 1
+                  ? value.profile.id
+                  : `deleted-source-${hop + 1}`;
+              return {
+                profile_id: null,
+                chain_profile_id: source,
+                chain_depth: hop,
+                source_profile_id: source,
+                target_profile_id: target,
+                merged_at_ms: 2_000,
+                op_id: null,
+              };
+            }),
         });
         await expect(
           readCanonicalPublicProfileByLogin(observed.database, loginUid),
         ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
-        expect(observed.batches).toHaveLength(failure === "cycle" ? 2 : 33);
+        expect(observed.batches).toHaveLength(0);
+        expect(observed.allQueries).toHaveLength(1);
+        await expect(
+          resolveCanonicalPublicProfile(
+            observed.database,
+            value.profile.id,
+            32,
+            "null",
+          ),
+        ).resolves.toBeNull();
       },
     );
   });
@@ -895,11 +1055,21 @@ describe("canonical profile D1 store", () => {
 
     const sql: string[] = [];
     const fakeDb = {
-      batch: async () => [{ results: [] }, { results: [] }],
       prepare: (statement: string) => {
         sql.push(statement);
         return {
-          all: async () => ({ results: [] }),
+          all: async () => ({
+            results: statement.includes("chain_profile_id")
+              ? [
+                  {
+                    chain_profile_id: "missing",
+                    chain_depth: 0,
+                    profile_id: null,
+                    source_profile_id: null,
+                  },
+                ]
+              : [],
+          }),
           bind() {
             return this;
           },
@@ -909,7 +1079,7 @@ describe("canonical profile D1 store", () => {
     await resolveCanonicalPublicProfile(fakeDb, "missing");
     await readCanonicalLeaderboard(fakeDb, "rating");
     const publicProfileQueries = sql.filter((statement) =>
-      statement.includes("FROM profile_records"),
+      statement.includes("profile_records"),
     );
     expect(publicProfileQueries).toHaveLength(2);
     for (const statement of publicProfileQueries) {
@@ -1379,6 +1549,23 @@ describe("canonical profile D1 store", () => {
         ownership.canonicalProfileIdByProfileId.get(profileId),
       ),
     ).toEqual(profileIds.map(() => profileIds.at(-1)));
+    const observed = observeAggregateDatabase({ mapAll: (rows) => rows });
+    await expect(
+      resolveCanonicalPublicProfile(observed.database, profileIds[0], 2),
+    ).resolves.toMatchObject({ profileId: profileIds[2] });
+    expect(observed.allQueries).toHaveLength(1);
+    expect(observed.batches).toHaveLength(0);
+    await expect(
+      resolveCanonicalPublicProfile(testEnv.PROFILE_DB, profileIds[0], 1),
+    ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+    await expect(
+      resolveCanonicalPublicProfile(
+        testEnv.PROFILE_DB,
+        profileIds[0],
+        1,
+        "null",
+      ),
+    ).resolves.toBeNull();
   });
 
   it("materializes public defaults and rejects public or emoji drift", async () => {
@@ -2493,6 +2680,26 @@ describe("canonical profile D1 store", () => {
       (await resolveCanonicalProfile(testEnv.PROFILE_DB, "canonical-chain-0"))
         ?.profileId,
     ).toBe("canonical-chain-32");
+    const observed = observeAggregateDatabase({ mapAll: (rows) => rows });
+    await expect(
+      resolveCanonicalPublicProfile(observed.database, "canonical-chain-28", 4),
+    ).resolves.toMatchObject({ profileId: "canonical-chain-32" });
+    expect(observed.allQueries).toHaveLength(1);
+    await expect(
+      resolveCanonicalPublicProfile(
+        testEnv.PROFILE_DB,
+        "canonical-chain-27",
+        4,
+      ),
+    ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+    await expect(
+      resolveCanonicalPublicProfile(
+        testEnv.PROFILE_DB,
+        "canonical-chain-27",
+        4,
+        "null",
+      ),
+    ).resolves.toBeNull();
     await expect(
       resolveCanonicalProfile(testEnv.PROFILE_DB, "canonical-chain-0", 4),
     ).rejects.toBeInstanceOf(CanonicalProfileCorruption);

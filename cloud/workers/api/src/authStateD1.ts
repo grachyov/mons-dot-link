@@ -147,6 +147,7 @@ const X_FLOW_STATUSES = new Set<XFlowStatus>([
 ]);
 const AUTH_STATE_NONTERMINAL_RETENTION_MS = 60 * 60 * 1_000;
 const AUTH_STATE_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const AUTH_STATE_SWEEP_BATCH_SIZE = 1_000;
 
 const FLOW_COLUMNS: Record<Exclude<keyof XFlowUpdate, "result">, string> = {
   completedAtMs: "completed_at_ms",
@@ -494,49 +495,74 @@ export async function sweepExpiredAuthState(
       db
         .prepare(
           `DELETE FROM x_redirect_flows
-           WHERE expires_at_ms < ?
-             AND status IN ('created', 'processing')`,
+           WHERE flow_id IN (
+             SELECT flow_id FROM x_redirect_flows
+             WHERE expires_at_ms < ?
+               AND status IN ('created', 'processing')
+             ORDER BY expires_at_ms, flow_id
+             LIMIT ?
+           )`,
         )
-        .bind(cutoffMs),
+        .bind(cutoffMs, AUTH_STATE_SWEEP_BATCH_SIZE),
       db
         .prepare(
           `DELETE FROM x_redirect_flows
+           WHERE flow_id IN (
+             SELECT flow_id FROM x_redirect_flows
              WHERE updated_at_ms < ?
-               AND status IN ('verified', 'completed', 'failed')`,
+               AND status IN ('verified', 'completed', 'failed')
+             ORDER BY updated_at_ms, flow_id
+             LIMIT ?
+           )`,
         )
-        .bind(terminalCutoffMs),
+        .bind(terminalCutoffMs, AUTH_STATE_SWEEP_BATCH_SIZE),
       db
         .prepare(
           `DELETE FROM auth_intents
-           WHERE expires_at_ms < ?
-             AND NOT EXISTS (
-               SELECT 1 FROM x_redirect_flows
-               WHERE x_redirect_flows.intent_id = auth_intents.intent_id
-             )`,
+           WHERE intent_id IN (
+             SELECT intent_id FROM auth_intents
+             WHERE expires_at_ms < ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM x_redirect_flows
+                 WHERE x_redirect_flows.intent_id = auth_intents.intent_id
+               )
+             ORDER BY expires_at_ms, intent_id
+             LIMIT ?
+           )`,
         )
-        .bind(cutoffMs),
+        .bind(cutoffMs, AUTH_STATE_SWEEP_BATCH_SIZE),
       db
         .prepare(
           `UPDATE x_redirect_flows
            SET code_challenge = 'retired', code_verifier = 'retired'
-           WHERE expires_at_ms < ?
-             AND status IN ('verified', 'completed', 'failed')
-             AND (code_challenge <> 'retired' OR code_verifier <> 'retired')`,
+           WHERE flow_id IN (
+             SELECT flow_id FROM x_redirect_flows
+             WHERE expires_at_ms < ?
+               AND status IN ('verified', 'completed', 'failed')
+               AND (code_challenge <> 'retired' OR code_verifier <> 'retired')
+             ORDER BY expires_at_ms, flow_id
+             LIMIT ?
+           )`,
         )
-        .bind(cutoffMs),
+        .bind(cutoffMs, AUTH_STATE_SWEEP_BATCH_SIZE),
       db
         .prepare(
           `UPDATE auth_intents
            SET nonce = 'retired', state = 'retired'
-           WHERE expires_at_ms < ?
-             AND (nonce <> 'retired' OR state <> 'retired')
-             AND EXISTS (
-               SELECT 1 FROM x_redirect_flows
-               WHERE x_redirect_flows.intent_id = auth_intents.intent_id
-                 AND x_redirect_flows.status IN ('verified', 'completed', 'failed')
-             )`,
+           WHERE intent_id IN (
+             SELECT intent_id FROM auth_intents
+             WHERE expires_at_ms < ?
+               AND (nonce <> 'retired' OR state <> 'retired')
+               AND EXISTS (
+                 SELECT 1 FROM x_redirect_flows
+                 WHERE x_redirect_flows.intent_id = auth_intents.intent_id
+                   AND x_redirect_flows.status IN ('verified', 'completed', 'failed')
+               )
+             ORDER BY expires_at_ms, intent_id
+             LIMIT ?
+           )`,
         )
-        .bind(cutoffMs),
+        .bind(cutoffMs, AUTH_STATE_SWEEP_BATCH_SIZE),
     ]);
     const result = {
       flowsCompacted: compactedFlows.meta.changes,

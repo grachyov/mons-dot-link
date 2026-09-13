@@ -1,5 +1,6 @@
 import type { EventMutation } from "../../../runtime/eventCommands.js";
 import { classifyD1Failure } from "./d1Failure.ts";
+import { parseEventProgressOutbox } from "./eventProgressCodec.ts";
 import type {
   TransactionDecision,
   TransactionResult,
@@ -1594,7 +1595,69 @@ async function commitEventMutationsInternal(
       );
       continue;
     }
-    const record = validateEventProgressOutbox(outboxId, raw);
+    let record = validateEventProgressOutbox(outboxId, raw);
+    const stored = await db
+      .prepare(
+        `SELECT record_json FROM event_progress_outboxes
+         WHERE outbox_id = ? AND status = 'pending'`,
+      )
+      .bind(outboxId)
+      .first<{ record_json: string }>();
+    guards.push(
+      guardStatement(
+        db,
+        stored
+          ? `NOT EXISTS (
+               SELECT 1 FROM event_progress_outboxes
+               WHERE outbox_id = ? AND status = 'pending' AND record_json = ?
+             )`
+          : `EXISTS (
+               SELECT 1 FROM event_progress_outboxes
+               WHERE outbox_id = ? AND status = 'pending'
+             )`,
+        stored ? [outboxId, stored.record_json] : [outboxId],
+      ),
+    );
+    const previous = stored
+      ? await parseEventProgressOutbox(outboxId, decodeJson(stored.record_json))
+      : null;
+    if (stored && !previous) {
+      mutations.push(
+        db
+          .prepare(
+            `INSERT INTO event_progress_outboxes (
+               outbox_id, event_id, status, run_at_ms, last_queued_at_ms, record_json
+             )
+             SELECT outbox_id, event_id, 'dead', NULL, ?,
+               json_object(
+                 'deadAtMs', ?, 'originalRecord', json(record_json),
+                 'reason', 'invalid-event-progress-outbox'
+               )
+             FROM event_progress_outboxes
+             WHERE status = 'pending' AND outbox_id = ? AND record_json = ?
+             ON CONFLICT (status, outbox_id) DO UPDATE SET
+               event_id = excluded.event_id,
+               run_at_ms = NULL,
+               last_queued_at_ms = excluded.last_queued_at_ms,
+               record_json = excluded.record_json`,
+          )
+          .bind(nowMs, nowMs, outboxId, stored.record_json),
+      );
+    }
+    if (
+      previous &&
+      (record.reason === "event-prize-announcement" ||
+        record.reason === "sunday-mons-reminder") &&
+      Number.isSafeInteger(record.firstQueuedAtMs)
+    ) {
+      record = {
+        ...record,
+        firstQueuedAtMs: Math.min(
+          previous.outbox.firstQueuedAtMs,
+          Number(record.firstQueuedAtMs),
+        ),
+      };
+    }
     mutations.push(
       db
         .prepare(
@@ -1607,14 +1670,7 @@ async function commitEventMutationsInternal(
              status = 'pending',
              run_at_ms = excluded.run_at_ms,
              last_queued_at_ms = excluded.last_queued_at_ms,
-             record_json = CASE
-               WHEN json_extract(excluded.record_json, '$.reason') IN ('event-prize-announcement', 'sunday-mons-reminder')
-               THEN json_set(excluded.record_json, '$.firstQueuedAtMs', MIN(
-                 json_extract(event_progress_outboxes.record_json, '$.firstQueuedAtMs'),
-                 json_extract(excluded.record_json, '$.firstQueuedAtMs')
-               ))
-               ELSE excluded.record_json
-             END`,
+             record_json = excluded.record_json`,
         )
         .bind(
           outboxId,
@@ -1837,12 +1893,32 @@ async function commitEventMutationsInternal(
   return { eventRevisions, profilePrizeRevisions };
 }
 
-export function commitEventMutations(
+export async function commitEventMutations(
   db: EventD1Connection,
   changes: readonly EventMutation[],
   options: PublicEventMutationOptions,
 ): Promise<EventMutationResult> {
-  return commitEventMutationsInternal(db, changes, options);
+  const canRetry =
+    changes.length > 0 &&
+    changes.every(
+      (change) => change.kind === "progress-outbox" && change.value !== null,
+    ) &&
+    !options.expectedRecords &&
+    !options.expectedEventRevisions &&
+    !options.expectedProfilePrizeRevisions &&
+    !options.expectedTelegramStateRevisions &&
+    !options.eventLease &&
+    !options.transition;
+  const attempts = canRetry ? MAX_EVENT_TRANSACTION_ATTEMPTS : 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await commitEventMutationsInternal(db, changes, options);
+    } catch (error) {
+      if (!(error instanceof EventD1Conflict) || attempt + 1 === attempts)
+        throw error;
+    }
+  }
+  throw new EventD1Conflict();
 }
 export async function readEventLease(
   db: EventD1Connection,
