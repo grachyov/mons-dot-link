@@ -5,6 +5,7 @@ import {
   resolveAutomatchServerValues,
   AutomatchD1Failure,
   type AutomatchRecordMutation,
+  type AutomatchRecordSnapshot,
   type AutomatchD1StoreOptions,
 } from "../src/automatchD1.ts";
 import { isSafeRecordKey } from "../src/recordKeys.ts";
@@ -155,17 +156,146 @@ function validateQuery(query: StateQuery): void {
   }
 }
 
+function keyIntegerSql(expression: string): string {
+  const digits = `(CASE WHEN substr(${expression}, 1, 1) = '-' THEN substr(${expression}, 2) ELSE ${expression} END)`;
+  return `(CASE WHEN length(${digits}) BETWEEN 1 AND 10 AND ${digits} NOT GLOB '*[^0-9]*'
+    AND CAST(${expression} AS INTEGER) BETWEEN -2147483648 AND 2147483647
+    THEN CAST(${expression} AS INTEGER) END)`;
+}
+
+function keyOrderSql(expression: string): string {
+  const integer = keyIntegerSql(expression);
+  return `CASE WHEN ${integer} IS NULL THEN 1 ELSE 0 END, ${integer},
+    CASE WHEN ${integer} IS NOT NULL THEN length(${expression}) ELSE 0 END, ${expression} COLLATE BINARY`;
+}
+
+function jsonRankSql(column: string, field: string): string {
+  return `(CASE json_type(${column}, '$.${field}') WHEN 'false' THEN 1 WHEN 'true' THEN 2
+    WHEN 'integer' THEN 3 WHEN 'real' THEN 3 WHEN 'text' THEN 4
+    WHEN 'array' THEN 5 WHEN 'object' THEN 5 ELSE 0 END)`;
+}
+
+function queryBound(value: string | number | boolean | null | undefined): {
+  rank: number;
+  value: string | number;
+} {
+  if (value === null) return { rank: 0, value: 0 };
+  if (typeof value === "boolean") return { rank: value ? 2 : 1, value: 0 };
+  if (typeof value === "number") return { rank: 3, value };
+  if (typeof value === "string") return { rank: 4, value };
+  throw new TypeError("invalid-automatch-query-bound");
+}
+
+function querySql(
+  column: string,
+  query: StateQuery,
+): { where: string; order: string; values: Array<string | number> } {
+  validateQuery(query);
+  const field = query.orderBy || "$key";
+  const clauses = [`${column} IS NOT NULL`];
+  const values: Array<string | number> = [];
+  const rank = field === "$key" ? "4" : jsonRankSql(column, field);
+  const value =
+    field === "$key"
+      ? "record_key COLLATE BINARY"
+      : `json_extract(${column}, '$.${field}')`;
+  for (const [bound, operator] of [
+    ["equalTo", "="],
+    ["startAt", ">="],
+    ["endAt", "<="],
+  ] as const) {
+    if (!Object.hasOwn(query, bound)) continue;
+    const input = queryBound(query[bound]);
+    if (field === "$key") {
+      const key = String(input.value);
+      const integer = /^-?\d{1,10}$/.test(key) ? Number(key) : NaN;
+      const numeric =
+        Number.isInteger(integer) &&
+        integer >= -2147483648 &&
+        integer <= 2147483647;
+      if (operator === "=") {
+        clauses.push("record_key = ?");
+        values.push(key);
+      } else {
+        const expression = keyIntegerSql("record_key");
+        const tuple = `(CASE WHEN ${expression} IS NULL THEN 1 ELSE 0 END, COALESCE(${expression}, 0), CASE WHEN ${expression} IS NOT NULL THEN length(record_key) ELSE 0 END, record_key COLLATE BINARY)`;
+        clauses.push(`${tuple} ${operator} (?, ?, ?, ?)`);
+        values.push(
+          numeric ? 0 : 1,
+          numeric ? integer : 0,
+          numeric ? key.length : 0,
+          key,
+        );
+      }
+    } else if (operator === "=") {
+      clauses.push(
+        `${rank} = ?${input.rank === 3 || input.rank === 4 ? ` AND ${value} = ?` : ""}`,
+      );
+      values.push(input.rank);
+      if (input.rank === 3 || input.rank === 4) values.push(input.value);
+    } else {
+      clauses.push(
+        `(${rank} ${operator === ">=" ? ">" : "<"} ? OR (${rank} = ?${input.rank === 3 || input.rank === 4 ? ` AND ${value} ${operator} ?` : ""}))`,
+      );
+      values.push(input.rank, input.rank);
+      if (input.rank === 3 || input.rank === 4) values.push(input.value);
+    }
+  }
+  return {
+    where: clauses.join(" AND "),
+    order:
+      field === "$key"
+        ? keyOrderSql("record_key")
+        : `${rank}, CASE WHEN ${rank} IN (3, 4) THEN ${value} END, ${keyOrderSql("record_key")}`,
+    values,
+  };
+}
+
 export function createLegacyAutomatchD1Store(
   db: D1Database,
   options: AutomatchD1StoreOptions = {},
 ) {
   const store = createAutomatchD1Store(db, options);
   const { read, commit } = store;
-  const list = (
-    root: Parameters<typeof store.list>[0],
+  async function list(
+    root: AutomatchRoot,
     query: StateQuery = {},
     signal?: AbortSignal,
-  ) => store.list(root, query as Parameters<typeof store.list>[1], signal);
+  ): Promise<AutomatchRecordSnapshot[]> {
+    if (!Object.hasOwn(AUTOMATCH_RECORD_TABLES, root))
+      throw new TypeError("invalid-automatch-root");
+    const { table, valueColumn, revisionColumn } =
+      AUTOMATCH_RECORD_TABLES[root];
+    const sql = querySql(valueColumn, query);
+    signal?.throwIfAborted();
+    const rows = await db
+      .withSession("first-primary")
+      .prepare(
+        `SELECT record_key, ${valueColumn} AS payload_json, ${revisionColumn} AS revision
+         FROM ${table} WHERE ${sql.where} ORDER BY ${sql.order}${query.limitToFirst === undefined ? "" : " LIMIT ?"}`,
+      )
+      .bind(
+        ...sql.values,
+        ...(query.limitToFirst === undefined ? [] : [query.limitToFirst]),
+      )
+      .all<{
+        record_key: string;
+        payload_json: string | null;
+        revision: number;
+      }>();
+    signal?.throwIfAborted();
+    return rows.results.map((row) => {
+      requireKey(row.record_key);
+      if (!Number.isSafeInteger(row.revision) || row.revision < 0)
+        throw new AutomatchD1Failure("automatch-record-corrupt");
+      return {
+        root,
+        key: row.record_key,
+        value: row.payload_json === null ? null : JSON.parse(row.payload_json),
+        revision: row.revision,
+      };
+    });
+  }
   const now = options.now || Date.now;
   async function getPath(
     path: string,

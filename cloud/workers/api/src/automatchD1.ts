@@ -8,15 +8,6 @@ import { STATE_VALUE_FIELD } from "./stateCompatibility.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import { validateTelegramTransactionDecision } from "./telegramTransaction.ts";
 
-type AutomatchCollectionQuery = {
-  orderBy?: "$key" | "uid" | "updatedAtMs" | "lastQueuedAtMs";
-  equalTo?: string | number | boolean | null;
-  startAt?: string | number | boolean | null;
-  endAt?: string | number | boolean | null;
-  limitToFirst?: number;
-  shallow?: boolean;
-};
-
 export const AUTOMATCH_RECORD_TABLES = {
   automatch: {
     table: "automatch_entries",
@@ -452,65 +443,15 @@ export function resolveAutomatchServerValues(
   return value;
 }
 
-const QUERY_FIELDS = new Set([
-  "endAt",
-  "equalTo",
-  "limitToFirst",
-  "orderBy",
-  "shallow",
-  "startAt",
-]);
-const ORDER_FIELDS = new Set([
-  "$key",
-  "uid",
-  "profileId",
-  "updatedAtMs",
-  "lastQueuedAtMs",
-  "completedAtMs",
-]);
-
-function validateQuery(query: AutomatchCollectionQuery): void {
-  if (Object.keys(query).some((field) => !QUERY_FIELDS.has(field))) {
-    throw new TypeError("unsupported-automatch-query");
-  }
-  if (query.orderBy !== undefined && !ORDER_FIELDS.has(query.orderBy)) {
-    throw new TypeError("unsupported-automatch-query-order");
-  }
-  if (
-    query.limitToFirst !== undefined &&
-    (!Number.isSafeInteger(query.limitToFirst) || query.limitToFirst < 1)
-  ) {
+function validateQueryLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 1) {
     throw new TypeError("invalid-automatch-query-limit");
   }
-  if (query.shallow !== undefined && typeof query.shallow !== "boolean") {
-    throw new TypeError("invalid-automatch-query-shallow");
-  }
-  if (
-    query.shallow === true &&
-    Object.keys(query).some((field) => field !== "shallow")
-  ) {
-    throw new TypeError("unsupported-automatch-shallow-query");
-  }
-  if (
-    Object.hasOwn(query, "equalTo") &&
-    (Object.hasOwn(query, "startAt") || Object.hasOwn(query, "endAt"))
-  ) {
-    throw new TypeError("unsupported-automatch-query-range");
-  }
-  for (const field of ["startAt", "endAt", "equalTo"] as const) {
-    if (!Object.hasOwn(query, field)) continue;
-    const value = query[field];
-    if (
-      value !== null &&
-      typeof value !== "string" &&
-      typeof value !== "boolean" &&
-      !(typeof value === "number" && Number.isFinite(value))
-    ) {
-      throw new TypeError("invalid-automatch-query-bound");
-    }
-    if ((query.orderBy || "$key") === "$key" && typeof value !== "string") {
-      throw new TypeError("invalid-automatch-key-query-bound");
-    }
+}
+
+function validateQueryCutoff(value: number): void {
+  if (!Number.isFinite(value)) {
+    throw new TypeError("invalid-automatch-query-bound");
   }
 }
 
@@ -525,88 +466,6 @@ function keyOrderSql(expression: string): string {
   const integer = keyIntegerSql(expression);
   return `CASE WHEN ${integer} IS NULL THEN 1 ELSE 0 END, ${integer},
     CASE WHEN ${integer} IS NOT NULL THEN length(${expression}) ELSE 0 END, ${expression} COLLATE BINARY`;
-}
-
-function jsonRankSql(column: string, field: string): string {
-  return `(CASE json_type(${column}, '$.${field}') WHEN 'false' THEN 1 WHEN 'true' THEN 2
-    WHEN 'integer' THEN 3 WHEN 'real' THEN 3 WHEN 'text' THEN 4
-    WHEN 'array' THEN 5 WHEN 'object' THEN 5 ELSE 0 END)`;
-}
-
-function queryBound(value: string | number | boolean | null | undefined): {
-  rank: number;
-  value: string | number;
-} {
-  if (value === null) return { rank: 0, value: 0 };
-  if (typeof value === "boolean") return { rank: value ? 2 : 1, value: 0 };
-  if (typeof value === "number") return { rank: 3, value };
-  if (typeof value === "string") return { rank: 4, value };
-  throw new TypeError("invalid-automatch-query-bound");
-}
-
-function querySql(
-  column: string,
-  query: AutomatchCollectionQuery,
-): { where: string; order: string; values: Array<string | number> } {
-  validateQuery(query);
-  const field = query.orderBy || "$key";
-  const clauses = [`${column} IS NOT NULL`];
-  const values: Array<string | number> = [];
-  const rank = field === "$key" ? "4" : jsonRankSql(column, field);
-  const value =
-    field === "$key"
-      ? "record_key COLLATE BINARY"
-      : `json_extract(${column}, '$.${field}')`;
-  for (const [bound, operator] of [
-    ["equalTo", "="],
-    ["startAt", ">="],
-    ["endAt", "<="],
-  ] as const) {
-    if (!Object.hasOwn(query, bound)) continue;
-    const input = queryBound(query[bound]);
-    if (field === "$key") {
-      const key = String(input.value);
-      const integer = /^-?\d{1,10}$/.test(key) ? Number(key) : NaN;
-      const numeric =
-        Number.isInteger(integer) &&
-        integer >= -2147483648 &&
-        integer <= 2147483647;
-      if (operator === "=") {
-        clauses.push("record_key = ?");
-        values.push(key);
-      } else {
-        const expression = keyIntegerSql("record_key");
-        const tuple = `(CASE WHEN ${expression} IS NULL THEN 1 ELSE 0 END, COALESCE(${expression}, 0), CASE WHEN ${expression} IS NOT NULL THEN length(record_key) ELSE 0 END, record_key COLLATE BINARY)`;
-        clauses.push(`${tuple} ${operator} (?, ?, ?, ?)`);
-        values.push(
-          numeric ? 0 : 1,
-          numeric ? integer : 0,
-          numeric ? key.length : 0,
-          key,
-        );
-      }
-    } else if (operator === "=") {
-      clauses.push(
-        `${rank} = ?${input.rank === 3 || input.rank === 4 ? ` AND ${value} = ?` : ""}`,
-      );
-      values.push(input.rank);
-      if (input.rank === 3 || input.rank === 4) values.push(input.value);
-    } else {
-      clauses.push(
-        `(${rank} ${operator === ">=" ? ">" : "<"} ? OR (${rank} = ?${input.rank === 3 || input.rank === 4 ? ` AND ${value} ${operator} ?` : ""}))`,
-      );
-      values.push(input.rank, input.rank);
-      if (input.rank === 3 || input.rank === 4) values.push(input.value);
-    }
-  }
-  return {
-    where: clauses.join(" AND "),
-    order:
-      field === "$key"
-        ? keyOrderSql("record_key")
-        : `${rank}, CASE WHEN ${rank} IN (3, 4) THEN ${value} END, ${keyOrderSql("record_key")}`,
-    values,
-  };
 }
 
 export type AutomatchD1StoreOptions = {
@@ -697,27 +556,150 @@ export function createAutomatchD1Store(
     });
   }
 
-  async function list(
+  async function readValues(
     root: AutomatchRoot,
-    query: AutomatchCollectionQuery = {},
+    sql: string,
+    values: readonly (string | number)[],
     signal?: AbortSignal,
-  ): Promise<AutomatchRecordSnapshot[]> {
-    const { table, valueColumn, revisionColumn } = requireRoot(root);
-    const sql = querySql(valueColumn, query);
+  ): Promise<Record<string, unknown> | null> {
     signal?.throwIfAborted();
     const rows = await db
       .withSession("first-primary")
-      .prepare(
-        `SELECT record_key, ${valueColumn} AS payload_json, ${revisionColumn} AS revision
-       FROM ${table} WHERE ${sql.where} ORDER BY ${sql.order}${query.limitToFirst === undefined ? "" : " LIMIT ?"}`,
-      )
-      .bind(
-        ...sql.values,
-        ...(query.limitToFirst === undefined ? [] : [query.limitToFirst]),
-      )
+      .prepare(sql)
+      .bind(...values)
       .all<RecordRow>();
     signal?.throwIfAborted();
-    return rows.results.map((row) => decodeSnapshot(root, row));
+    if (!rows.results.length) return null;
+    return Object.fromEntries(
+      rows.results.map((row) => {
+        const snapshot = decodeSnapshot(root, row);
+        return [snapshot.key, snapshot.value];
+      }),
+    );
+  }
+
+  async function listAutomatchEntriesByLogin(
+    uid: string,
+    limit: number,
+    signal?: AbortSignal,
+  ) {
+    validateQueryLimit(limit);
+    if (typeof uid !== "string") {
+      throw new TypeError("invalid-automatch-query-bound");
+    }
+    return readValues(
+      "automatch",
+      `SELECT record_key, payload_json, revision FROM automatch_entries
+       WHERE payload_json IS NOT NULL
+         AND json_extract(payload_json, '$.uid') = ?
+         AND json_type(payload_json, '$.uid') = 'text'
+       ORDER BY ${keyOrderSql("record_key")} LIMIT ?`,
+      [uid, limit],
+      signal,
+    );
+  }
+
+  async function readFirstAutomatchEntry(signal?: AbortSignal) {
+    return readValues(
+      "automatch",
+      `SELECT record_key, payload_json, revision FROM automatch_entries
+       WHERE payload_json IS NOT NULL
+       ORDER BY ${keyOrderSql("record_key")} LIMIT 1`,
+      [],
+      signal,
+    );
+  }
+
+  async function listDueAutomatchTelegramOutboxes(
+    nowMs: number,
+    limit: number,
+    signal?: AbortSignal,
+  ) {
+    validateQueryLimit(limit);
+    validateQueryCutoff(nowMs);
+    return readValues(
+      "telegramProjectionOutbox/automatch",
+      `SELECT record_key, payload_json, revision
+       FROM automatch_telegram_projection_outbox
+       WHERE payload_json IS NOT NULL
+         AND json_type(payload_json, '$.updatedAtMs') IN ('integer', 'real')
+         AND json_extract(payload_json, '$.updatedAtMs') >= 0
+         AND json_extract(payload_json, '$.updatedAtMs') <= ?
+       ORDER BY json_extract(payload_json, '$.updatedAtMs'), ${keyOrderSql("record_key")}
+       LIMIT ?`,
+      [nowMs, limit],
+      signal,
+    );
+  }
+
+  async function listDueAutomatchProfileOutboxes(
+    beforeMs: number,
+    limit: number,
+    signal?: AbortSignal,
+  ) {
+    validateQueryLimit(limit);
+    validateQueryCutoff(beforeMs);
+    return readValues(
+      "profileGameProjectionOutbox/automatch",
+      `WITH null_due AS (
+         SELECT record_key, payload_json, revision, 0 AS sort_rank, NULL AS sort_value
+         FROM game_session_projection_outbox
+         WHERE payload_json IS NOT NULL
+           AND json_extract(payload_json, '$.lastQueuedAtMs') IS NULL
+         ORDER BY ${keyOrderSql("record_key")} LIMIT ?2
+       ), false_due AS (
+         SELECT record_key, payload_json, revision, 1 AS sort_rank, NULL AS sort_value
+         FROM game_session_projection_outbox
+         WHERE payload_json IS NOT NULL
+           AND json_extract(payload_json, '$.lastQueuedAtMs') = 0
+           AND json_type(payload_json, '$.lastQueuedAtMs') = 'false'
+         ORDER BY ${keyOrderSql("record_key")} LIMIT ?2
+       ), true_due AS (
+         SELECT record_key, payload_json, revision, 2 AS sort_rank, NULL AS sort_value
+         FROM game_session_projection_outbox
+         WHERE payload_json IS NOT NULL
+           AND json_extract(payload_json, '$.lastQueuedAtMs') = 1
+           AND json_type(payload_json, '$.lastQueuedAtMs') = 'true'
+         ORDER BY ${keyOrderSql("record_key")} LIMIT ?2
+       ), numeric_due AS (
+         SELECT record_key, payload_json, revision, 3 AS sort_rank,
+           json_extract(payload_json, '$.lastQueuedAtMs') AS sort_value
+         FROM game_session_projection_outbox
+         WHERE payload_json IS NOT NULL
+           AND json_extract(payload_json, '$.lastQueuedAtMs') <= ?1
+           AND json_type(payload_json, '$.lastQueuedAtMs') IN ('integer', 'real')
+         ORDER BY json_extract(payload_json, '$.lastQueuedAtMs'), ${keyOrderSql("record_key")}
+         LIMIT ?2
+       )
+       SELECT record_key, payload_json, revision FROM (
+         SELECT * FROM null_due
+         UNION ALL SELECT * FROM false_due
+         UNION ALL SELECT * FROM true_due
+         UNION ALL SELECT * FROM numeric_due
+       ) ORDER BY sort_rank, sort_value, ${keyOrderSql("record_key")} LIMIT ?2`,
+      [beforeMs, limit],
+      signal,
+    );
+  }
+
+  async function listMalformedAutomatchProfileOutboxes(
+    limit: number,
+    signal?: AbortSignal,
+  ) {
+    validateQueryLimit(limit);
+    return readValues(
+      "profileGameProjectionOutbox/automatch",
+      `SELECT record_key, payload_json, revision
+       FROM game_session_projection_outbox
+       WHERE payload_json IS NOT NULL
+         AND json_extract(payload_json, '$.lastQueuedAtMs') >= ''
+       ORDER BY CASE json_type(payload_json, '$.lastQueuedAtMs') WHEN 'text' THEN 0 ELSE 1 END,
+         CASE WHEN json_type(payload_json, '$.lastQueuedAtMs') = 'text'
+           THEN json_extract(payload_json, '$.lastQueuedAtMs') END,
+         ${keyOrderSql("record_key")} LIMIT ?`,
+      [limit],
+      signal,
+    );
   }
 
   async function listEntriesByLogins(
@@ -961,17 +943,6 @@ export function createAutomatchD1Store(
     throw new AutomatchD1Failure("automatch-transaction-contention");
   }
 
-  const values = async (
-    root: AutomatchRoot,
-    query: AutomatchCollectionQuery,
-    signal?: AbortSignal,
-  ) => {
-    const rows = await list(root, query, signal);
-    return rows.length
-      ? Object.fromEntries(rows.map((row) => [row.key, row.value]))
-      : null;
-  };
-
   async function expireReceipts(
     cutoffMs: number,
     limit = 1000,
@@ -1019,18 +990,8 @@ export function createAutomatchD1Store(
     prepareChanges,
     readAutomatchEntry: async (inviteId: string, signal?: AbortSignal) =>
       (await read("automatch", inviteId, signal)).value,
-    listAutomatchEntriesByLogin: (
-      uid: string,
-      limit: number,
-      signal?: AbortSignal,
-    ) =>
-      values(
-        "automatch",
-        { orderBy: "uid", equalTo: uid, limitToFirst: limit },
-        signal,
-      ),
-    readFirstAutomatchEntry: (signal?: AbortSignal) =>
-      values("automatch", { orderBy: "$key", limitToFirst: 1 }, signal),
+    listAutomatchEntriesByLogin,
+    readFirstAutomatchEntry,
     readMutationReceipt: async (operationId: string, signal?: AbortSignal) =>
       (await read("gameplayMutationReceipts", operationId, signal)).value,
     readAutomatchTelegramSource: async (
@@ -1059,21 +1020,7 @@ export function createAutomatchD1Store(
         update,
         signal,
       ),
-    listDueAutomatchTelegramOutboxes: (
-      nowMs: number,
-      limit: number,
-      signal?: AbortSignal,
-    ) =>
-      values(
-        "telegramProjectionOutbox/automatch",
-        {
-          orderBy: "updatedAtMs",
-          startAt: 0,
-          endAt: nowMs,
-          limitToFirst: limit,
-        },
-        signal,
-      ),
+    listDueAutomatchTelegramOutboxes,
     readAutomatchProfileOutbox: async (
       inviteId: string,
       signal?: AbortSignal,
@@ -1091,26 +1038,8 @@ export function createAutomatchD1Store(
         update,
         signal,
       ),
-    listDueAutomatchProfileOutboxes: (
-      beforeMs: number,
-      limit: number,
-      signal?: AbortSignal,
-    ) =>
-      values(
-        "profileGameProjectionOutbox/automatch",
-        { orderBy: "lastQueuedAtMs", endAt: beforeMs, limitToFirst: limit },
-        signal,
-      ),
-    listMalformedAutomatchProfileOutboxes: (
-      limit: number,
-      signal?: AbortSignal,
-    ) =>
-      values(
-        "profileGameProjectionOutbox/automatch",
-        { orderBy: "lastQueuedAtMs", startAt: "", limitToFirst: limit },
-        signal,
-      ),
-    list,
+    listDueAutomatchProfileOutboxes,
+    listMalformedAutomatchProfileOutboxes,
     listEntriesByLogins,
     buildRevisionGuardStatements,
     buildCommitStatements,
