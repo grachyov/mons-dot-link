@@ -11,11 +11,13 @@ export function guardStatement(
   db: D1Database,
   failurePredicate: string,
   values: D1Value[],
+  kind: "conflict" | "invariant" = "conflict",
 ): D1PreparedStatement {
+  // NOT NULL identifies optimistic guards; CHECK remains a permanent invariant.
   return db
     .prepare(
       `INSERT INTO profile_transaction_guards (singleton)
-       SELECT 0 WHERE ${failurePredicate}`,
+       SELECT ${kind === "conflict" ? "NULL" : "0"} WHERE ${failurePredicate}`,
     )
     .bind(...values);
 }

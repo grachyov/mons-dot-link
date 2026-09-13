@@ -1,4 +1,5 @@
 import type { EventMutation } from "../../../runtime/eventCommands.js";
+import { classifyD1Failure } from "./d1Failure.ts";
 import type {
   TransactionDecision,
   TransactionResult,
@@ -25,7 +26,8 @@ const EVENT_WRITE_ADMISSION_TTL_MS = 5 * 60 * 1_000;
 const EVENT_STATUSES = new Set(["scheduled", "active", "ended", "dismissed"]);
 const UTF8_ENCODER = new TextEncoder();
 
-export type EventD1Connection = Pick<D1Database, "batch" | "prepare">;
+export type EventD1Connection = Pick<D1Database, "batch" | "prepare"> &
+  Partial<Pick<D1Database, "withSession">>;
 export type ConditionalSnapshot<T> =
   { notModified: true; revision: number } | { notModified: false; snapshot: T };
 export type EventStorageMode = "frozen" | "d1";
@@ -93,8 +95,8 @@ export class EventD1Conflict extends EventD1Failure {
 }
 
 export class EventWritesDisabled extends EventD1Failure {
-  constructor() {
-    super("event-writes-disabled");
+  constructor(options?: ErrorOptions) {
+    super("event-writes-disabled", options);
   }
 }
 
@@ -806,11 +808,17 @@ function guardStatement(
   db: EventD1Connection,
   failurePredicate: string,
   values: unknown[],
+  kind: "conflict" | "invariant" = "conflict",
 ): D1PreparedStatement {
+  // Reinsert the sentinel for identifiable conflicts; a missing sentinel fails CHECK.
+  const value =
+    kind === "conflict"
+      ? "CASE WHEN EXISTS (SELECT 1 FROM event_transaction_guards WHERE singleton = 1) THEN 1 ELSE 0 END"
+      : "0";
   return db
     .prepare(
       `INSERT INTO event_transaction_guards (singleton)
-       SELECT 0 WHERE ${failurePredicate}`,
+       SELECT ${value} WHERE ${failurePredicate}`,
     )
     .bind(...values);
 }
@@ -834,6 +842,7 @@ function eventWriteAdmissionGuard(
          AND control.storage_mode = 'd1'
      )`,
     [admission.admissionId, admission.freezeGeneration],
+    "invariant",
   );
 }
 
@@ -857,15 +866,78 @@ function eventLeaseGuard(
          )
      )`,
     [eventId, lockId, ownerUid],
+    "invariant",
   );
 }
 
-function isConstraintFailure(error: unknown): boolean {
-  const message =
-    error instanceof Error ? `${error.name}: ${error.message}` : "";
-  return /constraint|event_transaction_guards|event transition|event pending|foreign key/i.test(
-    message,
-  );
+async function rethrowEventBatchFailure(
+  db: EventD1Connection,
+  error: unknown,
+  options: { admission: EventWriteAdmission; eventLease?: EventLeaseGuard },
+): Promise<never> {
+  const failure = classifyD1Failure(error);
+  if (failure === "event-conflict") {
+    throw new EventD1Conflict("event-d1-conflict", { cause: error });
+  }
+  if (failure === "guard") {
+    let control: {
+      storage_mode: string;
+      admission_valid: number;
+      lease_valid: number;
+    } | null;
+    try {
+      const primary = db.withSession?.("first-primary") || db;
+      control = await primary
+        .prepare(
+          `SELECT control.storage_mode,
+             EXISTS (
+               SELECT 1 FROM event_write_admissions AS admission
+               WHERE admission.admission_id = ?
+                 AND admission.freeze_generation = ?
+                 AND admission.freeze_generation = control.freeze_generation
+                 AND admission.expires_at_ms > CAST(
+                   (julianday('now') - 2440587.5) * 86400000 AS INTEGER
+                 )
+             ) AS admission_valid,
+             (? IS NULL OR EXISTS (
+               SELECT 1 FROM event_leases
+               WHERE event_id = ? AND lease_id = ? AND owner_uid = ?
+                 AND expires_at_ms > CAST(
+                   (julianday('now') - 2440587.5) * 86400000 AS INTEGER
+                 )
+             )) AS lease_valid
+           FROM event_runtime_control AS control WHERE singleton = 1`,
+        )
+        .bind(
+          options.admission.admissionId,
+          options.admission.freezeGeneration,
+          options.eventLease?.eventId ?? null,
+          options.eventLease?.eventId ?? null,
+          options.eventLease?.lockId ?? null,
+          options.eventLease?.ownerUid ?? null,
+        )
+        .first<typeof control>();
+    } catch {
+      throw new EventD1Failure("event-d1-unavailable", { cause: error });
+    }
+    if (control?.storage_mode === "frozen") {
+      throw new EventWritesDisabled({ cause: error });
+    }
+    if (control?.storage_mode === "d1") {
+      if (control.admission_valid === 0) {
+        throw new EventD1Failure("event-write-admission-invalid", {
+          cause: error,
+        });
+      }
+      if (control.lease_valid === 0) {
+        throw new EventD1Failure("event-lease-lost", { cause: error });
+      }
+    }
+  }
+  if (failure !== "unknown") {
+    throw new EventD1Failure("event-d1-integrity", { cause: error });
+  }
+  throw error;
 }
 
 function setNested(
@@ -1197,7 +1269,7 @@ async function commitEventMutationsInternal(
             throw new EventD1Failure("event-deletion-unsupported");
           state.next = validateEventAggregate(eventId, value);
         } else {
-          if (!state.next) throw new EventD1Conflict("event-not-found");
+          if (!state.next) throw new EventD1Failure("event-not-found");
           if (change.kind === "event-round")
             setNested(state.next, ["rounds", exactKey(change.roundKey)], value);
           if (change.kind === "event-match-status")
@@ -1242,7 +1314,7 @@ async function commitEventMutationsInternal(
         const eventId = exactKey(change.eventId);
         if (!eventId) throw new EventD1Failure("invalid-event-path");
         const state = await getEventMutationState(db, eventStates, eventId);
-        if (!state.next) throw new EventD1Conflict("event-not-found");
+        if (!state.next) throw new EventD1Failure("event-not-found");
         const selections = await ensureSelections(db, eventId, state);
         if (change.kind === "prize-selections") {
           const replacement = value === null ? {} : value;
@@ -1304,7 +1376,7 @@ async function commitEventMutationsInternal(
       case "progress-dispatched": {
         const outboxId = exactKey(change.outboxId);
         const current = await readEventProgressOutbox(db, outboxId);
-        if (!current) throw new EventD1Conflict("event-progress-not-found");
+        if (!current) throw new EventD1Failure("event-progress-not-found");
         progressUpdates.set(outboxId, {
           ...cloneJson(current),
           lastQueuedAtMs: value,
@@ -1361,7 +1433,7 @@ async function commitEventMutationsInternal(
       transitionEventId,
     );
     if (state.pendingTransitionId !== transitionId) {
-      throw new EventD1Conflict("event-transition-not-owned");
+      throw new EventD1Failure("event-transition-not-owned");
     }
   }
 
@@ -1381,7 +1453,7 @@ async function commitEventMutationsInternal(
       (options.transition?.eventId !== eventId ||
         options.transition.transitionId !== state.pendingTransitionId)
     ) {
-      throw new EventD1Conflict("event-transition-pending");
+      throw new EventD1Failure("event-transition-pending");
     }
     const expected =
       options.expectedEventRevisions?.[eventId] ?? state.revision;
@@ -1398,6 +1470,7 @@ async function commitEventMutationsInternal(
                AND expected_revision = ? AND status = 'pending'
            )`,
           [options.transition!.transitionId, eventId, expected],
+          "invariant",
         ),
       );
     }
@@ -1759,10 +1832,7 @@ async function commitEventMutationsInternal(
   try {
     await db.batch([...guards, ...mutations]);
   } catch (error) {
-    if (isConstraintFailure(error)) {
-      throw new EventD1Conflict("event-d1-conflict", { cause: error });
-    }
-    throw error;
+    await rethrowEventBatchFailure(db, error, options);
   }
   return { eventRevisions, profilePrizeRevisions };
 }
@@ -2155,10 +2225,7 @@ async function transactEventCoordination<
       ]);
       return results[1];
     } catch (error) {
-      if (isConstraintFailure(error)) {
-        throw new EventD1Conflict("event-d1-conflict", { cause: error });
-      }
-      throw error;
+      return rethrowEventBatchFailure(db, error, options);
     }
   };
   eventId = exactKey(eventId);
@@ -2413,6 +2480,7 @@ export async function createEventTransitionIntent(
              AND pending_transition_id != ?
          )`,
         [intent.eventId, intent.transitionId],
+        "invariant",
       ),
       db
         .prepare(
@@ -2439,6 +2507,7 @@ export async function createEventTransitionIntent(
              AND intent_json = ?
          )`,
         [intent.transitionId, intent.eventId, intent.expectedRevision, encoded],
+        "invariant",
       ),
       db
         .prepare(
@@ -2448,10 +2517,7 @@ export async function createEventTransitionIntent(
         .bind(intent.transitionId, intent.eventId, intent.expectedRevision),
     ]);
   } catch (error) {
-    if (isConstraintFailure(error)) {
-      throw new EventD1Conflict("event-transition-conflict", { cause: error });
-    }
-    throw error;
+    await rethrowEventBatchFailure(db, error, options);
   }
 }
 

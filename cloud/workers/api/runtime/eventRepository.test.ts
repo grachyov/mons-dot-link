@@ -1424,7 +1424,7 @@ describe("typed event repository", () => {
     await transactEventRepositoryFixture(client, lockPath, () => ({
       value: { ...originalLock, lockId: "successor-lock" },
     }));
-    await expect(writePrize()).rejects.toThrow("event-d1-conflict");
+    await expect(writePrize()).rejects.toThrow("event-lease-lost");
     expect(await readEventOwnedPath(testEnv.EVENT_DB, targetPath)).toBeNull();
 
     await transactEventRepositoryFixture(client, lockPath, () => ({
@@ -1435,7 +1435,7 @@ describe("typed event repository", () => {
         expiresAtMs: nowMs - 1_000,
       },
     }));
-    await expect(writePrize()).rejects.toThrow("event-d1-conflict");
+    await expect(writePrize()).rejects.toThrow("event-lease-lost");
     expect(await readEventOwnedPath(testEnv.EVENT_DB, targetPath)).toBeNull();
   });
 

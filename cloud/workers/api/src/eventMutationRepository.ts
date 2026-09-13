@@ -3,9 +3,13 @@ import {
   createEventGameplayRepository,
   type EventGameplayRepository,
 } from "./eventRepository.ts";
-import { createEventProfileGameProjectionRepository } from "./eventProfileGameProjectionProducer.ts";
-import { createEventTelegramProjectionRepository } from "./eventTelegramProjectionProducer.ts";
-import { createEventAnnouncementScheduleRepository } from "./eventPrizeAnnouncementSchedule.ts";
+import { prepareEventProfileGameProjection } from "./eventProfileGameProjectionProducer.ts";
+import { prepareEventTelegramProjection } from "./eventTelegramProjectionProducer.ts";
+import { prepareEventAnnouncementSchedule } from "./eventPrizeAnnouncementSchedule.ts";
+import {
+  commitPreparedEventMutation,
+  createEventMutationReads,
+} from "./eventMutationCommit.ts";
 
 type EventMutationRepositoryOptions = {
   baseRepository?: GameplayRepository;
@@ -20,17 +24,28 @@ export function createEventMutationRepository(
   const eventRepository =
     options.eventRepository ||
     createEventGameplayRepository(env, options.baseRepository);
-  const announcementRepository = createEventAnnouncementScheduleRepository(
-    env,
-    eventRepository,
-    { schedule: options.schedule },
-  );
-  const telegramRepository = createEventTelegramProjectionRepository(
-    env,
-    announcementRepository,
-    { schedule: options.schedule },
-  );
-  return createEventProfileGameProjectionRepository(env, telegramRepository, {
-    schedule: options.schedule,
-  });
+  return {
+    ...eventRepository,
+    async commitEventPlan(updates, signal) {
+      const reads = createEventMutationReads(eventRepository, signal);
+      const profile = await prepareEventProfileGameProjection(
+        env,
+        updates,
+        reads,
+      );
+      const telegram = prepareEventTelegramProjection(env, updates);
+      const announcements = await prepareEventAnnouncementSchedule(
+        env,
+        updates,
+        reads,
+      );
+      await commitPreparedEventMutation(
+        eventRepository,
+        updates,
+        [profile, telegram, announcements],
+        signal,
+        options.schedule,
+      );
+    },
+  };
 }

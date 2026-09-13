@@ -319,6 +319,22 @@ describe("socket session lifetime", () => {
     expect(await spectator.read()).toBe(REACTION_HEARTBEAT_RESPONSE);
   });
 
+  it("expires a match session before its five-second repair deadline", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const { room, inviteId } = await fixture();
+    const participant = await connect(room, "matches", inviteId, now + 2_000);
+    expect(
+      await runInDurableObject(room, (_instance, state) =>
+        state.storage.getAlarm(),
+      ),
+    ).toBe(now + 2_000);
+    clock.mockReturnValue(now + 2_000);
+    expect(await runDurableObjectAlarm(room)).toBe(true);
+    expect(await participant.closed).toBe(4001);
+    expect(participant.messages).toEqual([]);
+  });
+
   it("expired participants receive no reaction or presentation broadcasts", async () => {
     const { room, inviteId } = await fixture();
     const expiry = Date.now() + 300_000;

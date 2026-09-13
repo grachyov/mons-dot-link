@@ -18,6 +18,7 @@ import {
 } from "@mons/shared/reactions";
 import type { InviteReactions } from "../src/inviteReactions.ts";
 import type { MatchSyncMetadata } from "../src/matchSync.ts";
+import { MATCH_SYNC_REPAIR_MS } from "../src/matchSyncRoom.ts";
 
 type Room = DurableObjectStub<InviteReactions>;
 type Source = {
@@ -301,20 +302,27 @@ describe("live match snapshots", () => {
     expect((await closed).code).toBe(1008);
   });
 
-  it("recovers lost notifications after one second and stops polling after the last subscriber", async () => {
+  it("repairs lost notifications after five seconds and stops after the last subscriber", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     const { room, inviteId, source } = await fixture();
     const channel = await connect(room, inviteId);
     await channel.snapshot();
     const due = await runInDurableObject(room, (_instance, state) =>
       state.storage.getAlarm(),
     );
-    expect(due! - Date.now()).toBeLessThanOrEqual(MATCH_SYNC_REFRESH_MS);
+    expect(due).toBe(now + MATCH_SYNC_REPAIR_MS);
     source.matches.set(`guest-login/${inviteId}`, {
       ...match,
       color: "black",
       fen: "changed",
       flatMovesString: "x",
     });
+    const initialReads = source.reads.length;
+    clock.mockReturnValue(now + MATCH_SYNC_REFRESH_MS);
+    await runDurableObjectAlarm(room);
+    expect(source.reads).toHaveLength(initialReads);
+    expect(channel.messages).toHaveLength(0);
     await runNextAlarm(room);
     expect(await channel.snapshot()).toMatchObject({
       revision: 2,
@@ -331,7 +339,7 @@ describe("live match snapshots", () => {
     ).toBeNull();
   });
 
-  it("keeps match and metadata polling cadences separate in the shared alarm", async () => {
+  it("shares one metadata read when match and metadata repairs are due together", async () => {
     vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
     const { room, inviteId, source } = await fixture();
     const channel = await connect(room, inviteId);
@@ -356,21 +364,34 @@ describe("live match snapshots", () => {
     );
     await metadataChannel.read();
     const reads = source.metadataReads;
+    const matchReads = source.reads.length;
     source.invite.hostRematches = "1";
-    for (let i = 0; i < 4; i++) await runNextAlarm(room);
-    expect(source.metadataReads).toBe(reads);
-    expect(metadataChannel.messages).toHaveLength(0);
     await runNextAlarm(room);
     expect(
       JSON.parse(await metadataChannel.read()).snapshot.hostRematches,
     ).toBe("1");
     expect(source.metadataReads).toBe(reads + 1);
+    expect(source.reads).toHaveLength(matchReads + 2);
     await close(channel.socket);
     await runNextAlarm(room);
     const next = await runInDurableObject(room, (_instance, state) =>
       state.storage.getAlarm(),
     );
     expect(next).not.toBeNull();
+  });
+
+  it("rechecks access at the repair deadline with only match subscribers", async () => {
+    const { room, inviteId, source } = await fixture();
+    const channel = await connect(room, inviteId);
+    await channel.snapshot();
+    const closed = new Promise<CloseEvent>((resolve) =>
+      channel.socket.addEventListener("close", resolve, { once: true }),
+    );
+    source.invite.hostId = "replacement-login";
+    await runNextAlarm(room);
+    expect((await closed).code).toBe(1008);
+    expect(channel.messages).toHaveLength(0);
+    expect(source.metadataReads).toBe(2);
   });
 
   it("replaces in-flight stale source reads before returning a coalesced snapshot", async () => {

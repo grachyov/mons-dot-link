@@ -498,7 +498,7 @@ describe("event transitions with canonical D1 invitation metadata", () => {
        BEFORE UPDATE OF revision ON event_records WHEN NEW.revision > OLD.revision
        BEGIN SELECT RAISE(ABORT, 'event-finalization-failed'); END`,
     ).run();
-    await expect(f.start()).rejects.toThrow("event-d1-conflict");
+    await expect(f.start()).rejects.toThrow("event-d1-integrity");
     expect(await count("invite_sources")).toBe(1);
     expect(await count("invite_event_effect_receipts")).toBe(1);
     const writes = f.writes.length;

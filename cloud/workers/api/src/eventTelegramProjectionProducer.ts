@@ -6,6 +6,10 @@ import { STATE_FAILURE_MESSAGES } from "./stateCompatibility.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import type { EventTelegramProjectionTask } from "./telegramProjectionTasks.ts";
+import {
+  commitPreparedEventMutation,
+  type PreparedEventMutation,
+} from "./eventMutationCommit.ts";
 
 export const EVENT_TELEGRAM_PROJECTION_OUTBOX_ROOT =
   "telegramProjectionOutbox/event";
@@ -61,11 +65,11 @@ export function buildEventTelegramProjectionOutbox(
   };
 }
 
-export function createEventTelegramProjectionRepository(
+export function prepareEventTelegramProjection(
   env: Env,
-  repository: EventGameplayRepository,
+  updates: readonly EventCommand[],
   dependencies: ProducerDependencies = {},
-): EventGameplayRepository {
+): PreparedEventMutation | null {
   const createRequestId =
     dependencies.createRequestId || (() => crypto.randomUUID());
   const enqueue =
@@ -74,59 +78,68 @@ export function createEventTelegramProjectionRepository(
       env.TELEGRAM_PROJECTION_QUEUE.send(task));
   const logger = dependencies.logger || console;
   const now = dependencies.now || Date.now;
+  const eventIds = eventIdsFromUpdates(updates);
+  if (eventIds.length === 0) return null;
+  const updatedAtMs = now();
+  const tasks = eventIds.map((eventId) => ({
+    kind: "event-telegram-projection" as const,
+    eventId,
+    requestId: createRequestId(),
+  }));
+  const commands: EventCommitPlan = [];
+  for (const task of tasks) {
+    commands.push(
+      {
+        kind: "telegram-outbox",
+        eventId: task.eventId,
+        value: buildEventTelegramProjectionOutbox(task.requestId, updatedAtMs),
+      },
+      {
+        kind: "telegram-generation",
+        eventId: task.eventId,
+        value: 1,
+        increment: true,
+      },
+    );
+  }
+  return {
+    commands,
+    async dispatch() {
+      const results = await Promise.allSettled(tasks.map(enqueue));
+      for (let index = 0; index < results.length; index += 1) {
+        if (results[index].status === "rejected") {
+          logger.error(
+            JSON.stringify({
+              event: "event_telegram_projection_enqueue_failed",
+              eventId: tasks[index].eventId,
+            }),
+          );
+        }
+      }
+    },
+  };
+}
+
+export function createEventTelegramProjectionRepository(
+  env: Env,
+  repository: EventGameplayRepository,
+  dependencies: ProducerDependencies = {},
+): EventGameplayRepository {
   return {
     ...repository,
     async commitEventPlan(updates, signal) {
-      const eventIds = eventIdsFromUpdates(updates);
-      if (eventIds.length === 0) {
-        await repository.commitEventPlan(updates, signal);
-        return;
-      }
-      const updatedAtMs = now();
-      const tasks = eventIds.map((eventId) => ({
-        kind: "event-telegram-projection" as const,
-        eventId,
-        requestId: createRequestId(),
-      }));
-      const nextUpdates: EventCommitPlan = [...updates];
-      for (const task of tasks) {
-        nextUpdates.push(
-          {
-            kind: "telegram-outbox",
-            eventId: task.eventId,
-            value: buildEventTelegramProjectionOutbox(
-              task.requestId,
-              updatedAtMs,
-            ),
-          },
-          {
-            kind: "telegram-generation",
-            eventId: task.eventId,
-            value: 1,
-            increment: true,
-          },
-        );
-      }
-      await repository.commitEventPlan(nextUpdates, signal);
-      const dispatch = async () => {
-        const results = await Promise.allSettled(tasks.map(enqueue));
-        for (let index = 0; index < results.length; index += 1) {
-          if (results[index].status === "rejected") {
-            logger.error(
-              JSON.stringify({
-                event: "event_telegram_projection_enqueue_failed",
-                eventId: tasks[index].eventId,
-              }),
-            );
-          }
-        }
-      };
-      const work = dispatch();
-      if (dependencies.schedule) {
-        dependencies.schedule(work);
-        return;
-      }
-      await work;
+      const prepared = prepareEventTelegramProjection(
+        env,
+        updates,
+        dependencies,
+      );
+      await commitPreparedEventMutation(
+        repository,
+        updates,
+        [prepared],
+        signal,
+        dependencies.schedule,
+      );
     },
   };
 }

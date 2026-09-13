@@ -5,7 +5,12 @@ import type {
 import { getOwnerProfileIds } from "../../../runtime/events/eventProjectionModel.js";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
-
+import {
+  commitPreparedEventMutation,
+  createEventMutationReads,
+  type EventMutationReads,
+  type PreparedEventMutation,
+} from "./eventMutationCommit.ts";
 import type { EventProfileGameProjectionTask } from "./profileGameProjectionTasks.ts";
 
 const PROFILE_GAME_EVENT_FIELDS = new Set([
@@ -51,11 +56,12 @@ export function eventIdsFromProfileGameProjectionUpdates(
   ].sort();
 }
 
-export function createEventProfileGameProjectionRepository(
+export async function prepareEventProfileGameProjection(
   env: Env,
-  repository: EventGameplayRepository,
+  updates: readonly EventCommand[],
+  reads: Pick<EventMutationReads, "readEvent">,
   dependencies: ProducerDependencies = {},
-): EventGameplayRepository {
+): Promise<PreparedEventMutation | null> {
   const createRequestId =
     dependencies.createRequestId || (() => crypto.randomUUID());
   const enqueue =
@@ -64,98 +70,111 @@ export function createEventProfileGameProjectionRepository(
       env.PROFILE_GAME_PROJECTION_QUEUE.send(task));
   const logger = dependencies.logger || console;
   const now = dependencies.now || Date.now;
+  const eventIds = eventIdsFromProfileGameProjectionUpdates(updates);
+  if (eventIds.length === 0) return null;
+  const previousEvents = await Promise.all(
+    eventIds.map((eventId) => reads.readEvent(eventId)),
+  );
+  const timestamp = now();
+  const tasks = eventIds.map((eventId) => ({
+    kind: "event-profile-game-projection" as const,
+    eventId,
+    requestId: createRequestId(),
+  }));
+  const commands: EventCommitPlan = [];
+  for (let index = 0; index < tasks.length; index += 1) {
+    const event = toRecord(previousEvents[index]);
+    const participants = toRecord(event?.participants) || {};
+    const eventId = tasks[index].eventId;
+    commands.push(
+      {
+        kind: "profile-game-outbox-field",
+        eventId,
+        field: "schemaVersion",
+        value: 1,
+      },
+      {
+        kind: "profile-game-outbox-field",
+        eventId,
+        field: "status",
+        value: "pending",
+      },
+      {
+        kind: "profile-game-outbox-field",
+        eventId,
+        field: "requestId",
+        value: tasks[index].requestId,
+      },
+      {
+        kind: "profile-game-outbox-field",
+        eventId,
+        field: "lastQueuedAtMs",
+        value: timestamp,
+      },
+      {
+        kind: "profile-game-outbox-field",
+        eventId,
+        field: "reason",
+        value: null,
+      },
+      {
+        kind: "profile-game-outbox-field",
+        eventId,
+        field: "deadAtMs",
+        value: null,
+      },
+    );
+    for (const profileId of new Set(getOwnerProfileIds(participants))) {
+      if (typeof profileId !== "string" || profileId.length === 0) continue;
+      if (!isSafeRecordKey(profileId))
+        throw new TypeError("invalid event projection cleanup profile id");
+      commands.push({
+        kind: "profile-game-outbox-cleanup",
+        eventId,
+        profileId,
+        value: true,
+      });
+    }
+  }
+  return {
+    commands,
+    async dispatch() {
+      const results = await Promise.allSettled(tasks.map(enqueue));
+      for (let index = 0; index < results.length; index += 1) {
+        if (results[index].status === "rejected") {
+          logger.error(
+            JSON.stringify({
+              event: "event_profile_game_projection_enqueue_failed",
+              eventId: tasks[index].eventId,
+            }),
+          );
+        }
+      }
+    },
+  };
+}
+
+export function createEventProfileGameProjectionRepository(
+  env: Env,
+  repository: EventGameplayRepository,
+  dependencies: ProducerDependencies = {},
+): EventGameplayRepository {
   return {
     ...repository,
     async commitEventPlan(updates, signal) {
-      const eventIds = eventIdsFromProfileGameProjectionUpdates(updates);
-      if (eventIds.length === 0) {
-        await repository.commitEventPlan(updates, signal);
-        return;
-      }
-      const previousEvents = await Promise.all(
-        eventIds.map((eventId) => repository.readEvent(eventId, signal)),
+      const prepared = await prepareEventProfileGameProjection(
+        env,
+        updates,
+        createEventMutationReads(repository, signal),
+        dependencies,
       );
-      const timestamp = now();
-      const tasks = eventIds.map((eventId) => ({
-        kind: "event-profile-game-projection" as const,
-        eventId,
-        requestId: createRequestId(),
-      }));
-      const nextUpdates: EventCommitPlan = [...updates];
-      for (let index = 0; index < tasks.length; index += 1) {
-        const event = toRecord(previousEvents[index]);
-        const participants = toRecord(event?.participants) || {};
-        const eventId = tasks[index].eventId;
-        nextUpdates.push(
-          {
-            kind: "profile-game-outbox-field",
-            eventId,
-            field: "schemaVersion",
-            value: 1,
-          },
-          {
-            kind: "profile-game-outbox-field",
-            eventId,
-            field: "status",
-            value: "pending",
-          },
-          {
-            kind: "profile-game-outbox-field",
-            eventId,
-            field: "requestId",
-            value: tasks[index].requestId,
-          },
-          {
-            kind: "profile-game-outbox-field",
-            eventId,
-            field: "lastQueuedAtMs",
-            value: timestamp,
-          },
-          {
-            kind: "profile-game-outbox-field",
-            eventId,
-            field: "reason",
-            value: null,
-          },
-          {
-            kind: "profile-game-outbox-field",
-            eventId,
-            field: "deadAtMs",
-            value: null,
-          },
-        );
-        for (const profileId of new Set(getOwnerProfileIds(participants))) {
-          if (typeof profileId !== "string" || profileId.length === 0) continue;
-          if (!isSafeRecordKey(profileId))
-            throw new TypeError("invalid event projection cleanup profile id");
-          nextUpdates.push({
-            kind: "profile-game-outbox-cleanup",
-            eventId,
-            profileId,
-            value: true,
-          });
-        }
-      }
-      await repository.commitEventPlan(nextUpdates, signal);
-      const dispatch = async () => {
-        const results = await Promise.allSettled(tasks.map(enqueue));
-        for (let index = 0; index < results.length; index += 1) {
-          if (results[index].status === "rejected") {
-            logger.error(
-              JSON.stringify({
-                event: "event_profile_game_projection_enqueue_failed",
-                eventId: tasks[index].eventId,
-              }),
-            );
-          }
-        }
-      };
-      const work = dispatch();
-      if (dependencies.schedule) {
-        dependencies.schedule(work);
-        return;
-      }
-      await work;
+      await commitPreparedEventMutation(
+        repository,
+        updates,
+        [prepared],
+        signal,
+        dependencies.schedule,
+      );
     },
   };
 }

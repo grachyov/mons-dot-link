@@ -251,14 +251,15 @@ describe("canonical match room integration", () => {
     const { room, rpc, inviteId, input } = await fixture(host, guest);
     await createMatches(input);
     let attempts = 0;
+    const failDelivery = async () => {
+      attempts++;
+      throw new Error("temporary-dispatch-failure");
+    };
     await runInDurableObject(room, (instance) => {
       const target = instance as unknown as {
         deliverMatchEffect: (effect: MatchStateEffect) => Promise<void>;
       };
-      target.deliverMatchEffect = async () => {
-        attempts++;
-        throw new Error("temporary-dispatch-failure");
-      };
+      target.deliverMatchEffect = failDelivery;
     });
     expect(
       unwrapMatchStateRpc(
@@ -272,6 +273,24 @@ describe("canonical match room integration", () => {
         }),
       ),
     ).toEqual({ ok: true });
+    expect(attempts).toBe(0);
+    expect(
+      await runInDurableObject(room, (_instance, state) =>
+        state.storage.sql
+          .exec<{ attempts: number; completed_at_ms: number | null }>(
+            "SELECT attempts, completed_at_ms FROM match_state_effects",
+          )
+          .one(),
+      ),
+    ).toEqual({ attempts: 0, completed_at_ms: null });
+    await evictDurableObject(room);
+    await runInDurableObject(room, (instance) => {
+      const target = instance as unknown as {
+        deliverMatchEffect: (effect: MatchStateEffect) => Promise<void>;
+      };
+      target.deliverMatchEffect = failDelivery;
+    });
+    expect(await runDurableObjectAlarm(room)).toBe(true);
     expect(attempts).toBe(1);
     const saved = await runInDurableObject(room, (_instance, state) => ({
       effect: state.storage.sql

@@ -190,7 +190,7 @@ test("event Telegram projection uses a dedicated lock without changing domain lo
   assert.equal(coreSource.includes("eventTelegramProjectionLocks"), true);
 });
 
-test("event HTTP and Workflow runtimes install every outbox producer", () => {
+test("event HTTP and Workflow runtimes install the mutation coordinator", () => {
   for (const relativePath of [
     "cloud/workers/api/src/eventRoute.ts",
     "cloud/workers/api/src/eventProgress.ts",
@@ -205,21 +205,6 @@ test("event HTTP and Workflow runtimes install every outbox producer", () => {
       relativePath,
     );
   }
-  const composition = fs.readFileSync(
-    path.join(
-      repositoryRoot,
-      "cloud/workers/api/src/eventMutationRepository.ts",
-    ),
-    "utf8",
-  );
-  const telegramProducer = composition.indexOf(
-    "createEventTelegramProjectionRepository(",
-  );
-  const profileProducer = composition.indexOf(
-    "createEventProfileGameProjectionRepository(",
-  );
-  assert.ok(telegramProducer >= 0);
-  assert.ok(profileProducer > telegramProducer);
 });
 
 test("Worker tests exercise the production event projector", () => {

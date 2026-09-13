@@ -448,7 +448,6 @@ export class InviteReactions
       this.inviteChannels.pinInvite(input.inviteId);
       const result = await this.matchState.claimTimer(input);
       await this.notifyCanonicalMatches(input.inviteId, [input.matchId]);
-      await this.dispatchMatchEffects();
       return result;
     });
   }
@@ -565,17 +564,43 @@ export class InviteReactions
   }
 
   async alarm(): Promise<void> {
-    this.socketSessions.nextExpiry();
-    await this.dispatchMatchEffects();
-    await this.inviteChannels.alarm();
-    await this.matchSync.alarm();
-    const due = [
-      this.inviteChannels.nextAlarm(),
-      this.matchSync.nextAlarm(),
-      this.matchState.nextEffectAt(),
-      this.socketSessions.nextExpiry(),
-    ].filter((value): value is number => typeof value === "number");
-    if (due.length) await this.scheduleInviteAlarm(Math.min(...due));
+    const failures: unknown[] = [];
+    try {
+      for (const work of [
+        () => this.socketSessions.nextExpiry(),
+        () => this.inviteChannels.alarm(),
+        () => this.matchSync.alarm(),
+        () => this.socketSessions.nextExpiry(),
+        () => this.dispatchMatchEffects(),
+      ]) {
+        try {
+          await work();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+    } finally {
+      const due: number[] = [];
+      for (const readDeadline of [
+        () => this.inviteChannels.nextAlarm(),
+        () => this.matchSync.nextAlarm(),
+        () => this.matchState.nextEffectAt(),
+        () => this.socketSessions.nextExpiry(),
+      ]) {
+        try {
+          const deadline = readDeadline();
+          if (deadline !== null) due.push(deadline);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      try {
+        if (due.length) await this.scheduleInviteAlarm(Math.min(...due));
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length) throw failures[0];
   }
 
   private matchRoomFull(role: string, ip: string): boolean {

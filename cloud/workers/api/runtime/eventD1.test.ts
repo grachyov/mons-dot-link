@@ -1,6 +1,8 @@
 import { commitEventMutations } from "../src/eventD1.ts";
 import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import type { EventMutation } from "../../../runtime/eventCommands.js";
+import { classifyD1Failure } from "../src/d1Failure.ts";
+import { observeD1FailureDatabase } from "./d1FailureTestUtils.ts";
 import {
   patchEventOwnedPaths as patchEventOwnedPathsRaw,
   readEventOwnedPath,
@@ -18,6 +20,7 @@ import {
   createEventTransitionIntent as createEventTransitionIntentRaw,
   EventD1Conflict,
   EventD1Failure,
+  EventWritesDisabled,
   listDueEventProfileGameProjectionOutboxes,
   listDueEventProgressOutboxes,
   listDueEventTelegramProjectionOutboxes,
@@ -34,6 +37,8 @@ import {
   readProfileEventPrizesIfChanged,
   readProfileEventPrizeAssignment,
   releaseEventWriteAdmission,
+  transactEventField,
+  transactEventLease,
   validateEventAggregate,
   type EventD1Connection,
 } from "../src/eventD1.ts";
@@ -219,6 +224,212 @@ describe("event D1 store", () => {
       testEnv.EVENT_DB.prepare("DELETE FROM event_records"),
       testEnv.EVENT_DB.prepare("DELETE FROM profile_event_prize_revisions"),
     ]);
+  });
+
+  describe("commit failure classification", () => {
+    it.each(["present", "missing"])(
+      "fails closed with a %s event guard sentinel",
+      async (sentinel) => {
+        await patchEventOwnedPaths(testEnv.EVENT_DB, {
+          [`events/${eventId}`]: eventRecord(),
+        });
+        await withD1Admission(async (admission) => {
+          const observed = observeD1FailureDatabase(testEnv.EVENT_DB, {
+            async beforeBatch() {
+              await testEnv.EVENT_DB.prepare(
+                "UPDATE event_records SET revision = revision + 1 WHERE event_id = ?",
+              )
+                .bind(eventId)
+                .run();
+            },
+          });
+          if (sentinel === "missing") {
+            await testEnv.EVENT_DB.prepare(
+              "DELETE FROM event_transaction_guards",
+            ).run();
+          }
+          let failure: unknown;
+          try {
+            failure = await commitEventMutations(
+              observed.database,
+              [
+                {
+                  kind: "event-field",
+                  eventId,
+                  field: "status",
+                  value: "active",
+                },
+              ],
+              { admission },
+            ).catch((error: unknown) => error);
+          } finally {
+            if (sentinel === "missing") {
+              await testEnv.EVENT_DB.prepare(
+                "INSERT INTO event_transaction_guards VALUES (1)",
+              ).run();
+            }
+          }
+          expect(failure).toBeInstanceOf(
+            sentinel === "present" ? EventD1Conflict : EventD1Failure,
+          );
+          if (sentinel === "missing")
+            expect(failure).not.toBeInstanceOf(EventD1Conflict);
+          expect(failure).toHaveProperty("cause", observed.errors[0]);
+          expect(classifyD1Failure(observed.errors[0])).toBe(
+            sentinel === "present" ? "event-conflict" : "guard",
+          );
+          expect(observed.batches).toHaveLength(1);
+          expect(observed.sessions).toEqual(
+            sentinel === "present" ? [] : ["first-primary"],
+          );
+          expect(
+            (await readEventSnapshot(testEnv.EVENT_DB, eventId)).event?.status,
+          ).toBe("scheduled");
+        });
+      },
+    );
+
+    it.each([
+      "expired admission",
+      "lost lease",
+      "SQL failure",
+      "diagnostic unavailable",
+    ])("does not retry a transaction after %s", async (mode) => {
+      await patchEventOwnedPaths(testEnv.EVENT_DB, {
+        [`events/${eventId}`]: eventRecord(),
+      });
+      const before = await readEventSnapshot(testEnv.EVENT_DB, eventId);
+      const admission = await acquireEventWriteAdmission(
+        testEnv.EVENT_DB,
+        mode === "expired admission" ? { nowMs: 1, ttlMs: 1 } : {},
+      );
+      const observed = observeD1FailureDatabase(testEnv.EVENT_DB, {
+        diagnosticFailure:
+          mode === "diagnostic unavailable"
+            ? new Error("session-unavailable")
+            : undefined,
+      });
+      if (mode === "SQL failure") {
+        await testEnv.EVENT_DB.prepare(
+          `CREATE TRIGGER guard_test_event_update BEFORE UPDATE ON event_records
+             BEGIN SELECT RAISE(ABORT, 'event pending transition is unavailable'); END`,
+        ).run();
+      }
+      let decisions = 0;
+      try {
+        const failure = await transactEventField(
+          observed.database,
+          eventId,
+          "status",
+          () => {
+            decisions++;
+            return { value: "active" };
+          },
+          {
+            admission,
+            ...(mode === "lost lease" || mode === "diagnostic unavailable"
+              ? {
+                  eventLease: {
+                    eventId,
+                    lockId: "missing",
+                    ownerUid: "missing",
+                  },
+                }
+              : {}),
+          },
+        ).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(EventD1Failure);
+        expect(failure).not.toBeInstanceOf(EventD1Conflict);
+        expect(failure).toHaveProperty("cause", observed.errors[0]);
+        expect(observed.errors).toHaveLength(1);
+        expect(decisions).toBe(1);
+        expect(observed.sessions).toEqual(
+          mode === "SQL failure" ? [] : ["first-primary"],
+        );
+        expect(failure).toHaveProperty(
+          "message",
+          mode === "expired admission"
+            ? "event-write-admission-invalid"
+            : mode === "lost lease"
+              ? "event-lease-lost"
+              : mode === "diagnostic unavailable"
+                ? "event-d1-unavailable"
+                : "event-d1-integrity",
+        );
+        expect(await readEventSnapshot(testEnv.EVENT_DB, eventId)).toEqual(
+          before,
+        );
+      } finally {
+        if (mode === "SQL failure") {
+          await testEnv.EVENT_DB.prepare(
+            "DROP TRIGGER guard_test_event_update",
+          ).run();
+        }
+        await releaseEventWriteAdmission(testEnv.EVENT_DB, admission);
+      }
+    });
+
+    it("maps frozen coordination and transition writes without losing their causes", async () => {
+      await patchEventOwnedPaths(testEnv.EVENT_DB, {
+        [`events/${eventId}`]: eventRecord(),
+      });
+      const admission = await acquireEventWriteAdmission(testEnv.EVENT_DB);
+      await releaseEventWriteAdmission(testEnv.EVENT_DB, admission);
+      await transitionEventStorageMode(testEnv.EVENT_DB, {
+        expected: { storageMode: "d1" },
+        next: { storageMode: "frozen" },
+        nowMs: 100,
+      });
+      try {
+        for (const kind of ["lease", "transition"] as const) {
+          const observed = observeD1FailureDatabase(testEnv.EVENT_DB);
+          const operation =
+            kind === "lease"
+              ? transactEventLease(
+                  observed.database,
+                  eventId,
+                  () => ({
+                    value: {
+                      lockId: "test-lease",
+                      ownerUid: "test-owner",
+                      acquiredAtMs: 1,
+                      refreshedAtMs: 1,
+                      expiresAtMs: 2,
+                    },
+                  }),
+                  { admission },
+                )
+              : createEventTransitionIntentRaw(
+                  observed.database,
+                  {
+                    schemaVersion: 1,
+                    transitionId: "test-transition",
+                    eventId,
+                    expectedRevision: 1,
+                    canonicalUpdates: {},
+                    rtdbEffects: {},
+                    createdAtMs: 1,
+                    updatedAtMs: 1,
+                  },
+                  { admission },
+                );
+          const failure = await operation.catch((error: unknown) => error);
+          expect(failure).toBeInstanceOf(EventWritesDisabled);
+          expect(failure).toHaveProperty("cause", observed.errors[0]);
+          expect(observed.batches).toHaveLength(1);
+          expect(observed.sessions).toEqual(["first-primary"]);
+          expect(
+            await readEventSnapshot(testEnv.EVENT_DB, eventId),
+          ).toMatchObject({ revision: 1, event: { status: "scheduled" } });
+        }
+      } finally {
+        await transitionEventStorageMode(testEnv.EVENT_DB, {
+          expected: { storageMode: "frozen" },
+          next: { storageMode: "d1" },
+          nowMs: 101,
+        });
+      }
+    });
   });
 
   it("rejects invalid nested typed identities and stored paths without changing the event", async () => {
@@ -1291,7 +1502,7 @@ describe("event D1 store", () => {
           value.transactionValue = root === "events" ? true : "1514";
           return { value };
         }),
-      ).rejects.toBeInstanceOf(EventD1Conflict);
+      ).rejects.toThrow("event-transition-pending");
       expect(attached).toBe(true);
       expect(await readEventSnapshot(testEnv.EVENT_DB, eventId)).toEqual(
         before,
@@ -1888,7 +2099,13 @@ describe("event D1 store", () => {
                   : {}),
               },
             ),
-          ).rejects.toBeInstanceOf(EventD1Conflict);
+          ).rejects.toThrow(
+            failure === "expired admission"
+              ? "event-write-admission-invalid"
+              : failure === "SQL failure"
+                ? "event-d1-integrity"
+                : "event-d1-conflict",
+          );
         } finally {
           if (admission !== active) {
             await releaseEventWriteAdmission(testEnv.EVENT_DB, admission);
@@ -2022,7 +2239,7 @@ describe("event D1 store", () => {
         { [`events/${eventId}`]: eventRecord() },
         { admission },
       ),
-    ).rejects.toBeInstanceOf(EventD1Conflict);
+    ).rejects.toThrow("event-write-admission-invalid");
     await expect(
       readEventSnapshot(testEnv.EVENT_DB, eventId),
     ).resolves.toMatchObject({ event: null, revision: 0 });
@@ -2063,7 +2280,7 @@ describe("event D1 store", () => {
             },
             { admission },
           ),
-        ).rejects.toBeInstanceOf(EventD1Conflict);
+        ).rejects.toThrow("event-write-admission-invalid");
       }
       await expect(
         readEventSnapshot(testEnv.EVENT_DB, eventId),

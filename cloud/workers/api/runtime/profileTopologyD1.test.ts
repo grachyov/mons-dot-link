@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
-  CanonicalProfileConflict,
+  CanonicalProfileCorruption,
   commitCanonicalPlan,
   countCanonicalCommitStatements,
   materializeCanonicalProfile,
@@ -267,7 +267,7 @@ describe("scoped canonical profile topology", () => {
       const target = await fixture();
       await expect(
         commitCanonicalPlan(db, retirementPlan(source, target)),
-      ).rejects.toBeInstanceOf(CanonicalProfileConflict);
+      ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
       expect(
         await readCanonicalProfileAggregate(db, source.profile.profileId),
       ).toEqual(source);
@@ -388,7 +388,7 @@ describe("scoped canonical profile topology", () => {
               ],
             };
       await expect(commitCanonicalPlan(db, plan)).rejects.toBeInstanceOf(
-        CanonicalProfileConflict,
+        CanonicalProfileCorruption,
       );
       const stored = await readCanonicalProfileAggregate(
         db,
@@ -439,7 +439,7 @@ describe("scoped canonical profile topology", () => {
     await corruptRetirement(source, target);
     try {
       await expect(commitCanonicalPlan(db, plan)).rejects.toBeInstanceOf(
-        CanonicalProfileConflict,
+        CanonicalProfileCorruption,
       );
       const stored = await readCanonicalProfileAggregate(
         db,

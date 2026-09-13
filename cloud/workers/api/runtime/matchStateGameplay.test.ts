@@ -2,6 +2,7 @@ import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import { env } from "cloudflare:workers";
 import {
   applyD1Migrations,
+  runDurableObjectAlarm,
   runInDurableObject,
   type D1Migration,
 } from "cloudflare:test";
@@ -460,6 +461,28 @@ describe("gameplay with canonical Durable Object storage", () => {
       opponentId,
       timer: started.timer,
     });
+    const room = workerEnv.INVITE_REACTIONS.getByName(inviteId);
+    const pendingEffects = () =>
+      runInDurableObject(
+        room,
+        (_instance, durableState) =>
+          durableState.storage.sql
+            .exec<{ count: number }>(
+              "SELECT COUNT(*) AS count FROM match_state_effects WHERE completed_at_ms IS NULL",
+            )
+            .one().count,
+      );
+    expect(await pendingEffects()).toBe(1);
+    expect(
+      await db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM match_timer_starts WHERE match_id = ?",
+        )
+        .bind(inviteId)
+        .first("count"),
+    ).toBe(1);
+    expect(await runDurableObjectAlarm(room)).toBe(true);
+    expect(await pendingEffects()).toBe(0);
     expect(
       await db
         .prepare(

@@ -23,8 +23,9 @@ export class AuthApiFailure extends Error {
     code: AuthErrorCode,
     message: string,
     details?: unknown,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.status = status;
     this.code = code;
     this.details = details;
@@ -34,8 +35,8 @@ export class AuthApiFailure extends Error {
 export class ProfileWritesDisabledFailure extends AuthApiFailure {
   readonly profileWritesDisabled = true;
 
-  constructor() {
-    super(503, "unavailable", "profile-writes-disabled");
+  constructor(options?: ErrorOptions) {
+    super(503, "unavailable", "profile-writes-disabled", undefined, options);
   }
 }
 

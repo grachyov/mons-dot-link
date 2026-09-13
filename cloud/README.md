@@ -88,7 +88,7 @@ Paired invites allow spectators. Pending open invites require authentication; pe
 
 Reaction v1 and presentation v2 retain their protocol contracts and hibernating attachments. Registered actor existence and canonical Durable Object state are required for appearance reads. Appearance updates preserve operation-ID replay and expected revisions; immutable historical appearances do not change when live cosmetics change.
 
-The shared alarm recovers missed notifications and pending durable effects. Preserve its namespace, records, revisions, and per-channel ownership. `smoke:invite-lifecycle`, `smoke:reactions`, and `smoke:invite-metadata` verify the corresponding canonical behavior. Lifecycle checks own their temporary sessions and games and clean them up.
+Match mutations notify subscribers immediately; the server checks for missed match notifications every five seconds. HTTP cache freshness and browser fallback retain their one-second interval. The shared alarm handles session expiry and socket refreshes before delivering pending durable effects. Timer claims return after their durable commit and notification scheduling; downstream delivery runs through the alarm. Preserve its namespace, records, revisions, and per-channel ownership. `smoke:invite-lifecycle`, `smoke:reactions`, and `smoke:invite-metadata` verify the corresponding canonical behavior. Lifecycle checks own their temporary sessions and games and clean them up.
 
 ## Events, wagers, and withdrawals
 

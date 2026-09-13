@@ -19,6 +19,8 @@ import {
   type SocketSessions,
 } from "./socketSession.ts";
 
+export const MATCH_SYNC_REPAIR_MS = 5_000;
+
 type MatchSocketAttachment = {
   channel: "matches";
   schemaVersion: 1;
@@ -221,7 +223,7 @@ export class MatchSyncRoom {
         state.sourceEpoch = sourceEpoch;
         await this.scheduleMatch(
           matchId,
-          state.checkedAt + MATCH_SYNC_REFRESH_MS,
+          state.checkedAt + MATCH_SYNC_REPAIR_MS,
         );
         if (!current()) continue;
         return result;
@@ -359,7 +361,7 @@ export class MatchSyncRoom {
         });
       await this.scheduleMatch(
         matchId,
-        Date.now() + MATCH_SYNC_REFRESH_MS,
+        Date.now() + MATCH_SYNC_REPAIR_MS,
         true,
         true,
       );
@@ -454,7 +456,7 @@ export class MatchSyncRoom {
           if (this.admissions.get(matchId)) {
             this.ctx.storage.sql.exec(
               "UPDATE match_sync_snapshots SET next_at_ms = ? WHERE match_id = ?",
-              Date.now() + MATCH_SYNC_REFRESH_MS,
+              Date.now() + MATCH_SYNC_REPAIR_MS,
               matchId,
             );
             continue;

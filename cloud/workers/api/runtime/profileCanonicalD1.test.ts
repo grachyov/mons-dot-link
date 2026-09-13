@@ -32,6 +32,10 @@ import {
   type CanonicalRatingUpdateValue,
 } from "../src/profileCanonicalD1.ts";
 import { applyRetiredProfileMigrations } from "./profileTestMigrations.ts";
+import { ProfileWritesDisabledFailure } from "../src/authErrors.ts";
+import { classifyD1Failure } from "../src/d1Failure.ts";
+import { createProfileCustomizationRepository } from "../src/profileCustomizationRepository.ts";
+import { observeD1FailureDatabase } from "./d1FailureTestUtils.ts";
 
 const testEnv = env as Env & { TEST_PROFILE_D1_MIGRATIONS: D1Migration[] };
 
@@ -254,6 +258,136 @@ describe("canonical profile D1 store", () => {
 
   beforeEach(async () => {
     await resetCanonicalRows(testEnv.PROFILE_DB);
+  });
+
+  describe("commit failure classification", () => {
+    it("uses the runtime guard signature without diagnostic reads on success or conflict", async () => {
+      const value = profileValue("guard-signature");
+      const plan = {
+        expectations: [{ kind: "profile-absent", profileId: value.profile.id }],
+        mutations: [{ kind: "insert-active-profile", value }],
+      } as const;
+      const observed = observeD1FailureDatabase(testEnv.PROFILE_DB);
+      await commitCanonicalPlan(observed.database, plan);
+      const failure = await commitCanonicalPlan(observed.database, plan).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(CanonicalProfileConflict);
+      expect(failure).toHaveProperty("cause", observed.errors[0]);
+      expect(classifyD1Failure(observed.errors[0])).toBe("profile-conflict");
+      expect(observed.batches).toHaveLength(2);
+      expect(observed.sessions).toEqual([]);
+      expect(
+        (await readCanonicalProfile(testEnv.PROFILE_DB, value.profile.id))
+          ?.revision,
+      ).toBe(1);
+    });
+
+    it.each(["frozen", "diagnostic unavailable", "integrity", "revision"])(
+      "customization handles %s without retrying permanent failures",
+      async (mode) => {
+        const value = profileValue("guard-customization");
+        const loginUid = "guard-customization-login";
+        await commitCanonicalPlan(testEnv.PROFILE_DB, {
+          expectations: [
+            { kind: "profile-absent", profileId: value.profile.id },
+            { kind: "login-owner-absent", loginUid },
+          ],
+          mutations: [
+            { kind: "insert-active-profile", value },
+            {
+              kind: "insert-login-owner",
+              value: {
+                loginUid,
+                profileId: value.profile.id,
+                createdAtMs: 1_000,
+                updatedAtMs: 1_000,
+              },
+            },
+          ],
+        });
+        const observed = observeD1FailureDatabase(testEnv.PROFILE_DB, {
+          diagnosticFailure:
+            mode === "diagnostic unavailable"
+              ? new Error("diagnostic-failed")
+              : undefined,
+          async beforeBatch(attempt) {
+            if (attempt !== 1) return;
+            if (mode === "revision") {
+              await testEnv.PROFILE_DB.prepare(
+                "UPDATE profile_records SET revision = revision + 1 WHERE profile_id = ?",
+              )
+                .bind(value.profile.id)
+                .run();
+            } else if (mode === "integrity") {
+              await testEnv.PROFILE_DB.prepare(
+                `CREATE TRIGGER guard_test_profile_update BEFORE UPDATE ON profile_records
+                 BEGIN SELECT RAISE(ABORT, 'profile merge mappings are immutable'); END`,
+              ).run();
+            } else {
+              await testEnv.PROFILE_DB.prepare(
+                "UPDATE profile_canonical_control SET state = 'frozen' WHERE singleton = 1",
+              ).run();
+            }
+          },
+        });
+        try {
+          const repository = createProfileCustomizationRepository(testEnv, {
+            d1: observed.database,
+            now: () => 2_000,
+          });
+          const result = await repository
+            .updateCustomization(
+              loginUid,
+              { field: "tutorialCompleted", value: false },
+              async () => {},
+            )
+            .catch((error: unknown) => error);
+          if (mode === "revision") {
+            expect(result).toBe("updated");
+            expect(observed.batches).toHaveLength(2);
+            expect(observed.sessions).toEqual([]);
+            expect(classifyD1Failure(observed.errors[0])).toBe(
+              "profile-conflict",
+            );
+            expect(
+              (await readCanonicalProfile(testEnv.PROFILE_DB, value.profile.id))
+                ?.profile.isTutorialCompleted,
+            ).toBe(false);
+          } else {
+            expect(result).not.toBeInstanceOf(CanonicalProfileConflict);
+            expect(result).toHaveProperty("cause", observed.errors[0]);
+            expect(observed.batches).toHaveLength(1);
+            expect(observed.sessions).toEqual(
+              mode === "integrity" ? [] : ["first-primary"],
+            );
+            if (mode === "frozen")
+              expect(result).toBeInstanceOf(ProfileWritesDisabledFailure);
+            if (mode === "integrity")
+              expect(result).toBeInstanceOf(CanonicalProfileCorruption);
+            if (mode === "diagnostic unavailable")
+              expect(result).toHaveProperty(
+                "message",
+                "canonical-profile-unavailable",
+              );
+            expect(
+              (await readCanonicalProfile(testEnv.PROFILE_DB, value.profile.id))
+                ?.revision,
+            ).toBe(1);
+          }
+        } finally {
+          if (mode === "integrity") {
+            await testEnv.PROFILE_DB.prepare(
+              "DROP TRIGGER IF EXISTS guard_test_profile_update",
+            ).run();
+          } else if (mode !== "revision") {
+            await testEnv.PROFILE_DB.prepare(
+              "UPDATE profile_canonical_control SET state = 'active' WHERE singleton = 1",
+            ).run();
+          }
+        }
+      },
+    );
   });
 
   describe("auth recovery reader", () => {
@@ -1071,7 +1205,7 @@ describe("canonical profile D1 store", () => {
           },
         ],
       }),
-    ).rejects.toBeInstanceOf(CanonicalProfileConflict);
+    ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
     await expect(
       commitCanonicalPlan(testEnv.PROFILE_DB, {
         expectations: [
@@ -2417,7 +2551,7 @@ describe("canonical profile D1 store", () => {
           },
         ],
       }),
-    ).rejects.toBeInstanceOf(CanonicalProfileConflict);
+    ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
     expect(
       (await readCanonicalProfile(testEnv.PROFILE_DB, depthSource.profileId))
         ?.state,

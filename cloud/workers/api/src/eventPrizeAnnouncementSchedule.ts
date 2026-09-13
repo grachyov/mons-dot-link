@@ -1,4 +1,7 @@
-import type { EventCommitPlan } from "../../../runtime/eventCommands.js";
+import type {
+  EventCommand,
+  EventCommitPlan,
+} from "../../../runtime/eventCommands.js";
 import {
   EVENT_ANNOUNCEMENT_KINDS,
   EVENT_ANNOUNCEMENT_SPECS,
@@ -12,6 +15,12 @@ import {
 } from "./eventProgress.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
+import {
+  commitPreparedEventMutation,
+  createEventMutationReads,
+  type EventMutationReads,
+  type PreparedEventMutation,
+} from "./eventMutationCommit.ts";
 
 export const EVENT_PRIZE_ANNOUNCEMENT_REASON =
   EVENT_ANNOUNCEMENT_SPECS.prizes.reason;
@@ -75,7 +84,7 @@ export const buildSundayMonsReminderPlan = (
 ) => buildEventAnnouncementPlan(eventId, event, nowMs, "reminder");
 
 async function preserveSchedule(
-  repository: ScheduleRepository,
+  repository: Pick<ScheduleRepository, "readEventProgressOutbox">,
   plan: EventProgressPlan,
   signal?: AbortSignal,
 ): Promise<EventProgressPlan> {
@@ -136,89 +145,106 @@ export async function scheduleEventAnnouncements(
     throw new AggregateError(failures, "event-announcement-scheduling-failed");
 }
 
-export function createEventAnnouncementScheduleRepository(
+export async function prepareEventAnnouncementSchedule(
   env: Env,
-  repository: EventGameplayRepository,
+  updates: readonly EventCommand[],
+  reads: EventMutationReads,
   dependencies: ScheduleDependencies = {},
-): EventGameplayRepository {
+): Promise<PreparedEventMutation | null> {
   const now = dependencies.now || Date.now;
   const enqueue =
     dependencies.enqueue ||
     ((plan: EventProgressPlan) => ensureEventProgressWorkflow(env, plan));
   const logger = dependencies.logger || console;
+  const eventIds = new Set<string>();
+  for (const command of updates) {
+    if (
+      (command.kind === "event" ||
+        (command.kind === "event-field" &&
+          SCHEDULE_FIELDS.has(command.field))) &&
+      isSafeRecordKey(command.eventId)
+    )
+      eventIds.add(command.eventId);
+  }
+  const plans: EventProgressPlan[] = [];
+  const commands: EventCommitPlan = [];
+  for (const eventId of eventIds) {
+    const replacement = updates.findLast(
+      (command) => command.kind === "event" && command.eventId === eventId,
+    );
+    const event = toRecord(
+      replacement?.kind === "event"
+        ? replacement.value
+        : await reads.readEvent(eventId),
+    );
+    if (!event) continue;
+    const nextEvent = { ...event };
+    for (const command of updates)
+      if (
+        command.kind === "event-field" &&
+        command.eventId === eventId &&
+        SCHEDULE_FIELDS.has(command.field)
+      )
+        nextEvent[command.field] = command.value;
+    const discoveredAtMs = now();
+    for (const kind of EVENT_ANNOUNCEMENT_KINDS) {
+      const candidate = await buildEventAnnouncementPlan(
+        eventId,
+        nextEvent,
+        discoveredAtMs,
+        kind,
+      );
+      if (!candidate) continue;
+      const plan = await preserveSchedule(reads, candidate);
+      commands.push({
+        kind: "progress-outbox",
+        outboxId: plan.outboxId,
+        value: plan.outbox,
+      });
+      plans.push(plan);
+    }
+  }
+  if (plans.length === 0) return null;
+  return {
+    commands,
+    async dispatch() {
+      const results = await Promise.allSettled(plans.map(enqueue));
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          logger.error(
+            JSON.stringify({
+              event: "event_announcement_enqueue_failed",
+              eventId: plans[index].params.eventId,
+              reason: plans[index].params.reason,
+            }),
+          );
+        }
+      });
+    },
+  };
+}
+
+export function createEventAnnouncementScheduleRepository(
+  env: Env,
+  repository: EventGameplayRepository,
+  dependencies: ScheduleDependencies = {},
+): EventGameplayRepository {
   return {
     ...repository,
     async commitEventPlan(updates, signal) {
-      const eventIds = new Set<string>();
-      for (const command of updates) {
-        if (
-          (command.kind === "event" ||
-            (command.kind === "event-field" &&
-              SCHEDULE_FIELDS.has(command.field))) &&
-          isSafeRecordKey(command.eventId)
-        )
-          eventIds.add(command.eventId);
-      }
-      const plans: EventProgressPlan[] = [];
-      const nextUpdates: EventCommitPlan = [...updates];
-      for (const eventId of eventIds) {
-        const replacement = updates.findLast(
-          (command) => command.kind === "event" && command.eventId === eventId,
-        );
-        const event = toRecord(
-          replacement?.kind === "event"
-            ? replacement.value
-            : await repository.readEvent(eventId, signal),
-        );
-        if (!event) continue;
-        const nextEvent = { ...event };
-        for (const command of updates)
-          if (
-            command.kind === "event-field" &&
-            command.eventId === eventId &&
-            SCHEDULE_FIELDS.has(command.field)
-          )
-            nextEvent[command.field] = command.value;
-        const discoveredAtMs = now();
-        for (const kind of EVENT_ANNOUNCEMENT_KINDS) {
-          const candidate = await buildEventAnnouncementPlan(
-            eventId,
-            nextEvent,
-            discoveredAtMs,
-            kind,
-          );
-          if (!candidate) continue;
-          const plan = await preserveSchedule(repository, candidate, signal);
-          nextUpdates.push({
-            kind: "progress-outbox",
-            outboxId: plan.outboxId,
-            value: plan.outbox,
-          });
-          plans.push(plan);
-        }
-      }
-      await repository.commitEventPlan(nextUpdates, signal);
-      if (plans.length === 0) return;
-      const dispatch = async () => {
-        const results = await Promise.allSettled(plans.map(enqueue));
-        results.forEach((result, index) => {
-          if (result.status === "rejected") {
-            logger.error(
-              JSON.stringify({
-                event: "event_announcement_enqueue_failed",
-                eventId: plans[index].params.eventId,
-                reason: plans[index].params.reason,
-              }),
-            );
-          }
-        });
-      };
-      const work = dispatch();
-      if (dependencies.schedule) {
-        dependencies.schedule(work);
-      } else {
-        await work;
-      }
+      const prepared = await prepareEventAnnouncementSchedule(
+        env,
+        updates,
+        createEventMutationReads(repository, signal),
+        dependencies,
+      );
+      await commitPreparedEventMutation(
+        repository,
+        updates,
+        [prepared],
+        signal,
+        dependencies.schedule,
+      );
     },
   };
 }

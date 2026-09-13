@@ -1,4 +1,6 @@
 import { CANONICAL_PROFILE_TOPOLOGY_VIOLATION_PREDICATE } from "../profileTopologySql.ts";
+import { ProfileWritesDisabledFailure } from "../authErrors.ts";
+import { classifyD1Failure } from "../d1Failure.ts";
 import {
   type D1Value,
   type CanonicalProfileValue,
@@ -9,6 +11,7 @@ import {
   type CanonicalCommitPlan,
   type CanonicalExpectation,
   CanonicalProfileConflict,
+  CanonicalProfileCorruption,
 } from "./types.ts";
 import { profileWriteRow } from "./profiles.ts";
 import {
@@ -433,6 +436,7 @@ function mutationStatements(
              WHERE profile_id = ? AND state = 'active'
            )`,
           [mutation.value.profile.id],
+          "invariant",
         ),
         profileMutationStatement(db, mutation.value, false),
       ];
@@ -445,6 +449,7 @@ function mutationStatements(
              WHERE profile_id = ? AND state = 'active'
            )`,
           [mutation.profile.profile.id],
+          "invariant",
         ),
         profileMutationStatement(db, mutation.profile, false),
         mergeTargetMutationStatement(db, mutation.redirect),
@@ -459,6 +464,7 @@ function mutationStatements(
                AND merged_into_profile_id = ?
            )`,
           [mutation.profileId, mutation.targetProfileId],
+          "invariant",
         ),
         db
           .prepare(
@@ -471,14 +477,6 @@ function mutationStatements(
     default:
       return [mutationStatement(db, mutation)];
   }
-}
-
-function isConstraintFailure(error: unknown): boolean {
-  const message =
-    error instanceof Error ? `${error.name}: ${error.message}` : "";
-  return /constraint|profile_transaction_guards|immutable|permanent|profile merge|not active|cannot be deleted/i.test(
-    message,
-  );
 }
 
 function sameJsonObject(left: JsonObject, right: JsonObject): boolean {
@@ -1001,9 +999,12 @@ function canonicalTopologyGuardStatement(
   db: D1Database,
   plan: CanonicalCommitPlan,
 ): D1PreparedStatement {
-  return guardStatement(db, CANONICAL_PROFILE_TOPOLOGY_VIOLATION_PREDICATE, [
-    JSON.stringify(canonicalTopologyProfileIds(plan)),
-  ]);
+  return guardStatement(
+    db,
+    CANONICAL_PROFILE_TOPOLOGY_VIOLATION_PREDICATE,
+    [JSON.stringify(canonicalTopologyProfileIds(plan))],
+    "invariant",
+  );
 }
 
 export async function commitCanonicalPlan(
@@ -1020,6 +1021,7 @@ export async function commitCanonicalPlan(
          WHERE singleton = 1 AND state = 'active'
        )`,
       [],
+      "invariant",
     ),
     ...buildCanonicalGuardStatements(db, plan.expectations),
     ...plan.mutations.flatMap((mutation) => mutationStatements(db, mutation)),
@@ -1028,8 +1030,29 @@ export async function commitCanonicalPlan(
   try {
     await db.batch(statements);
   } catch (error) {
-    if (isConstraintFailure(error)) {
+    const failure = classifyD1Failure(error);
+    if (failure === "profile-conflict" || failure === "username-conflict") {
       throw new CanonicalProfileConflict({ cause: error });
+    }
+    if (failure === "guard") {
+      let control: { state: string } | null;
+      try {
+        control = await db
+          .withSession("first-primary")
+          .prepare(
+            "SELECT state FROM profile_canonical_control WHERE singleton = 1",
+          )
+          .first<{ state: string }>();
+      } catch {
+        throw new Error("canonical-profile-unavailable", { cause: error });
+      }
+      if (control?.state === "frozen") {
+        throw new ProfileWritesDisabledFailure({ cause: error });
+      }
+      throw new CanonicalProfileCorruption({ cause: error });
+    }
+    if (failure !== "unknown") {
+      throw new CanonicalProfileCorruption({ cause: error });
     }
     throw error;
   }
