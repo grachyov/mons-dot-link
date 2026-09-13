@@ -1,6 +1,10 @@
 import { STATE_EFFECTS_FIELD } from "./stateCompatibility.ts";
 import type { EventReads } from "../../../runtime/eventReads.js";
 import { createEventReadRepository } from "./eventReadRepository.ts";
+import {
+  createEventOutboxReadRepository,
+  type EventOutboxReads,
+} from "./eventOutboxReadRepository.ts";
 import { createAutomatchPersistence } from "./automatchPersistence.ts";
 import {
   type StateRepository,
@@ -14,9 +18,6 @@ import {
   acquireEventWriteAdmission,
   createEventTransitionIntent,
   listPendingEventTransitionIntents,
-  listDueEventProgressOutboxes,
-  listDueEventProfileGameProjectionOutboxes,
-  listDueEventTelegramProjectionOutboxes,
   listEventAggregates,
   patchEventOwnedPaths,
   readEventOwnedPath,
@@ -92,10 +93,13 @@ type EventLockGuard = {
   lockRoot: string;
   ownerUid: string;
 };
-export type EventGameplayRepository = GameplayRepository & EventReads;
+export type EventGameplayRepository = GameplayRepository &
+  EventReads &
+  EventOutboxReads;
 
 export type EventStateRepository = StateRepository &
-  EventReads & {
+  EventReads &
+  EventOutboxReads & {
     transactStoredProfileEventPrizeWithEventLease(
       path: string,
       updater: (current: unknown) => unknown,
@@ -620,6 +624,7 @@ export function createEventGameplayRepository(
   return {
     ...base,
     ...createEventReadRepository(env.EVENT_DB),
+    ...createEventOutboxReadRepository(env.EVENT_DB),
     getStatePath: eventClient.getPath,
     patchStateRoot: eventClient.patchRoot,
     transactStatePath: eventClient.transactPath,
@@ -783,6 +788,7 @@ export function createEventStateRepository(
   return {
     ...base,
     ...createEventReadRepository(env.EVENT_DB),
+    ...createEventOutboxReadRepository(env.EVENT_DB),
     async getPath(path, query, signal) {
       if (isTransitionReceiptPath(path)) {
         throw new Error("event-transition-receipt-path-reserved");
@@ -806,43 +812,6 @@ export function createEventStateRepository(
           status,
           limit: query.limitToFirst || 1_000,
         });
-      }
-      if (cleanPath === "eventProgressOutbox") {
-        const records = await listDueEventProgressOutboxes(
-          env.EVENT_DB,
-          typeof query?.endAt === "number"
-            ? query.endAt
-            : Number.MAX_SAFE_INTEGER,
-          query?.limitToFirst || 100,
-        );
-        return Object.fromEntries(
-          records.map(({ outboxId, record }) => [outboxId, record]),
-        );
-      }
-      if (cleanPath === "profileGameProjectionOutbox/event") {
-        if (query?.startAt === "") return {};
-        const records = await listDueEventProfileGameProjectionOutboxes(
-          env.EVENT_DB,
-          typeof query?.endAt === "number"
-            ? query.endAt
-            : Number.MAX_SAFE_INTEGER,
-          query?.limitToFirst || 100,
-        );
-        return Object.fromEntries(
-          records.map(({ eventId, record }) => [eventId, record]),
-        );
-      }
-      if (cleanPath === "telegramProjectionOutbox/event") {
-        const records = await listDueEventTelegramProjectionOutboxes(
-          env.EVENT_DB,
-          typeof query?.endAt === "number"
-            ? query.endAt
-            : Number.MAX_SAFE_INTEGER,
-          query?.limitToFirst || 100,
-        );
-        return Object.fromEntries(
-          records.map(({ eventId, record }) => [eventId, record]),
-        );
       }
       if (
         cleanPath.startsWith("profileEventPrizes/") &&

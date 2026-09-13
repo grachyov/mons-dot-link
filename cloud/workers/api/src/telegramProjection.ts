@@ -19,6 +19,7 @@ import {
 } from "../../../runtime/telegram/projectionCore.js";
 import type { StateRepository } from "./stateRepositoryTypes.ts";
 import { createEventStateRepository } from "./eventRepository.ts";
+import type { EventOutboxReads } from "./eventOutboxReadRepository.ts";
 import {
   createGameplayRepository,
   createRatingRepository,
@@ -67,7 +68,9 @@ type ProjectionDependencies = {
   createRating?: (env: Env) => RatingProjectionRepository;
   createStateRepository?: (
     env: Env,
-  ) => StateRepository & Pick<EventReads, "readEvent">;
+  ) => StateRepository &
+    Pick<EventReads, "readEvent"> &
+    Pick<EventOutboxReads, "listDueEventTelegramProjectionOutboxes">;
   createTelegram?: (env: Env) => TelegramRepository;
   createAnnouncements?: (
     env: Env,

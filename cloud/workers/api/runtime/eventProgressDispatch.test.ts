@@ -110,6 +110,7 @@ async function seedOutbox(): Promise<{
     plan,
     repository: {
       readEvent: client.readEvent,
+      listDueEventProgressOutboxes: client.listDueEventProgressOutboxes,
       getStatePath: client.getPath,
       patchStateRoot: client.patchRoot,
     },
@@ -154,6 +155,58 @@ describe("event-progress Workflow dispatch admissions", () => {
         `eventProgressOutbox/${plan.outboxId}`,
       ),
     ).toEqual(plan.outbox);
+    expect(await admissionCount()).toBe(0);
+  });
+
+  it("isolates BLOB outbox IDs so healthy dispatch and scheduled recovery continue", async () => {
+    const { plan, repository } = await seedOutbox();
+    const recordJson = JSON.stringify(plan.outbox);
+    await testEnv.EVENT_DB.prepare(
+      `INSERT INTO event_progress_outboxes (
+         outbox_id, event_id, status, run_at_ms, last_queued_at_ms, record_json
+       ) VALUES (CAST(? AS BLOB), ?, 'pending', NULL, 50, ?)`,
+    )
+      .bind("bad", eventId, recordJson)
+      .run();
+    const cursorRevision = await testEnv.EVENT_DB.prepare(
+      "SELECT revision FROM event_scheduled_recovery_cursor WHERE singleton = 1",
+    ).first<number>("revision");
+    const f = environment();
+
+    await sweepEventProgress(f.value, {
+      repository,
+      now: () => 200,
+      ratingRepository: null,
+    });
+
+    expect(f.operations).toContain("createBatch");
+    expect(
+      await readEventOwnedPath(
+        testEnv.EVENT_DB,
+        `eventProgressOutbox/${plan.outboxId}`,
+      ),
+    ).toEqual({ ...plan.outbox, lastQueuedAtMs: 200 });
+    expect(
+      await testEnv.EVENT_DB.prepare(
+        "SELECT revision FROM event_scheduled_recovery_cursor WHERE singleton = 1",
+      ).first<number>("revision"),
+    ).toBe(cursorRevision! + 1);
+    expect(
+      await testEnv.EVENT_DB.prepare(
+        `SELECT hex(outbox_id) AS outbox_id_hex, status, last_queued_at_ms,
+           record_json FROM event_progress_outboxes
+         WHERE typeof(outbox_id) = 'blob'`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        {
+          outbox_id_hex: "626164",
+          status: "pending",
+          last_queued_at_ms: 50,
+          record_json: recordJson,
+        },
+      ],
+    });
     expect(await admissionCount()).toBe(0);
   });
 

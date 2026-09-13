@@ -380,6 +380,7 @@ function applyStateTransaction(
 
 function projectionLockState(values = new Map<string, unknown>()) {
   return {
+    listDueEventProfileGameProjectionOutboxes: async () => [],
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
@@ -1808,6 +1809,7 @@ test("automatch Queue retries transient work without settling its outbox", async
   await handleProfileGameProjectionMessage(failed.message, TELEGRAM_TEST_ENV, {
     createLocks: () => locks,
     createStateRepository: () => ({
+      listDueEventProfileGameProjectionOutboxes: async () => [],
       readInviteMetadata: async () => {
         throw new Error("unexpected-invite-metadata-read");
       },
@@ -2202,17 +2204,16 @@ test("event recovery claims due outboxes and repairs malformed records", async (
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
-    getStatePath: async (path: string, query?: Record<string, unknown>) => {
-      assert.equal(path, "profileGameProjectionOutbox/event");
-      if (query?.endAt === 300_000) {
-        return Object.fromEntries(values);
-      }
-      assert.deepEqual(query, {
-        orderBy: "lastQueuedAtMs",
-        startAt: "",
-        limitToFirst: 10,
-      });
-      return null;
+    listDueEventProfileGameProjectionOutboxes: async (
+      beforeMs: number,
+      limit?: number,
+    ) => {
+      assert.equal(beforeMs, 300_000);
+      assert.equal(limit, 10);
+      return [...values].map(([eventId, record]) => ({ eventId, record }));
+    },
+    getStatePath: async () => {
+      throw new Error("unexpected-path-read");
     },
     transactStatePath: async (
       path: string,
@@ -2341,6 +2342,7 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
+    listDueEventProfileGameProjectionOutboxes: async () => [],
     getStatePath: async (path: string, query?: Record<string, unknown>) => {
       assert.equal(path, "profileGameProjectionOutbox/automatch");
       if (query?.endAt === 300_000) {

@@ -15,6 +15,7 @@ import {
 } from "../../../runtime/telegram/eventProjectionCore.js";
 import { createEventLockManagerCore } from "../../../runtime/events/lockManagerCore.js";
 import type { StateRepository } from "./stateRepositoryTypes.ts";
+import type { EventOutboxReads } from "./eventOutboxReadRepository.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import type { RatingProjectionRepository } from "./gameplayRepository.ts";
 import {
@@ -506,16 +507,17 @@ async function markInvalidEventProjectionSweepEntry(
 
 export async function sweepEventTelegramProjections(
   queue: Queue<TelegramProjectionTask>,
-  state: StateRepository,
+  state: StateRepository &
+    Pick<EventOutboxReads, "listDueEventTelegramProjectionOutboxes">,
   nowMs: number,
 ): Promise<number> {
-  const value = await state.getPath(EVENT_TELEGRAM_PROJECTION_OUTBOX_ROOT, {
-    orderBy: "updatedAtMs",
-    startAt: 0,
-    endAt: nowMs,
-    limitToFirst: EVENT_PROJECTION_SWEEP_LIMIT,
-  });
-  const entries = eventProjectionSweepEntries(value);
+  const records = await state.listDueEventTelegramProjectionOutboxes(
+    nowMs,
+    EVENT_PROJECTION_SWEEP_LIMIT,
+  );
+  const entries = eventProjectionSweepEntries(
+    Object.fromEntries(records.map(({ eventId, record }) => [eventId, record])),
+  );
   const candidates = entries.flatMap((entry) =>
     entry.kind === "candidate" ? [entry.value] : [],
   );

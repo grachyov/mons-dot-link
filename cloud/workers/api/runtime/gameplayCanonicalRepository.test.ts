@@ -20,6 +20,7 @@ import {
   readCanonicalWagerSettlement,
 } from "../src/profileCanonicalD1.ts";
 import { createProfileGameProjectionRuntime } from "../src/profileGameProjectionRepository.ts";
+import { createMiningRepository } from "../src/miningRepository.ts";
 import { getProfileGameProjection } from "../src/profileGamesD1.ts";
 import { loadEndedMatchResults } from "../../../runtime/telegram/eventProjectionCore.js";
 
@@ -630,7 +631,124 @@ describe("canonical gameplay repositories", () => {
       emoji: "",
       rating: 0,
     });
+    const miningOwnership = await createMiningRepository(
+      testEnv,
+    ).readProfileOwnershipSnapshot({
+      loginUids: [loginUid],
+      profileIds: [],
+    });
+    expect(miningOwnership).toEqual(gameplayOwnership);
+    expect(ratingOwnership).toEqual(gameplayOwnership);
   });
+
+  it.each([
+    { name: "absent", ratingPresent: false, emoji: 0 },
+    { name: "null", ratingPresent: true, emoji: "raw-emoji" },
+  ])(
+    "shares ownership mapping for merged and missing identities with $name ratings",
+    async ({ ratingPresent, emoji }) => {
+      const profileId = "d1-ownership-target";
+      const sourceProfileId = "d1-ownership-source";
+      const loginUids = ["d1-ownership-login-a", "d1-ownership-login-b"];
+      const value = materializeCanonicalProfile({
+        profile: profile(profileId, { username: null }),
+        createdAtMs: 1_000,
+        updatedAtMs: 1_000,
+        emojiPresent: false,
+        gameplayEmoji: emoji,
+        sortPresence: { rating: ratingPresent },
+        sortValues: { rating: null },
+      });
+      await commitCanonicalPlan(testEnv.PROFILE_DB, {
+        expectations: [
+          { kind: "profile-absent", profileId },
+          ...loginUids.map((loginUid) => ({
+            kind: "login-owner-absent" as const,
+            loginUid,
+          })),
+        ],
+        mutations: [
+          { kind: "insert-active-profile", value },
+          ...loginUids.map((loginUid) => ({
+            kind: "insert-login-owner" as const,
+            value: {
+              loginUid,
+              profileId,
+              createdAtMs: 1_000,
+              updatedAtMs: 1_000,
+            },
+          })),
+        ],
+      });
+      await insertProfile(sourceProfileId, null);
+      await retireProfileInto(
+        sourceProfileId,
+        profileId,
+        2_000,
+        "ownership-merge",
+      );
+      const query = {
+        loginUids: [...loginUids, "missing-login"],
+        profileIds: [sourceProfileId, profileId, "missing-profile"],
+      };
+      const gameplay = createGameplayRepository(testEnv, {
+        stateClient: state,
+      });
+      const mining = createMiningRepository(testEnv);
+      const snapshots = await Promise.all([
+        gameplay.readProfileOwnershipSnapshot(query),
+        mining.readProfileOwnershipSnapshot(query),
+      ]);
+      expect(snapshots[0]).toEqual(snapshots[1]);
+      for (const snapshot of snapshots) {
+        expect(snapshot.canonicalProfileIdByProfileId).toEqual(
+          new Map([
+            [sourceProfileId, profileId],
+            [profileId, profileId],
+            ["missing-profile", null],
+          ]),
+        );
+        expect(snapshot.loginOwnerByUid).toEqual(
+          new Map([
+            ...loginUids.map(
+              (loginUid) => [loginUid, { profileId, revision: 1 }] as const,
+            ),
+            ["missing-login", null],
+          ]),
+        );
+        expect(snapshot.loginUidsByProfileId).toEqual(
+          new Map([[profileId, loginUids]]),
+        );
+        expect(snapshot.profileById).toEqual(
+          new Map([
+            [
+              profileId,
+              {
+                profile: {
+                  aura: "",
+                  emoji,
+                  eth: "",
+                  profileId,
+                  rating: 1500,
+                  sol: "",
+                  username: "",
+                },
+                revision: 1,
+              },
+            ],
+          ]),
+        );
+        expect(Object.isFrozen(snapshot)).toBe(true);
+        expect(
+          Object.isFrozen(snapshot.loginUidsByProfileId.get(profileId)),
+        ).toBe(true);
+        expect(Object.isFrozen(snapshot.profileById.get(profileId))).toBe(true);
+        expect(
+          Object.isFrozen(snapshot.profileById.get(profileId)?.profile),
+        ).toBe(true);
+      }
+    },
+  );
 
   it("replays February opponents through deleted merge sources", async () => {
     const sourceProfileId = "d1-feb-source";

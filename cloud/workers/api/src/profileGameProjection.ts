@@ -13,6 +13,7 @@ import {
   type RatingProfileGameProjectionRepository,
 } from "./gameplayRepository.ts";
 import { createEventGameplayRepository } from "./eventRepository.ts";
+import type { EventOutboxReads } from "./eventOutboxReadRepository.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import {
   AUTOMATCH_PROFILE_GAME_PROJECTION_OUTBOX_ROOT,
@@ -158,7 +159,10 @@ export type ProfileGameProjectionDependencies = {
   createProfileLinkJobs?: (env: Env) => ProfileLinkProjectionJobs;
   createEventRuntime?: (env: Env) => EventProfileGameProjectionRuntime;
   createRating?: (env: Env) => RatingProfileGameProjectionRepository;
-  createStateRepository?: (env: Env) => ProfileGameProjectionState;
+  createStateRepository?: (
+    env: Env,
+  ) => ProfileGameProjectionState &
+    Pick<EventOutboxReads, "listDueEventProfileGameProjectionOutboxes">;
   createRequestId?: () => string;
   createRuntime?: (env: Env) => ProfileGameProjectionRuntime;
   logger?: ProfileGameProjectionLogger;
@@ -1167,22 +1171,13 @@ export async function sweepEventProfileGameProjections(
     dependencies.createStateRepository ||
     ((workerEnv: Env) => createEventGameplayRepository(workerEnv))
   )(env);
-  const [dueValue, malformedValue] = await Promise.all([
-    state.getStatePath(EVENT_PROFILE_GAME_PROJECTION_OUTBOX_ROOT, {
-      orderBy: "lastQueuedAtMs",
-      endAt: dueBeforeMs,
-      limitToFirst: PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
-    }),
-    state.getStatePath(EVENT_PROFILE_GAME_PROJECTION_OUTBOX_ROOT, {
-      orderBy: "lastQueuedAtMs",
-      startAt: "",
-      limitToFirst: PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
-    }),
-  ]);
-  const entries = [
-    ...eventSweepEntries(dueValue),
-    ...eventSweepEntries(malformedValue),
-  ];
+  const records = await state.listDueEventProfileGameProjectionOutboxes(
+    dueBeforeMs,
+    PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
+  );
+  const entries = eventSweepEntries(
+    Object.fromEntries(records.map(({ eventId, record }) => [eventId, record])),
+  );
   const invalidEventIds = Array.from(
     new Set(
       entries.flatMap((entry) =>

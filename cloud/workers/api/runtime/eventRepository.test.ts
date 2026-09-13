@@ -19,6 +19,7 @@ import {
 } from "../src/eventD1.ts";
 import {
   createD1AuthRecoveryPrizeStore,
+  createEventGameplayRepository,
   createEventStateRepository,
 } from "../src/eventRepository.ts";
 import { prepareInviteEventIntent } from "../src/inviteEventEffects.ts";
@@ -247,6 +248,139 @@ describe("hybrid event repository", () => {
     ).toBe(1);
   });
 
+  it.each([
+    {
+      kind: "progress",
+      method: "listDueEventProgressOutboxes",
+      path: "eventProgressOutbox",
+      table: "event_progress_outboxes",
+    },
+    {
+      kind: "profile-game",
+      method: "listDueEventProfileGameProjectionOutboxes",
+      path: "profileGameProjectionOutbox/event",
+      table: "event_profile_game_projection_outboxes",
+    },
+    {
+      kind: "telegram",
+      method: "listDueEventTelegramProjectionOutboxes",
+      path: "telegramProjectionOutbox/event",
+      table: "event_telegram_projection_outboxes",
+    },
+  ] as const)(
+    "lists raw due $kind outboxes through both event repositories",
+    async ({ kind, method, path, table }) => {
+      const getPath = vi.fn(async () => null);
+      const client = createEventStateRepository(testEnv, {
+        getPath,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      });
+      const rows = [
+        { id: "NN3eRzoZo80", timestamp: 200 },
+        { id: "VOxalSrexcA", timestamp: 100 },
+        { id: "FRkdorMWaYW", timestamp: 100 },
+        { id: "oXAceF6anag", timestamp: 201 },
+        { id: "RpPjMNyrJJa", timestamp: 50 },
+      ].map(({ id, timestamp }) => ({
+        id,
+        record:
+          kind === "progress"
+            ? {
+                schemaVersion: 1,
+                eventId: id,
+                sourceKey: `start:${id}:1000`,
+                reason: "scheduled-start",
+                runAtMs: 1_000,
+                firstQueuedAtMs: timestamp,
+                lastQueuedAtMs: timestamp,
+              }
+            : kind === "profile-game"
+              ? {
+                  schemaVersion: 1,
+                  status: "pending",
+                  requestId: `request-${id}`,
+                  lastQueuedAtMs: timestamp,
+                  cleanupOwnerProfileIds: {},
+                }
+              : {
+                  schemaVersion: 1,
+                  status: "pending",
+                  requestId: `request-${id}`,
+                  firstQueuedAtMs: timestamp,
+                  updatedAtMs: timestamp,
+                },
+      }));
+      await client.patchRoot(
+        Object.fromEntries(
+          rows.flatMap(({ id, record }) => [
+            [`events/${id}`, eventRecord("scheduled", id)],
+            [`${path}/${id}`, record],
+          ]),
+        ),
+      );
+      const malformed = { status: "pending", unrecognized: "raw-record" };
+      await testEnv.EVENT_DB.batch([
+        testEnv.EVENT_DB.prepare(
+          `UPDATE ${table} SET record_json = ? WHERE event_id = ?`,
+        ).bind(JSON.stringify(malformed), rows[2].id),
+        testEnv.EVENT_DB.prepare(
+          `UPDATE ${table} SET status = 'dead' WHERE event_id = ?`,
+        ).bind(rows[4].id),
+      ]);
+      const entries = [rows[2], rows[1], rows[0], rows[3]].map((row) => ({
+        ...(kind === "progress" ? { outboxId: row.id } : { eventId: row.id }),
+        record: row.id === rows[2].id ? malformed : row.record,
+      }));
+
+      for (const repository of [
+        client,
+        createEventGameplayRepository(testEnv),
+      ]) {
+        await expect(repository[method](99)).resolves.toEqual([]);
+        await expect(repository[method](100)).resolves.toEqual(
+          entries.slice(0, 2),
+        );
+        await expect(repository[method](200)).resolves.toEqual(
+          entries.slice(0, 3),
+        );
+        await expect(repository[method](200, 1)).resolves.toEqual(
+          entries.slice(0, 1),
+        );
+        await expect(
+          repository[method](Number.MAX_SAFE_INTEGER),
+        ).resolves.toEqual(entries);
+      }
+      expect(getPath).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects legacy outbox collection queries without base fallback", async () => {
+    const getPath = vi.fn(async () => null);
+    const client = createEventStateRepository(testEnv, {
+      getPath,
+      patchRoot: async () => undefined,
+      transactPath: async () => ({ committed: false, value: null }),
+    });
+    for (const path of [
+      "eventProgressOutbox",
+      "profileGameProjectionOutbox/event",
+      "telegramProjectionOutbox/event",
+    ]) {
+      await expect(
+        client.getPath(path, { endAt: 200, limitToFirst: 100 }),
+      ).rejects.toThrow("event-d1-query-unsupported");
+    }
+    await expect(
+      client.getPath("profileGameProjectionOutbox/event", {
+        orderBy: "lastQueuedAtMs",
+        startAt: "",
+        limitToFirst: 100,
+      }),
+    ).rejects.toThrow("event-d1-query-unsupported");
+    expect(getPath).not.toHaveBeenCalled();
+  });
+
   it("quarantines malformed Telegram outboxes in D1 mode", async () => {
     const client = createEventStateRepository(testEnv, {
       getPath: async () => null,
@@ -308,12 +442,8 @@ describe("hybrid event repository", () => {
       deadAtMs: 200,
     });
     await expect(
-      client.getPath("telegramProjectionOutbox/event", {
-        orderBy: "updatedAtMs",
-        endAt: 200,
-        limitToFirst: 100,
-      }),
-    ).resolves.toEqual({});
+      client.listDueEventTelegramProjectionOutboxes(200, 100),
+    ).resolves.toEqual([]);
   });
 
   it("pages mixed-case profile prize IDs in binary cursor order", async () => {
@@ -890,12 +1020,19 @@ describe("hybrid event repository", () => {
       },
     });
     await expect(
-      client.getPath("profileGameProjectionOutbox/event", {
-        orderBy: "lastQueuedAtMs",
-        startAt: "",
-        limitToFirst: 100,
-      }),
-    ).resolves.toEqual({});
+      client.listDueEventProfileGameProjectionOutboxes(100, 100),
+    ).resolves.toEqual([
+      {
+        eventId,
+        record: {
+          schemaVersion: 1,
+          status: "pending",
+          requestId: "profile-request",
+          lastQueuedAtMs: 100,
+          cleanupOwnerProfileIds: {},
+        },
+      },
+    ]);
     await expect(
       processEventProfileGameProjection(
         {

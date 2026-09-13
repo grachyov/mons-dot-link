@@ -17,8 +17,6 @@ import {
   readCanonicalWagerSettlement,
   resolveCanonicalProfile,
   CanonicalProfileConflict,
-  type CanonicalProfileOwnershipProfileSnapshot,
-  type CanonicalProfileOwnershipSnapshot,
   type CanonicalProfileSnapshot,
   type CanonicalProfileValue,
   type CanonicalExpectation,
@@ -39,7 +37,6 @@ import {
   getD1NavigationGame,
 } from "./profileGamesD1.ts";
 import type {
-  GameplayProfile,
   GameplayRepository,
   PendingRatingEventProgress,
   PendingRatingProfileGameProjection,
@@ -57,7 +54,7 @@ import type {
   WagerTransferInput,
   WagerTransferResult,
 } from "./gameplayRepository.ts";
-import type { ProfileOwnershipSnapshot } from "./profileOwnership.ts";
+import { mapCanonicalOwnershipSnapshot } from "./profileOwnershipMapping.ts";
 import { readRatingCompletion } from "./ratingCompletionD1.ts";
 
 type CanonicalRepositoryOptions = {
@@ -174,50 +171,6 @@ function canonicalProfileFields(
 }
 
 export { canonicalProfileFields };
-
-function gameplayProfile(
-  snapshot: CanonicalProfileOwnershipProfileSnapshot | CanonicalProfileSnapshot,
-): GameplayProfile {
-  const profile = snapshot.profile;
-  return {
-    aura: profile.aura || "",
-    emoji: snapshot.gameplayEmoji,
-    eth: profile.eth || "",
-    profileId: profile.id,
-    rating:
-      snapshot.sortPresence.rating && snapshot.sortValues.rating !== null
-        ? snapshot.sortValues.rating
-        : 1500,
-    sol: profile.sol || "",
-    username: profile.username || "",
-  };
-}
-
-function gameplayOwnershipSnapshot(
-  snapshot: CanonicalProfileOwnershipSnapshot,
-): ProfileOwnershipSnapshot {
-  return Object.freeze({
-    canonicalProfileIdByProfileId: new Map(
-      snapshot.canonicalProfileIdByProfileId,
-    ),
-    loginOwnerByUid: new Map(snapshot.loginOwnerByUid),
-    loginUidsByProfileId: new Map(
-      [...snapshot.loginOwnersByProfileId].map(([profileId, owners]) => [
-        profileId,
-        Object.freeze(owners.map((owner) => owner.loginUid)),
-      ]),
-    ),
-    profileById: new Map(
-      [...snapshot.profileById].map(([profileId, profile]) => [
-        profileId,
-        Object.freeze({
-          profile: Object.freeze(gameplayProfile(profile)),
-          revision: profile.revision,
-        }),
-      ]),
-    ),
-  });
-}
 
 function ratingProfileFromSnapshot(
   value: CanonicalRatingProfileSnapshot | null,
@@ -606,7 +559,7 @@ export function createCanonicalGameplayRepository(
 
     async readProfileOwnershipSnapshot(query) {
       try {
-        return gameplayOwnershipSnapshot(
+        return mapCanonicalOwnershipSnapshot(
           await readCanonicalProfileOwnershipSnapshot(db, query),
         );
       } catch {

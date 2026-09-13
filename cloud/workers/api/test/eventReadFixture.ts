@@ -4,6 +4,7 @@ import type {
   EventReads,
 } from "../../../runtime/eventReads.js";
 import type { StateQuery } from "../src/stateRepositoryTypes.ts";
+import type { EventOutboxReads } from "../src/eventOutboxReadRepository.ts";
 
 export function eventReadFixture(
   read: (
@@ -11,8 +12,14 @@ export function eventReadFixture(
     query?: StateQuery,
     signal?: AbortSignal,
   ) => Promise<unknown>,
-): EventReads {
+): EventReads & EventOutboxReads {
+  const unexpectedOutboxRead = async () => {
+    throw new Error("unexpected-event-outbox-read");
+  };
   return {
+    listDueEventProgressOutboxes: unexpectedOutboxRead,
+    listDueEventProfileGameProjectionOutboxes: unexpectedOutboxRead,
+    listDueEventTelegramProjectionOutboxes: unexpectedOutboxRead,
     readEvent: async (eventId, signal) =>
       (await read(
         `events/${eventId}`,

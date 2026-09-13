@@ -1,5 +1,6 @@
 import { eventReadFixture } from "./eventReadFixture.ts";
 import type { EventReads } from "../../../runtime/eventReads.js";
+import type { EventOutboxReads } from "../src/eventOutboxReadRepository.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -35,8 +36,11 @@ import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
 
 function store(initial: Record<string, unknown>) {
   const values = new Map(Object.entries(initial));
-  const client: StateRepository & EventReads = {
+  const client: StateRepository &
+    EventReads &
+    Pick<EventOutboxReads, "listDueEventTelegramProjectionOutboxes"> = {
     ...eventReadFixture(async (path) => values.get(path) ?? null),
+    listDueEventTelegramProjectionOutboxes: async () => [],
     async getPath(path) {
       assert.ok(!path.startsWith("events/"));
       return values.get(path) ?? null;
@@ -1077,21 +1081,19 @@ test("event sweep claims valid markers and dead-letters malformed records", asyn
       updatedAtMs: 100,
     },
   });
-  const getPath = state.client.getPath;
-  state.client.getPath = async (path, query) => {
-    if (path === "telegramProjectionOutbox/event") {
-      assert.deepEqual(query, {
-        orderBy: "updatedAtMs",
-        startAt: 0,
-        endAt: 200,
-        limitToFirst: 100,
-      });
-      return {
-        "event-1": marker,
-        "event-bad": { status: "pending", updatedAtMs: 100 },
-      };
-    }
-    return getPath(path, query);
+  state.client.listDueEventTelegramProjectionOutboxes = async (
+    beforeMs,
+    limit,
+  ) => {
+    assert.equal(beforeMs, 200);
+    assert.equal(limit, 100);
+    return [
+      { eventId: "event-1", record: marker },
+      {
+        eventId: "event-bad",
+        record: { status: "pending", updatedAtMs: 100 },
+      },
+    ];
   };
   const batches: TelegramProjectionTask[][] = [];
   const queue = {

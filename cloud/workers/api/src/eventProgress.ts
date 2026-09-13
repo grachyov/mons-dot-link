@@ -80,7 +80,10 @@ export type EventProgressWorkflowDependencies = {
 
 export type EventProgressSweepRepository = Pick<
   EventGameplayRepository,
-  "getStatePath" | "patchStateRoot" | "readEvent"
+  | "getStatePath"
+  | "patchStateRoot"
+  | "readEvent"
+  | "listDueEventProgressOutboxes"
 >;
 
 export type EventProgressRatingRepository = Pick<
@@ -635,15 +638,14 @@ async function sweepAdmittedEventProgress(
       ? null
       : dependencies.ratingRepository ||
         createRatingRepository(env, createEventGameplayRepository(env));
-  const value = toRecord(
-    await repository.getStatePath(EVENT_PROGRESS_OUTBOX_ROOT, {
-      orderBy: "lastQueuedAtMs",
-      limitToFirst: EVENT_PROGRESS_SWEEP_LIMIT,
-    }),
+  const records = await repository.listDueEventProgressOutboxes(
+    Number.MAX_SAFE_INTEGER,
+    EVENT_PROGRESS_SWEEP_LIMIT,
   );
   const plans: EventProgressPlan[] = [];
   const invalidRecords: Array<{ outboxId: string; record: unknown }> = [];
-  for (const [outboxId, record] of Object.entries(value || {})) {
+  for (const { outboxId: rawOutboxId, record } of records) {
+    const outboxId = String(rawOutboxId);
     const plan = await parseEventProgressOutbox(outboxId, record);
     if (plan) {
       plans.push(plan);

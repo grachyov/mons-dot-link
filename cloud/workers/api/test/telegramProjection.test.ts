@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { StateRepository } from "../src/stateRepositoryTypes.ts";
 import type { EventReads } from "../../../runtime/eventReads.js";
+import type { EventOutboxReads } from "../src/eventOutboxReadRepository.ts";
 import { eventReadFixture } from "./eventReadFixture.ts";
 import type {
   RatingProjectionRepository,
@@ -33,8 +34,11 @@ const PROJECTION_TEST_ENV = {
 
 function memoryState(initial: Record<string, unknown>) {
   const state = new Map(Object.entries(initial));
-  const client: StateRepository & EventReads = {
+  const client: StateRepository &
+    EventReads &
+    Pick<EventOutboxReads, "listDueEventTelegramProjectionOutboxes"> = {
     ...eventReadFixture(async (path) => state.get(path) ?? null),
+    listDueEventTelegramProjectionOutboxes: async () => [],
     async getPath(path) {
       assert.ok(!path.startsWith("events/"));
       return state.get(path) ?? null;
@@ -599,6 +603,9 @@ test("recovery takes current records and reports scan failures", async () => {
   const logs: string[] = [];
   const failedState = memoryState({}).client;
   failedState.getPath = async () => {
+    throw new Error("state-unavailable");
+  };
+  failedState.listDueEventTelegramProjectionOutboxes = async () => {
     throw new Error("state-unavailable");
   };
   await assert.rejects(
