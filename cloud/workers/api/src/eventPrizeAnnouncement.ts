@@ -50,7 +50,7 @@ export type EventPrizeAnnouncementDeliveryDependencies = {
   controlsEnabled?: (env: Env) => Promise<boolean>;
   eventRepository?: Pick<
     EventGameplayRepository,
-    "readEvent" | "transactStatePath"
+    "readEvent" | "transactEventLease"
   >;
   log?: (record: Record<string, unknown>) => void;
   now?: () => number;
@@ -230,8 +230,8 @@ export async function deliverEventPrizeAnnouncement(
   const lockManager = createEventLockManagerCore({
     now,
     createLockId: () => crypto.randomUUID(),
-    transactPath: (path, updater) =>
-      eventRepository.transactStatePath(path, updater),
+    transactEventLease: (key, updater) =>
+      eventRepository.transactEventLease(key, updater),
   });
   let lock;
   try {

@@ -1720,7 +1720,7 @@ test("accepts concurrent lineage completion after reservations are consumed", as
 
   await ensureWagerAgreementLineageReady(
     state.repository,
-    "invites/invite/wagers/invite",
+    { inviteId: "invite", matchId: "invite" },
     () => 2,
   );
 
@@ -1798,7 +1798,7 @@ test("rejects concurrent ready lineage after settlement clears agreement", async
   await assert.rejects(
     ensureWagerAgreementLineageReady(
       state.repository,
-      "invites/invite/wagers/invite",
+      { inviteId: "invite", matchId: "invite" },
       () => 2,
     ),
     /wager-agreement-lineage-unavailable/,
@@ -1827,7 +1827,7 @@ test("rejects ready-false agreement without a nonempty adjustment list", async (
     await assert.rejects(
       ensureWagerAgreementLineageReady(
         state.repository,
-        "invites/invite/wagers/invite",
+        { inviteId: "invite", matchId: "invite" },
         () => 2,
       ),
       /wager-agreement-lineage-unavailable/,
@@ -1854,7 +1854,7 @@ test("returns immediately for already-ready agreement lineage", async () => {
 
   await ensureWagerAgreementLineageReady(
     state.repository,
-    "invites/invite/wagers/invite",
+    { inviteId: "invite", matchId: "invite" },
     () => 2,
   );
   assert.deepEqual(reads, ["invites/invite/wagers/invite"]);
@@ -2193,7 +2193,7 @@ test("rate limits outcome requests before repository work", async () => {
     {
       repository: {
         ...createRepository().repository,
-        getStatePath: async () => {
+        readInviteMetadata: async () => {
           reads += 1;
           return null;
         },

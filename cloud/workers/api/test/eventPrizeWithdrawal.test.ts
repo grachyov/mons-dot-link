@@ -11,7 +11,6 @@ import {
   type EventPrizeWithdrawalWorkflowInput,
 } from "../src/eventPrizeWithdrawal.ts";
 import type { EventPrizeWithdrawalStore } from "../src/eventPrizeWithdrawalD1.ts";
-import type { GameplayRepository } from "../src/gameplayRepository.ts";
 import type { EventGameplayRepository } from "../src/eventRepository.ts";
 import type { EventPrizeAssignmentRecord } from "../../../runtime/eventReads.js";
 import type {
@@ -176,28 +175,14 @@ function repository() {
       { eventId, place: 1, prizeId, profileId, assignedAtMs: 1 },
     ],
   ]);
-  const value: GameplayRepository &
-    Pick<EventGameplayRepository, "readProfileEventPrizeAssignment"> = {
-    readInviteMetadata: async () => {
-      throw new Error("unexpected-invite-metadata-read");
-    },
-    applyWagerTransferOnce: async () => "applied",
-    deleteNavigationGame: async () => "deleted",
+  const value: Pick<
+    EventGameplayRepository,
+    | "readProfileEventPrizeAssignment"
+    | "transactProfileEventPrize"
+    | "readProfileOwnershipSnapshot"
+  > = {
     readProfileOwnershipSnapshot:
       ownershipReader().readProfileOwnershipSnapshot,
-    getMiningMaterials: async () => ({
-      dust: 0,
-      gum: 0,
-      ice: 0,
-      metal: 0,
-      slime: 0,
-    }),
-    getMiningSnapshot: async () => null,
-    getNavigationGame: async () => null,
-    getStatePath: async (path) => {
-      assert.ok(!path.startsWith("profileEventPrizes/"));
-      return values.get(path) ?? null;
-    },
     readProfileEventPrizeAssignment: async (
       candidateProfileId,
       candidateEventId,
@@ -205,20 +190,16 @@ function repository() {
       (values.get(
         `profileEventPrizes/${candidateProfileId}/${candidateEventId}`,
       ) as EventPrizeAssignmentRecord | undefined) ?? null,
-    patchStateRoot: async (updates) => {
-      for (const [path, next] of Object.entries(updates)) {
-        if (next === null) values.delete(path);
-        else values.set(path, next);
-      }
-    },
-    transactStatePath: async (path, updater) => {
-      const current = values.get(path) ?? null;
-      const decision = updater(current) as {
-        commit?: false;
-        decision?: string;
-        value?: unknown;
-      };
-      if (decision.commit === false) {
+    transactProfileEventPrize: async (
+      candidateProfileId,
+      candidateEventId,
+      updater,
+    ) => {
+      const path = `profileEventPrizes/${candidateProfileId}/${candidateEventId}`;
+      const current =
+        (values.get(path) as EventPrizeAssignmentRecord | undefined) ?? null;
+      const decision = updater(current);
+      if ("commit" in decision) {
         return {
           committed: false,
           decision: decision.decision,
@@ -243,37 +224,36 @@ function repository() {
     },
     record(candidateEventId, candidatePrizeId) {
       const path = `eventPrizeWithdrawals/${candidateEventId}/${candidatePrizeId}`;
-      const read = () => values.get(path) ?? null;
+      const read = () =>
+        (values.get(path) as Record<string, unknown> | undefined) ?? null;
       return {
         async read() {
           return read();
         },
         async transaction(updater) {
           const current = read();
-          const next = updater(current);
-          if (next === undefined) {
+          const decision = updater(current);
+          if ("commit" in decision) {
             return {
               committed: false,
+              decision: decision.decision,
               value: current,
             };
           }
+          const next = decision.value;
           if (next === null) values.delete(path);
           else values.set(path, next);
           return {
             committed: true,
+            decision: decision.decision,
             value: next,
           };
         },
-        async update(updates) {
-          values.set(path, {
-            ...((read() as Record<string, unknown> | null) || {}),
-            ...updates,
-          });
-        },
       };
     },
-    async replacePaths(updates) {
-      for (const [path, next] of Object.entries(updates)) {
+    async replaceRecords(records) {
+      for (const { eventId, prizeId, value: next } of records) {
+        const path = `eventPrizeWithdrawals/${eventId}/${prizeId}`;
         if (next === null) values.delete(path);
         else values.set(path, next);
       }
@@ -863,16 +843,10 @@ test("completed execution retries projection cleanup failures", async () => {
     status: "completed",
     transactionSignature: "signature",
   });
-  const transactStatePath = state.value.transactStatePath;
   const failingRepository = {
     ...state.value,
-    transactStatePath: async (
-      ...args: Parameters<typeof transactStatePath>
-    ) => {
-      if (args[0].startsWith("profileEventPrizes/")) {
-        throw new Error("database unavailable");
-      }
-      return transactStatePath(...args);
+    transactProfileEventPrize: async () => {
+      throw new Error("database unavailable");
     },
   };
 

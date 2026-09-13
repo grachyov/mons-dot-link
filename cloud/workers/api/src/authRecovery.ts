@@ -1,3 +1,4 @@
+import type { EventPrizeAssignmentRecord } from "../../../runtime/eventReads.js";
 import { STATE_FAILURE_MESSAGES } from "./stateCompatibility.ts";
 import {
   getEventPrizeDefinition,
@@ -225,7 +226,7 @@ function buildPrizeCopy(
   targetProfileId: string,
   eventId: string,
   value: unknown,
-): Record<string, unknown> | null {
+): EventPrizeAssignmentRecord | null {
   const normalizedEventId = cleanString(eventId);
   if (
     !isEventPrizeAssignmentWireRecord(value) ||
@@ -385,10 +386,10 @@ function createCanonicalAuthRecoveryService(
     const prizeLockManager = createEventLockManagerCore({
       createLockId: () => crypto.randomUUID(),
       now,
-      transactPath: (path, updater) =>
-        prizeStore.transactPath(path, updater, signal),
-      releaseTransactPath: (path, updater) =>
-        prizeStore.transactPath(path, updater),
+      transactEventLease: (key, updater) =>
+        prizeStore.transactEventLease(key, updater, signal),
+      releaseTransactEventLease: (key, updater) =>
+        prizeStore.transactEventLease(key, updater),
     });
     const lock = await prizeLockManager.acquireEventLock(
       eventId,
@@ -410,11 +411,15 @@ function createCanonicalAuthRecoveryService(
       );
       if (!assignment) throw new Error("auth-recovery-prize-invalid");
       const prizeId = cleanString(assignment.prizeId);
-      const targetPath = `profileEventPrizes/${targetProfileId}/${eventId}`;
       const lockGuard = prizeLockManager.getEventLockGuard(lock);
-      const transactTarget = (updater: (current: unknown) => unknown) =>
+      const transactTarget = (
+        updater: Parameters<
+          AuthRecoveryPrizeStore["transactStoredProfileEventPrizeWithEventLease"]
+        >[2],
+      ) =>
         prizeStore.transactStoredProfileEventPrizeWithEventLease(
-          targetPath,
+          targetProfileId,
+          eventId,
           updater,
           lockGuard,
           signal,

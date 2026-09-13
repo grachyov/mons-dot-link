@@ -10,6 +10,8 @@ Routine compatible releases keep canonical writes and Queue delivery active. Pre
 
 The invite Durable Object owns active match records and timer claims. Gameplay D1 owns actor/match routes, immutable archived records, invite metadata, automatch, session receipts, discovery, projection outboxes, and locks. Events, Telegram delivery, and prize withdrawals have their own D1 databases.
 
+Worker and portable-runtime callers use typed domain repositories for matches, sessions, wagers, events, leases, Telegram delivery, and prize withdrawals. Event and session plans preserve their existing guarded commit stages. Compatibility codecs retain the exact persisted path encodings, server-value markers, and replay digests; legacy-shaped test adapters live only with the tests.
+
 Preserve existing login IDs, applied SQL migrations, immutable snapshots, imported legacy match records, rating completions, source digests, and both event receipt stages. Stored compatibility formats are not permission to restart a completed migration or rewrite historical data.
 
 ## Browser sessions and profile recovery

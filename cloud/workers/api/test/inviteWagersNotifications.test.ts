@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  changedInviteWagersIds,
   notifyInviteWagersChanged,
   notifyInviteSourceChanged,
 } from "../src/inviteWagersNotifications.ts";
@@ -22,42 +21,23 @@ function environment(notify: (inviteId: string) => Promise<void>): Env {
   } as unknown as Env;
 }
 
-test("wager invalidation covers source and access changes without unrelated state", () => {
-  assert.deepEqual(
-    changedInviteWagersIds({
-      "invites/proposal/wagers/match/proposals/host": { count: 2 },
-      "invites/proposal/wagers/match/proposals/guest": null,
-      "invites/agreement/wagers/match/agreed": {},
-      "invites/settlement/wagers/match/settlement": {},
-      "invites/resolved/wagers/match/resolved": {},
-      "invites/replaced": {},
-      "invites/deleted": null,
-      "invites/private/password": true,
-      "invites/paired/guestId": "guest",
-      "invites/owner/hostId": "host",
-      "invites/unrelated/hostRematches": "1",
-      "invites/unrelated/matchesWagerResolutions/match": true,
-      "players/host/matches/match": {},
-      "matchTimerClaims/match": {},
+test("wager invalidation validates and deduplicates explicit invite identities", async () => {
+  const calls: string[] = [];
+  await notifyInviteWagersChanged(
+    environment(async (id) => {
+      calls.push(id);
     }),
     [
       "proposal",
       "agreement",
       "settlement",
-      "resolved",
-      "replaced",
-      "deleted",
-      "private",
-      "paired",
-      "owner",
+      "proposal",
+      "",
+      "invalid/key",
+      " padded ",
     ],
   );
-  assert.deepEqual(
-    changedInviteWagersIds({
-      invites: { first: {}, second: null, "invalid/key": {} },
-    }),
-    ["first", "second"],
-  );
+  assert.deepEqual(calls, ["proposal", "agreement", "settlement"]);
 });
 
 test("confirmed source changes deduplicate metadata and wager invalidations", async () => {
@@ -75,18 +55,16 @@ test("confirmed source changes deduplicate metadata and wager invalidations", as
       }),
     },
   } as unknown as Env;
-  await notifyInviteSourceChanged(
-    env,
-    {
-      "invites/combined/guestId": "guest",
-      "invites/combined/wagers/match": {},
-      "invites/wager-only/wagers/match": {},
-    },
-    true,
-  );
+  await notifyInviteSourceChanged(env, {
+    metadataInviteIds: ["combined"],
+    wagerInviteIds: ["combined", "wager-only"],
+  });
   assert.deepEqual(calls, ["metadata:combined", "wagers:wager-only"]);
   calls.length = 0;
-  await notifyInviteSourceChanged(env, { "invites/combined": {} }, true);
+  await notifyInviteSourceChanged(env, {
+    metadataInviteIds: ["combined"],
+    wagerInviteIds: ["combined"],
+  });
   assert.deepEqual(calls, ["metadata:combined"]);
 });
 
@@ -97,12 +75,9 @@ test("ambiguous source changes invalidate wagers without claiming metadata commi
       notices.push(id);
     }),
     {
-      "invites/combined": {},
-      "invites/wager-only/wagers/match/proposals/host": {},
-      "invites/wager-only/wagers/match/proposedBy/host": true,
-      "invites/unrelated/hostRematches": "1",
+      metadataInviteIds: [],
+      wagerInviteIds: ["combined", "wager-only", "wager-only"],
     },
-    false,
   );
   assert.deepEqual(notices, ["combined", "wager-only"]);
 });
@@ -115,23 +90,18 @@ test("failed or stuck room notifications are bounded and cannot reject committed
     () => new Promise<void>(() => undefined),
   ]) {
     let failures = 0;
-    await notifyInviteWagersChanged(
-      environment(notify),
-      { "invites/invite/wagers/match": {} },
-      {
-        timeoutMs: 1,
-        logFailure: () => {
-          failures++;
-        },
+    await notifyInviteWagersChanged(environment(notify), ["invite"], {
+      timeoutMs: 1,
+      logFailure: () => {
+        failures++;
       },
-    );
+    });
     assert.equal(failures, 1);
   }
   await notifyInviteSourceChanged(
     environment(async () => {
       throw new Error("unavailable");
     }),
-    { "invites/invite/wagers/match": {} },
-    true,
+    { metadataInviteIds: [], wagerInviteIds: ["invite"] },
   );
 });

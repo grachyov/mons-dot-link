@@ -1,17 +1,84 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  createAuthRecoveryService,
+  createAuthRecoveryService as createAuthRecoveryServiceImpl,
   dispatchProfileLinkCatchupForOwner,
   MERGE_PRIZE_RECOVERY_PAGE_SIZE,
 } from "../src/authRecovery.ts";
-import type { AuthRecoveryPrizeStore } from "../src/eventRepository.ts";
+import type { AuthRecoveryPrizeStore as TypedAuthRecoveryPrizeStore } from "../src/eventRepository.ts";
 import type { ProfileLinkCatchupJob } from "../src/profileLinkCatchupD1.ts";
 import type {
   EventPrizeAssignmentRecord,
   ProfileEventPrizePageQuery,
 } from "../../../runtime/eventReads.js";
 import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
+
+type FixtureTransaction = (
+  path: string,
+  update: (current: unknown) => unknown,
+  signal?: AbortSignal,
+) => Promise<{ committed: boolean; decision?: string; value: unknown }>;
+type AuthRecoveryPrizeStore = Pick<
+  TypedAuthRecoveryPrizeStore,
+  "readProfileEventPrizeAssignment" | "listProfileEventPrizeAssignments"
+> & {
+  getPath: () => Promise<never>;
+  transactPath: FixtureTransaction;
+  transactStoredProfileEventPrizeWithEventLease(
+    path: string,
+    update: (current: unknown) => unknown,
+    guard: Parameters<
+      TypedAuthRecoveryPrizeStore["transactStoredProfileEventPrizeWithEventLease"]
+    >[3],
+    signal?: AbortSignal,
+  ): ReturnType<FixtureTransaction>;
+};
+function createAuthRecoveryService(
+  env: Parameters<typeof createAuthRecoveryServiceImpl>[0],
+  dependencies: Omit<
+    NonNullable<Parameters<typeof createAuthRecoveryServiceImpl>[1]>,
+    "prizeStore"
+  > & { prizeStore?: AuthRecoveryPrizeStore } = {},
+) {
+  const fixture = dependencies.prizeStore;
+  const prizeStore: TypedAuthRecoveryPrizeStore | undefined = fixture
+    ? {
+        readProfileEventPrizeAssignment:
+          fixture.readProfileEventPrizeAssignment,
+        listProfileEventPrizeAssignments:
+          fixture.listProfileEventPrizeAssignments,
+        transactEventLease: (key, update, signal) => {
+          assert.equal(key.kind, "event");
+          return fixture.transactPath(
+            `eventLocks/${key.id}`,
+            (current) =>
+              update(
+                current as
+                  | import("../../../runtime/eventLeases.js").EventLeaseRecord
+                  | null,
+              ),
+            signal,
+          ) as ReturnType<TypedAuthRecoveryPrizeStore["transactEventLease"]>;
+        },
+        transactStoredProfileEventPrizeWithEventLease: (
+          profileId,
+          eventId,
+          update,
+          guard,
+          signal,
+        ) =>
+          fixture.transactStoredProfileEventPrizeWithEventLease(
+            `profileEventPrizes/${profileId}/${eventId}`,
+            (current) => update(current as EventPrizeAssignmentRecord | null),
+            guard,
+            signal,
+          ) as ReturnType<
+            TypedAuthRecoveryPrizeStore["transactStoredProfileEventPrizeWithEventLease"]
+          >,
+      }
+    : undefined;
+  return createAuthRecoveryServiceImpl(env, { ...dependencies, prizeStore });
+}
 
 async function rejectLegacyPrizeRead(): Promise<never> {
   throw new Error("auth-recovery-must-use-typed-prize-reads");

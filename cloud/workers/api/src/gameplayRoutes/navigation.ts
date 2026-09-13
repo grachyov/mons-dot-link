@@ -50,7 +50,7 @@ export async function removeNavigationGame(
   }
   const [inviteValue, automatchValue] = await Promise.all([
     repository.readInviteMetadata(inviteId),
-    repository.getStatePath(`automatch/${inviteId}`),
+    repository.readAutomatchEntry(inviteId),
   ]);
   const invite = toRecord(inviteValue);
   if (!invite) {

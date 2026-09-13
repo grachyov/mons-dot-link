@@ -3,7 +3,8 @@ import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createGameplayRepository } from "../src/gameplayRepository.ts";
 import { normalizeInviteMetadata } from "../src/inviteMetadata.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { MatchStatePort } from "../src/repositoryContracts.ts";
+import { composeInviteWagerSource } from "../src/inviteWagerSource.ts";
 import { applyRetiredProfileMigrations } from "./profileTestMigrations.ts";
 
 const testEnv = env as Env & {
@@ -18,16 +19,17 @@ const source = {
   hostColor: "white",
   customMetadata: { retained: true },
 };
-const raw: StateRepository = {
-  async getPath() {
-    throw new Error("unexpected-raw-source-read");
-  },
-  async patchRoot() {
-    throw new Error("unexpected-raw-source-write");
-  },
-  async transactPath() {
-    throw new Error("unexpected-raw-source-write");
-  },
+const unexpectedRead = async (): Promise<never> => {
+  throw new Error("unexpected-raw-source-read");
+};
+const unexpectedWrite = async (): Promise<never> => {
+  throw new Error("unexpected-raw-source-write");
+};
+const raw: MatchStatePort = {
+  readMatchRecord: unexpectedRead,
+  readMatchPair: unexpectedRead,
+  createMatchRecords: unexpectedWrite,
+  applyMatchEventEffects: unexpectedWrite,
 };
 
 function repository(database = db, profileDb?: D1Database) {
@@ -156,9 +158,9 @@ describe("gameplay invite metadata reads", () => {
       status: "ok",
       passwordProtected: false,
     });
-    await expect(gameplay.getStatePath(`invites/${inviteId}`)).rejects.toThrow(
-      "unexpected-profile-database-access",
-    );
+    await expect(
+      gameplay.wagers.readInviteWagerState(inviteId),
+    ).rejects.toThrow("unexpected-profile-database-access");
   });
 
   it("returns null for a missing invite without accessing wagers", async () => {
@@ -192,7 +194,12 @@ describe("gameplay invite metadata reads", () => {
       .run();
     const gameplay = repository(db, env.PROFILE_DB);
     expect(await gameplay.readInviteMetadata(inviteId)).toEqual(source);
-    expect(await gameplay.getStatePath(`invites/${inviteId}`)).toEqual({
+    expect(
+      composeInviteWagerSource(
+        await gameplay.readInviteMetadata(inviteId),
+        await gameplay.wagers.readInviteWagerState(inviteId),
+      ),
+    ).toEqual({
       ...source,
       wagers: { [inviteId]: wager },
       matchesWagerResolutions: { [inviteId]: true },

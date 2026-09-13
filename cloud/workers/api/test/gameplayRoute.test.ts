@@ -1,3 +1,4 @@
+import { gameplayTestPort } from "./gameSessionTestPorts.ts";
 import type { TestGameplayRepository as GameplayRepository } from "./wagerFrozenTestUtils.ts";
 import {
   attachMemoryWagerFrozenStore,
@@ -207,6 +208,14 @@ function repository(
     ...overrides,
   };
   const result = attachMemoryWagerFrozenStore(value);
+  const session = gameplayTestPort({
+    getPath: (path, query, signal) => value.readState(path, query, signal),
+    patchRoot: (updates, signal) => value.patchStateRoot(updates, signal),
+    transactPath: (path, update, signal) =>
+      value.transactState(path, update, signal),
+  });
+  Object.assign(result, session, overrides);
+
   result.automatchPersistence ??= createAutomatchPersistenceStub({
     readQueuedByLogins: createAutomatchQueueLookup((...args) =>
       result.readState(...args),
@@ -357,6 +366,10 @@ test("cancels the deterministic UID automatch with exact v2 multipath updates", 
               }
             : null;
         }
+        if (path === "invites/auto-newer") {
+          guestReads++;
+          return { hostId: identity.uid, guestId: null };
+        }
         if (path === "invites/auto-newer/guestId") {
           guestReads++;
           return null;
@@ -437,6 +450,12 @@ test("cancels every queue owned by merged logins", async () => {
         }
         const queue = /^automatch\/(.+)$/.exec(path);
         if (queue) return queues.get(queue[1]) || null;
+        const metadata = /^invites\/(.+)$/.exec(path);
+        if (metadata && !metadata[1].includes("/"))
+          return {
+            hostId: queues.get(metadata[1])?.uid || null,
+            guestId: null,
+          };
         const invite = /^invites\/(.+)\/(guestId|hostId)$/.exec(path);
         if (invite) {
           return invite[2] === "guestId"
@@ -493,6 +512,8 @@ test("skips cancellation when a guest wins the invite lease race", async () => {
             telegramDeliveryVersion: 2,
           };
         }
+        if (path === "invites/auto-race")
+          return { hostId: "host-uid", guestId: "guest-uid" };
         if (path === "invites/auto-race/guestId") return "guest-uid";
         if (path === "invites/auto-race/hostId") return "host-uid";
         assert.fail(`unexpected state path ${path}`);
@@ -539,6 +560,8 @@ test("shared cancellation rejects changed queue timestamps and versions", async 
               return { auto_changed: discovered };
             }
             if (path === "automatch/auto_changed") return current;
+            if (path === "invites/auto_changed")
+              return { hostId: identity.uid, guestId: null };
             if (path === "invites/auto_changed/guestId") return null;
             if (path === "invites/auto_changed/hostId") return identity.uid;
             assert.fail(`unexpected state path ${path}`);
@@ -610,6 +633,8 @@ test("cancels an alternate-login legacy queue without a root scan", async () => 
             timestamp: 1,
           };
         }
+        if (path === "invites/auto-alias")
+          return { hostId: "legacy-login", guestId: null };
         if (path === "invites/auto-alias/guestId") return null;
         if (path === "invites/auto-alias/hostId") return "legacy-login";
         assert.fail(`unexpected state path ${path}`);
@@ -690,6 +715,8 @@ test("keeps legacy automatch cancellation free of Telegram v2 updates", async ()
             telegramDeliveryVersion: 1,
           };
         }
+        if (path === "invites/auto-legacy")
+          return { hostId: identity.uid, guestId: null };
         if (path === "invites/auto-legacy/guestId") return null;
         if (path === "invites/auto-legacy/hostId") return identity.uid;
         return null;
@@ -1534,44 +1561,37 @@ test("routes exact authenticated rating updates without a new rate limit", async
       return { status: "committed", data: plan.repairData };
     },
     readProfileOwnershipSnapshot: async (query) => ownershipSnapshot(query),
-    getStatePath: async (path) => {
-      assert.doesNotMatch(path, /matchesRatingUpdates/);
-      if (path === `invites/${ratingRequest.inviteId}`) {
-        return {
-          hostId: ratingRequest.playerId,
-          guestId: ratingRequest.opponentId,
-        };
-      }
-      if (
-        path ===
-        `players/${ratingRequest.playerId}/matches/${ratingRequest.matchId}`
-      ) {
-        return {
-          color: "white",
-          emojiId: 1,
-          fen: new Game().toFen(),
-          flatMovesString: "",
-          status: "",
-          timer: "",
-        };
-      }
-      if (
-        path ===
-        `players/${ratingRequest.opponentId}/matches/${ratingRequest.matchId}`
-      ) {
-        return {
-          color: "black",
-          emojiId: 2,
-          fen: new Game().toFen(),
-          flatMovesString: "",
-          status: "surrendered",
-          timer: "",
-        };
-      }
-      return null;
+    readInviteMetadata: async () => ({
+      hostId: ratingRequest.playerId,
+      guestId: ratingRequest.opponentId,
+    }),
+    readMatchRecord: async ({ playerId, matchId }) => {
+      assert.equal(matchId, ratingRequest.matchId);
+      return {
+        color: playerId === ratingRequest.playerId ? "white" : "black",
+        emojiId: playerId === ratingRequest.playerId ? 1 : 2,
+        fen: new Game().toFen(),
+        flatMovesString: "",
+        status: playerId === ratingRequest.playerId ? "" : "surrendered",
+        timer: "",
+      };
     },
-    patchStateRoot: async (updates) => {
-      patches.push(updates);
+    readMatchPair: async (input) => ({
+      ...input,
+      epoch: 1,
+      revision: 1,
+      claim: null,
+      playerMatch: (await ratingRepository.readMatchRecord(input)) as
+        import("../src/matchStateTypes.ts").MatchStateRecord | null,
+      opponentMatch: input.opponentId
+        ? ((await ratingRepository.readMatchRecord({
+            playerId: input.opponentId,
+            matchId: input.matchId,
+          })) as import("../src/matchStateTypes.ts").MatchStateRecord | null)
+        : null,
+    }),
+    putEventProgressOutbox: async (outboxId, record) => {
+      patches.push({ [`eventProgressOutbox/${outboxId}`]: record });
     },
     readRatingUpdate: async () => null,
     tryAcquireRatingLease: async () => ({

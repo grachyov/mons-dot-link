@@ -2,7 +2,7 @@
 
 const { EventPrizeWithdrawalError: HttpsError } = require("./errors");
 const {
-  buildWithdrawalCompletionUpdates,
+  buildWithdrawalCompletion,
   getWithdrawalProjectionProfileIds,
 } = require("../eventPrizeWithdrawalState");
 
@@ -14,7 +14,6 @@ const reconcileCompletedWithdrawalProjections = async (
   dependencies,
 ) => {
   const {
-    state,
     removeMatchingProfileEventPrizeAssignment,
     resolveCanonicalProfilePath,
   } = dependencies;
@@ -32,13 +31,7 @@ const reconcileCompletedWithdrawalProjections = async (
   await Promise.all(
     projectionProfileIds.map((projectionProfileId) =>
       removeMatchingProfileEventPrizeAssignment({
-        targetRecord: {
-          transaction: (updater) =>
-            state.transaction(
-              `profileEventPrizes/${projectionProfileId}/${eventId}`,
-              updater,
-            ),
-        },
+        profileId: projectionProfileId,
         eventId,
         prizeId,
       }),
@@ -76,7 +69,7 @@ const finalizeWithdrawal = async (
   },
   dependencies,
 ) => {
-  const { state, readProfileByLoginUid } = dependencies;
+  const { withdrawals, readProfileByLoginUid } = dependencies;
   const requesterUid = normalizeString(withdrawal.requesterUid);
   if (!requesterUid) {
     throw new HttpsError(
@@ -110,7 +103,7 @@ const finalizeWithdrawal = async (
     profileIds: [profileId, canonicalProfileId],
   });
   const completedAtMs = (dependencies.now || Date.now)();
-  const { completed, updates } = buildWithdrawalCompletionUpdates({
+  const completed = buildWithdrawalCompletion({
     withdrawal,
     profileId: canonicalProfileId,
     eventId,
@@ -120,7 +113,7 @@ const finalizeWithdrawal = async (
     transactionSignature,
     completedAtMs,
   });
-  await state.update("", updates);
+  await withdrawals.replaceRecords([{ eventId, prizeId, value: completed }]);
   await reconcileCompletedWithdrawalProjections(
     {
       withdrawal: completed,

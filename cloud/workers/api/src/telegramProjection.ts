@@ -1,9 +1,5 @@
 import type { EventReads } from "../../../runtime/eventReads.js";
-import {
-  TELEGRAM_AUTOMATCH_PROJECTION_OUTBOX_ROOT,
-  getAutomatchTelegramProjectionOutboxPath,
-  getAutomatchTelegramSourcePath,
-} from "../../../runtime/telegram/automatchSource.js";
+import {} from "../../../runtime/telegram/automatchSource.js";
 import {
   buildTelegramEditDesired,
   buildTelegramSendDesired,
@@ -17,8 +13,9 @@ import {
   shouldProjectRatingTelegramUpdate,
   type AutomatchTelegramProjection,
 } from "../../../runtime/telegram/projectionCore.js";
-import type { StateRepository } from "./stateRepositoryTypes.ts";
-import { createEventStateRepository } from "./eventRepository.ts";
+import type { EventStore } from "./eventStoreContracts.ts";
+import type { GameSessionPort } from "./gameSessionContracts.ts";
+import { createEventGameplayRepository } from "./eventRepository.ts";
 import type { EventOutboxReads } from "./eventOutboxReadRepository.ts";
 import {
   createGameplayRepository,
@@ -68,7 +65,8 @@ type ProjectionDependencies = {
   createRating?: (env: Env) => RatingProjectionRepository;
   createStateRepository?: (
     env: Env,
-  ) => StateRepository &
+  ) => GameSessionPort &
+    EventStore &
     Pick<EventReads, "readEvent"> &
     Pick<EventOutboxReads, "listDueEventTelegramProjectionOutboxes">;
   createTelegram?: (env: Env) => TelegramRepository;
@@ -129,18 +127,18 @@ function projectionDesired(projection: AutomatchTelegramProjection) {
 
 async function readAutomatchInputs(
   inviteId: string,
-  state: StateRepository,
+  state: GameSessionPort,
 ): Promise<{ inviteData: unknown; source: unknown }> {
   const [source, inviteData] = await Promise.all([
-    state.getPath(getAutomatchTelegramSourcePath(inviteId)),
-    state.getPath(`invites/${inviteId}`),
+    state.readAutomatchTelegramSource(inviteId),
+    state.readInviteMetadata(inviteId),
   ]);
   return { source, inviteData };
 }
 
 async function projectAutomatchSource(
   inviteId: string,
-  state: StateRepository,
+  state: GameSessionPort,
   telegram: TelegramRepository,
 ): Promise<AutomatchProjectionResult> {
   let input = await readAutomatchInputs(inviteId, state);
@@ -189,14 +187,14 @@ async function projectAutomatchSource(
 }
 
 async function settleAutomatchOutbox(
-  state: StateRepository,
+  state: GameSessionPort,
   task: AutomatchTelegramProjectionTask,
   disposition: "clear" | "dead",
   now: () => number,
   reason = "",
 ): Promise<boolean> {
-  const result = await state.transactPath(
-    getAutomatchTelegramProjectionOutboxPath(task.inviteId),
+  const result = await state.transactAutomatchTelegramOutbox(
+    task.inviteId,
     (current) => {
       const record = toRecord(current);
       if (record?.requestId !== task.requestId) {
@@ -221,15 +219,13 @@ async function settleAutomatchOutbox(
 
 async function processAutomatchTask(
   task: AutomatchTelegramProjectionTask,
-  state: StateRepository,
+  state: GameSessionPort,
   enqueueDelivery: (input: InitialTelegramDelivery) => Promise<unknown>,
   now: () => number,
   telegram: TelegramRepository,
 ): Promise<string> {
   const outbox = parseOutbox(
-    await state.getPath(
-      getAutomatchTelegramProjectionOutboxPath(task.inviteId),
-    ),
+    await state.readAutomatchTelegramOutbox(task.inviteId),
   );
   if (!outbox || outbox.requestId !== task.requestId) {
     return "stale";
@@ -256,7 +252,7 @@ async function processAutomatchTask(
 
 async function processRatingTask(
   task: RatingTelegramProjectionTask,
-  state: StateRepository,
+  state: GameSessionPort,
   rating: RatingProjectionRepository,
   enqueueDelivery: (input: InitialTelegramDelivery) => Promise<unknown>,
   now: () => number,
@@ -279,16 +275,13 @@ async function processRatingTask(
     return "dead";
   }
   let mergeReason = "skipped";
-  await state.transactPath(
-    getAutomatchTelegramSourcePath(update.inviteId),
-    (source) => {
-      const merged = mergeRatingResultFragment(source, update);
-      mergeReason = merged.reason;
-      return merged.changed
-        ? { value: merged.source, decision: merged.reason }
-        : { commit: false, decision: merged.reason };
-    },
-  );
+  await state.transactAutomatchTelegramSource(update.inviteId, (source) => {
+    const merged = mergeRatingResultFragment(source, update);
+    mergeReason = merged.reason;
+    return merged.changed
+      ? { value: merged.source, decision: merged.reason }
+      : { commit: false, decision: merged.reason };
+  });
   if (mergeReason === "skipped") {
     await rating.markRatingTelegramProjection(
       task.operationId,
@@ -345,7 +338,7 @@ export async function handleTelegramProjectionMessage(
   }
   const createStateRepository =
     dependencies.createStateRepository ||
-    ((workerEnv: Env) => createEventStateRepository(workerEnv));
+    ((workerEnv: Env) => createEventGameplayRepository(workerEnv));
   const createRating =
     dependencies.createRating ||
     ((workerEnv: Env) =>
@@ -427,7 +420,7 @@ export async function handleTelegramProjectionQueue(
   batch: MessageBatch<unknown>,
   env: Env,
 ): Promise<void> {
-  const state = createEventStateRepository(env);
+  const state = createEventGameplayRepository(env);
   const rating = createRatingRepository(env, createGameplayRepository(env));
   for (const message of batch.messages) {
     await handleTelegramProjectionMessage(message, env, {
@@ -479,12 +472,12 @@ function automatchSweepTasks(value: unknown): TelegramProjectionTask[] {
 }
 
 async function claimAutomatchSweepCandidate(
-  state: StateRepository,
+  state: GameSessionPort,
   candidate: AutomatchSweepCandidate,
   nowMs: number,
 ): Promise<boolean> {
-  const result = await state.transactPath(
-    getAutomatchTelegramProjectionOutboxPath(candidate.task.inviteId),
+  const result = await state.transactAutomatchTelegramOutbox(
+    candidate.task.inviteId,
     (current) => {
       const outbox = parseOutbox(current);
       if (
@@ -505,36 +498,33 @@ async function claimAutomatchSweepCandidate(
 }
 
 async function markInvalidAutomatchSweepEntry(
-  state: StateRepository,
+  state: GameSessionPort,
   inviteId: string,
   nowMs: number,
 ): Promise<void> {
-  await state.transactPath(
-    getAutomatchTelegramProjectionOutboxPath(inviteId),
-    (current) => {
-      const record = toRecord(current);
-      const updatedAtMs = record?.updatedAtMs;
-      if (
-        !record ||
-        (parseOutbox(current) && isSafeRecordKey(inviteId)) ||
-        typeof updatedAtMs !== "number" ||
-        !Number.isFinite(updatedAtMs) ||
-        updatedAtMs > nowMs
-      ) {
-        return { commit: false, decision: "changed" };
-      }
-      return {
-        value: {
-          ...record,
-          status: "dead",
-          reason: "invalid-record",
-          updatedAtMs: null,
-          deadAtMs: nowMs,
-        },
-        decision: "dead",
-      };
-    },
-  );
+  await state.transactAutomatchTelegramOutbox(inviteId, (current) => {
+    const record = toRecord(current);
+    const updatedAtMs = record?.updatedAtMs;
+    if (
+      !record ||
+      (parseOutbox(current) && isSafeRecordKey(inviteId)) ||
+      typeof updatedAtMs !== "number" ||
+      !Number.isFinite(updatedAtMs) ||
+      updatedAtMs > nowMs
+    ) {
+      return { commit: false, decision: "changed" };
+    }
+    return {
+      value: {
+        ...record,
+        status: "dead",
+        reason: "invalid-record",
+        updatedAtMs: null,
+        deadAtMs: nowMs,
+      },
+      decision: "dead",
+    };
+  });
 }
 
 async function sendTaskBatches(
@@ -569,19 +559,14 @@ async function collectSuccessfulClaims<T>(
 
 async function sweepAutomatchProjections(
   env: Env,
-  state: StateRepository,
+  state: GameSessionPort,
   logger: ProjectionLogger,
   nowMs: number,
 ): Promise<number> {
   try {
-    const value = await state.getPath(
-      TELEGRAM_AUTOMATCH_PROJECTION_OUTBOX_ROOT,
-      {
-        orderBy: "updatedAtMs",
-        startAt: 0,
-        endAt: nowMs,
-        limitToFirst: PROJECTION_SWEEP_LIMIT,
-      },
+    const value = await state.listDueAutomatchTelegramOutboxes(
+      nowMs,
+      PROJECTION_SWEEP_LIMIT,
     );
     const entries = automatchSweepEntries(value);
     const candidates = entries.flatMap((entry) =>
@@ -670,7 +655,7 @@ export async function sweepTelegramProjections(
   const now = dependencies.now || Date.now;
   const createStateRepository =
     dependencies.createStateRepository ||
-    ((workerEnv: Env) => createEventStateRepository(workerEnv));
+    ((workerEnv: Env) => createEventGameplayRepository(workerEnv));
   const createRating =
     dependencies.createRating ||
     ((workerEnv: Env) =>

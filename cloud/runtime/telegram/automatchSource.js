@@ -5,24 +5,22 @@ const TELEGRAM_AUTOMATCH_ROOT = "telegramAutomatches";
 const TELEGRAM_AUTOMATCH_PROJECTION_OUTBOX_ROOT =
   "telegramProjectionOutbox/automatch";
 
-const getAutomatchTelegramSourcePath = (inviteId) =>
-  `${TELEGRAM_AUTOMATCH_ROOT}/${inviteId}`;
-
-const getAutomatchTelegramProjectionOutboxPath = (inviteId) =>
-  `${TELEGRAM_AUTOMATCH_PROJECTION_OUTBOX_ROOT}/${inviteId}`;
-
-const buildAutomatchTelegramProjectionOutboxUpdates = ({
+const buildAutomatchTelegramProjectionChanges = ({
   inviteId,
   requestId,
   timestamp,
-}) => ({
-  [getAutomatchTelegramProjectionOutboxPath(inviteId)]: {
-    schemaVersion: 1,
-    status: "pending",
-    requestId,
-    updatedAtMs: timestamp,
+}) => [
+  {
+    kind: "telegram-outbox",
+    inviteId,
+    value: {
+      schemaVersion: 1,
+      status: "pending",
+      requestId,
+      updatedAtMs: timestamp,
+    },
   },
-});
+];
 
 const buildPendingAutomatchTelegramSource = ({
   inviteId,
@@ -40,44 +38,52 @@ const buildPendingAutomatchTelegramSource = ({
   updatedAtMs: timestamp,
 });
 
-const buildMatchedAutomatchTelegramUpdates = ({
+const buildMatchedAutomatchTelegramChanges = ({
   inviteId,
   matchedText,
   timestamp,
   generation,
 }) => {
-  const sourcePath = getAutomatchTelegramSourcePath(inviteId);
-  return {
-    [`${sourcePath}/lifecycle`]: "matched",
-    [`${sourcePath}/matchedText`]: matchedText,
-    [`${sourcePath}/matchedInstanceKey`]: `matched:${inviteId}`,
-    [`${sourcePath}/updatedAtMs`]: timestamp,
-    [`${sourcePath}/generation`]: generation,
-  };
+  return [
+    {
+      kind: "telegram-source-merge",
+      inviteId,
+      value: {
+        lifecycle: "matched",
+        matchedText,
+        matchedInstanceKey: `matched:${inviteId}`,
+        updatedAtMs: timestamp,
+        generation,
+      },
+    },
+  ];
 };
 
-const buildAutomatchTelegramLifecycleUpdates = ({
+const buildAutomatchTelegramLifecycleChanges = ({
   inviteId,
   lifecycle,
   timestamp,
   generation,
 }) => {
-  const sourcePath = getAutomatchTelegramSourcePath(inviteId);
-  return {
-    [`${sourcePath}/lifecycle`]: lifecycle,
-    [`${sourcePath}/updatedAtMs`]: timestamp,
-    [`${sourcePath}/generation`]: generation,
-  };
+  return [
+    {
+      kind: "telegram-source-merge",
+      inviteId,
+      value: {
+        lifecycle,
+        updatedAtMs: timestamp,
+        generation,
+      },
+    },
+  ];
 };
 
 module.exports = {
   TELEGRAM_AUTOMATCH_ROOT,
   TELEGRAM_AUTOMATCH_PROJECTION_OUTBOX_ROOT,
   TELEGRAM_AUTOMATCH_VERSION,
-  buildAutomatchTelegramProjectionOutboxUpdates,
-  buildAutomatchTelegramLifecycleUpdates,
-  buildMatchedAutomatchTelegramUpdates,
+  buildAutomatchTelegramProjectionChanges,
+  buildAutomatchTelegramLifecycleChanges,
+  buildMatchedAutomatchTelegramChanges,
   buildPendingAutomatchTelegramSource,
-  getAutomatchTelegramProjectionOutboxPath,
-  getAutomatchTelegramSourcePath,
 };

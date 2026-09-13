@@ -1,4 +1,5 @@
-import type { StateRepository } from "./stateRepositoryTypes.ts";
+import type { MatchStateJson } from "./matchStateTypes.ts";
+import type { MatchStatePort } from "./repositoryContracts.ts";
 import { registerMatchStateRoutes } from "./matchStateD1.ts";
 import { requireActiveDurableMatchState } from "./matchStateAuthority.ts";
 import {
@@ -8,32 +9,17 @@ import {
 import { getMatchStateRpc, unwrapMatchStateRpc } from "./matchStateRpc.ts";
 import { isCanonicalLoginUid, isSafeRecordKey } from "./recordKeys.ts";
 
-export function createMatchStateSource(env: Env): StateRepository {
+export function createMatchStateSource(env: Env): MatchStatePort {
   return {
-    async getPath(path, query, signal) {
+    async readMatchRecord(input, signal) {
       signal?.throwIfAborted();
-      const parts = path.split("/");
       if (
-        parts[0] !== "players" ||
-        parts[2] !== "matches" ||
-        parts.length < 4 ||
-        !isCanonicalLoginUid(parts[1]) ||
-        parts.slice(3).some((part) => !isSafeRecordKey(part)) ||
-        query
+        !isCanonicalLoginUid(input.playerId) ||
+        !isSafeRecordKey(input.matchId)
       )
-        throw new Error("match-state-unsupported-read-path");
-      let value = await readMatchStateRecord(
-        env,
-        { playerId: parts[1], matchId: parts[3] },
-        { signal },
-      );
-      for (const field of parts.slice(4)) {
-        value =
-          value && typeof value === "object" && !Array.isArray(value)
-            ? ((value as Record<string, unknown>)[field] ?? null)
-            : null;
-      }
-      return value;
+        throw new Error("match-state-invalid-read-target");
+      const value = await readMatchStateRecord(env, input, { signal });
+      return value as MatchStateJson;
     },
     async readMatchPair(input, signal) {
       signal?.throwIfAborted();
@@ -94,12 +80,6 @@ export function createMatchStateSource(env: Env): StateRepository {
           control.epoch,
         );
       }
-    },
-    async patchRoot() {
-      throw new Error("match-state-untyped-write-retired");
-    },
-    async transactPath() {
-      throw new Error("match-state-untyped-write-retired");
     },
   };
 }

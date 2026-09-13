@@ -1,15 +1,21 @@
+import type {
+  EventLeaseKey,
+  EventLeaseKind,
+  EventLeaseRecord,
+} from "../eventLeases.js";
 export type EventLockTransactionDecision =
-  { commit: false; decision?: string } | { value: unknown; decision?: string };
+  | { commit: false; decision?: string }
+  | { value: EventLeaseRecord | null; decision?: string };
 
 export type EventLockTransactionResult = {
   committed: boolean;
   decision?: string;
-  value: unknown;
+  value: EventLeaseRecord | null;
 };
 
 export type EventLockHandle = {
   eventId: string;
-  path: string;
+  key: EventLeaseKey;
   lockId: string;
   ownerUid: string;
   lockRoot: string;
@@ -42,17 +48,17 @@ export const EVENT_LOCK_REFRESH_INTERVAL_MS: 10000;
 export const EVENT_LOCK_TTL_MS: 30000;
 
 export function createEventLockManagerCore(dependencies: {
-  transactPath(
-    path: string,
-    updater: (current: unknown) => EventLockTransactionDecision,
+  transactEventLease(
+    key: EventLeaseKey,
+    updater: (current: EventLeaseRecord | null) => EventLockTransactionDecision,
   ): Promise<EventLockTransactionResult>;
-  releaseTransactPath?: (
-    path: string,
-    updater: (current: unknown) => EventLockTransactionDecision,
+  releaseTransactEventLease?: (
+    key: EventLeaseKey,
+    updater: (current: EventLeaseRecord | null) => EventLockTransactionDecision,
   ) => Promise<EventLockTransactionResult>;
   createLockId(): string;
   includeLegacyOwnerId?: boolean;
-  lockRoot?: string;
+  lockKind?: EventLeaseKind;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
   setInterval?: typeof globalThis.setInterval;

@@ -1,51 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { notifyInviteSourceChanged } from "../src/inviteWagersNotifications.ts";
-import {
-  changedInviteMetadataIds,
-  notifyInviteMetadataChanged,
-} from "../src/inviteMetadataNotifications.ts";
+import { notifyInviteMetadataChanged } from "../src/inviteMetadataNotifications.ts";
 import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
 
-test("metadata notifications cover structural producer writes and ignore unrelated state", () => {
-  assert.deepEqual(
-    changedInviteMetadataIds({
-      "invites/manual": { hostId: "host" },
-      "invites/auto_pending": { guestId: null },
-      "invites/auto_matched/guestId": "guest",
-      "invites/auto_canceled/automatchStateHint": "canceled",
-      "invites/auto_recovered/automatchOperationIds/host": "operation",
-      "invites/event_invite": {
-        eventOwned: true,
-        hostId: "host",
-        guestId: "guest",
-      },
-      "invites/rematch/hostRematches": "1",
-      "invites/rematch/guestRematches": "1x",
-      "invites/private/password": "changed",
-      "invites/removed": null,
-      "invites/wager/wagers/match/proposals": {},
-      "invites/wager/matchesWagerResolutions/match": true,
-      "players/host/matches/manual/fen": "next",
-      "matchTimerClaims/manual": {},
-      "telegramProjectionOutbox/automatch/manual": {},
-    }),
-    [
-      "manual",
-      "auto_pending",
-      "auto_matched",
-      "auto_canceled",
-      "auto_recovered",
-      "event_invite",
-      "rematch",
-      "private",
-      "removed",
-    ],
-  );
-  assert.deepEqual(
-    changedInviteMetadataIds({ invites: { "bulk-one": {}, "bulk-two": {} } }),
-    ["bulk-one", "bulk-two"],
-  );
+test("metadata notifications validate and deduplicate explicit invite identities", async () => {
+  const calls: string[] = [];
+  const env = {
+    ...TELEGRAM_TEST_ENV,
+    INVITE_REACTIONS: {
+      getByName: (id: string) => ({
+        notifyMetadataChanged: async () => {
+          calls.push(id);
+        },
+      }),
+    },
+  } as unknown as Env;
+  await notifyInviteMetadataChanged(env, [
+    "manual",
+    "auto_pending",
+    "event_invite",
+    "manual",
+    "",
+    "invalid/key",
+    " padded ",
+  ]);
+  assert.deepEqual(calls, ["manual", "auto_pending", "event_invite"]);
 });
 
 test("committed source updates notify metadata once per invite", async () => {
@@ -63,15 +43,10 @@ test("committed source updates notify metadata once per invite", async () => {
       }),
     },
   } as unknown as Env;
-  await notifyInviteSourceChanged(
-    env,
-    {
-      "invites/manual/hostRematches": "1",
-      "invites/manual/guestRematches": "1",
-      "invites/joined/guestId": "guest",
-    },
-    true,
-  );
+  await notifyInviteSourceChanged(env, {
+    metadataInviteIds: ["manual", "manual", "joined"],
+    wagerInviteIds: ["joined"],
+  });
   assert.deepEqual(notices, ["manual", "joined"]);
 });
 
@@ -88,11 +63,10 @@ test("unconfirmed changes skip metadata and notification failure cannot reject c
       }),
     },
   } as unknown as Env;
-  await notifyInviteSourceChanged(
-    env,
-    { "invites/manual/guestId": "guest" },
-    false,
-  );
+  await notifyInviteSourceChanged(env, {
+    metadataInviteIds: [],
+    wagerInviteIds: ["manual"],
+  });
   assert.equal(notices, 0);
   let failures = 0;
   const unavailable = {
@@ -105,15 +79,11 @@ test("unconfirmed changes skip metadata and notification failure cannot reject c
       }),
     },
   } as unknown as Env;
-  await notifyInviteMetadataChanged(
-    unavailable,
-    { "invites/manual/guestId": "guest" },
-    {
-      logFailure: () => {
-        failures++;
-      },
+  await notifyInviteMetadataChanged(unavailable, ["manual"], {
+    logFailure: () => {
+      failures++;
     },
-  );
+  });
   assert.equal(failures, 1);
 });
 
@@ -127,15 +97,11 @@ test("notification deadline prevents a stuck room from holding a committed mutat
     },
   } as unknown as Env;
   let failures = 0;
-  await notifyInviteMetadataChanged(
-    env,
-    { "invites/manual/hostRematches": "1" },
-    {
-      timeoutMs: 1,
-      logFailure: () => {
-        failures++;
-      },
+  await notifyInviteMetadataChanged(env, ["manual"], {
+    timeoutMs: 1,
+    logFailure: () => {
+      failures++;
     },
-  );
+  });
   assert.equal(failures, 1);
 });

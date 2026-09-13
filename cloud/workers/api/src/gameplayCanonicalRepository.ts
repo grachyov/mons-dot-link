@@ -31,7 +31,6 @@ import {
   readCanonicalRatingProfiles,
   type CanonicalRatingProfileSnapshot,
 } from "./profileMutationD1.ts";
-import type { StateRepository } from "./stateRepositoryTypes.ts";
 import {
   deleteD1NavigationGame,
   getD1NavigationGame,
@@ -411,9 +410,16 @@ function replayWagerSettlement(
 export function createCanonicalGameplayRepository(
   db: D1Database,
   profileGamesDb: D1Database,
-  state: StateRepository,
   options: CanonicalRepositoryOptions,
-): Omit<GameplayRepository, "readInviteMetadata"> {
+): Pick<
+  GameplayRepository,
+  | "applyWagerTransferOnce"
+  | "readProfileOwnershipSnapshot"
+  | "getMiningMaterials"
+  | "getMiningSnapshot"
+  | "getNavigationGame"
+  | "deleteNavigationGame"
+> {
   const attempts = retryCount(options.maxAttempts);
   return {
     async applyWagerTransferOnce(input: WagerTransferInput) {
@@ -586,11 +592,6 @@ export function createCanonicalGameplayRepository(
       }
     },
 
-    getStatePath: state.getPath,
-    patchStateRoot: state.patchRoot,
-    transactStatePath: state.transactPath,
-    readMatchPair: state.readMatchPair,
-
     async getNavigationGame(profileId, inviteId) {
       return getD1NavigationGame(profileGamesDb, profileId, inviteId);
     },
@@ -722,16 +723,16 @@ export function createCanonicalRatingRepository(
   db: D1Database,
   gameplay: GameplayRepository,
   options: CanonicalRepositoryOptions,
-): CanonicalRatingRepository {
+): Omit<CanonicalRatingRepository, "putEventProgressOutbox"> {
   const attempts = retryCount(options.maxAttempts);
   const readOperation = async (operationId: string) => {
     const snapshot = await readCanonicalRatingUpdate(db, operationId);
     return snapshot ? ratingData(snapshot) : null;
   };
   return {
-    getStatePath: gameplay.getStatePath,
+    readInviteMetadata: gameplay.readInviteMetadata,
+    readMatchRecord: gameplay.readMatchRecord,
     readMatchPair: gameplay.readMatchPair,
-    patchStateRoot: gameplay.patchStateRoot,
     readProfileOwnershipSnapshot: gameplay.readProfileOwnershipSnapshot,
 
     readRatingUpdate: readOperation,

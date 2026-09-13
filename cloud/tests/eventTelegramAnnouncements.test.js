@@ -17,7 +17,7 @@ const {
   loadEndedMatchResults,
   renderUpcomingMessage,
   splitEventTelegramProjectionUpdates,
-} = require("../runtime/telegram/eventProjectionCore");
+} = require("./eventProjectionChangesFixture");
 const {
   buildTelegramEditDesired,
 } = require("../runtime/telegram/desiredStateCore");
@@ -486,9 +486,15 @@ const createRuntimeLockManager = (
     setInterval: () => ({ unref() {} }),
     clearInterval() {},
     logger: { error() {} },
-    lockRoot,
-    transactPath: (path, updater) =>
-      runStateDecisionTransaction(database.ref(path), updater),
+    lockKind:
+      lockRoot === EVENT_TELEGRAM_PROJECTION_LOCK_ROOT
+        ? "telegram-projection"
+        : "event",
+    transactEventLease: (key, updater) =>
+      runStateDecisionTransaction(
+        database.ref(`${lockRoot}/${key.id}`),
+        updater,
+      ),
   });
 };
 

@@ -1,3 +1,4 @@
+import type { TelegramDesired } from "./desiredStateCore.js";
 export type EventTelegramProjectionOperation = {
   channel: "upcoming" | "reminder" | "started" | "ended";
   generation?: string;
@@ -35,30 +36,37 @@ export function buildEventTelegramProjection(input: {
   reminderMessage?: unknown;
   nowMs?: number;
 }): EventTelegramProjection;
-export function buildEventTelegramProjectionUpdates(input: {
+export type EventTelegramProjectionGuard = {
+  eventId: string;
+  generation?: number;
+  lockId: string;
+  lockRoot: string;
+  ownerUid: string;
+};
+export type EventTelegramDesiredChange = {
+  messageKey: string;
+  value: TelegramDesired & {
+    eventTelegramProjectionGuard?: EventTelegramProjectionGuard & {
+      messageKey: string;
+    };
+  };
+};
+export type EventTelegramProjectionChanges = {
+  eventId: string;
+  state: Record<string, unknown>;
+  desired: EventTelegramDesiredChange[];
+};
+export function buildEventTelegramProjectionChanges(input: {
   eventId: string;
   projection: EventTelegramProjection;
-}): Record<string, unknown>;
+}): EventTelegramProjectionChanges | null;
 export function addEventTelegramProjectionGuard(input: {
-  updates: Record<string, unknown>;
-  guard?: {
-    eventId: string;
-    generation?: number;
-    lockId: string;
-    lockRoot: string;
-    ownerUid: string;
-  } | null;
-}): Record<string, unknown>;
-export function splitEventTelegramProjectionUpdates(input: {
-  eventId: string;
-  updates: Record<string, unknown>;
-}): {
-  desiredUpdates: Record<string, unknown>;
-  stateUpdates: Record<string, unknown>;
-};
+  changes: EventTelegramProjectionChanges;
+  guard?: EventTelegramProjectionGuard | null;
+}): EventTelegramProjectionChanges;
 export function buildEventTelegramDispatches(input: {
   eventId: string;
-  desiredUpdates: Record<string, unknown>;
+  desiredChanges: EventTelegramDesiredChange[];
 }): Array<{ generation: string; messageKey: string; revision: string }>;
 export function loadEndedMatchResults(
   eventData: unknown,

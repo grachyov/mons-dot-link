@@ -1,8 +1,13 @@
+import { createLegacyInviteSourceD1Store as createInviteSourceD1Store } from "../test/legacyInviteSourceFixture.ts";
+import {
+  legacySessionChanges,
+  matchTestPort,
+} from "../test/gameSessionTestPorts.ts";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { applyStrictMatchStateTestMigrations } from "./strictMatchStateTestFixture.ts";
-import { createAutomatchD1Store } from "../src/automatchD1.ts";
+import { createLegacyAutomatchD1Store as createAutomatchD1Store } from "../test/legacyAutomatchStoreFixture.ts";
 import {
   createGameSessionTransitions,
   GAME_SESSION_TRANSITION_RETENTION_MS,
@@ -10,10 +15,9 @@ import {
   gameSessionResourceGuardStatements,
   type GameSessionLeaseProof,
 } from "../src/gameSessionTransitions.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import {
   acquireInviteSourceAdmission,
-  createInviteSourceD1Store,
   releaseInviteSourceAdmission,
 } from "../src/inviteSourceD1.ts";
 import {
@@ -176,13 +180,21 @@ function coordinator(
   state: MemoryStateRepository,
   options: Partial<Parameters<typeof createGameSessionTransitions>[0]> = {},
 ) {
-  return createGameSessionTransitions({
+  const transitions = createGameSessionTransitions({
     db,
-    state,
+    state: matchTestPort(state),
     now: () => NOW,
     prepareMatchPresentations: presentationCapture().prepare,
     ...options,
   });
+  return {
+    ...transitions,
+    commit: (
+      updates: Record<string, unknown>,
+      leases: readonly GameSessionLeaseProof[],
+      signal?: AbortSignal,
+    ) => transitions.commit(legacySessionChanges(updates), leases, signal),
+  };
 }
 
 function pendingCount() {
@@ -241,8 +253,8 @@ function interleavePreparations(
   let attempts = 0;
   return {
     ...store,
-    async preparePatch(...args: Parameters<typeof store.preparePatch>) {
-      const mutations = await store.preparePatch(...args);
+    async prepareChanges(...args: Parameters<typeof store.prepareChanges>) {
+      const mutations = await store.prepareChanges(...args);
       await afterPrepare(++attempts);
       return mutations;
     },
@@ -728,8 +740,8 @@ describe("recoverable D1 game-session transitions", () => {
         createId: () => `source-intent-${++ids}`,
         inviteStore: {
           ...source,
-          async preparePatch(...args) {
-            const mutations = await source.preparePatch(...args);
+          async prepareChanges(...args) {
+            const mutations = await source.prepareChanges(...args);
             if (++attempts === 1) {
               await db.batch(
                 source.buildCommitStatements(
@@ -954,8 +966,8 @@ describe("recoverable D1 game-session transitions", () => {
         coordinator(state, {
           inviteStore: {
             ...source,
-            async preparePatch(...args) {
-              const mutations = await source.preparePatch(...args);
+            async prepareChanges(...args) {
+              const mutations = await source.prepareChanges(...args);
               attempts++;
               await db
                 .prepare(
@@ -1165,13 +1177,7 @@ describe("recoverable D1 game-session transitions", () => {
       onCommitted: async (inviteId) => {
         notifications.push(inviteId);
       },
-      state: {
-        async getPath(path) {
-          inviteReads++;
-          return state.getPath(path);
-        },
-        transactPath: state.transactPath.bind(state),
-      },
+      state: { createMatchRecords: matchTestPort(state).createMatchRecords },
       store: interleavePreparations(store, async (attempt) => {
         preparations = attempt;
         if (attempt !== 1) return;

@@ -1,3 +1,4 @@
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import { env } from "cloudflare:workers";
 import {
   applyD1Migrations,
@@ -484,46 +485,50 @@ describe("gameplay with canonical Durable Object storage", () => {
     const guest = `event-guest-${eventId}`;
     rooms.add(inviteId);
     const repository = createEventGameplayRepository(workerEnv);
-    await repository.patchStateRoot({
-      [`events/${eventId}`]: {
-        schemaVersion: 2,
-        eventId,
-        status: "scheduled",
-        createdAtMs: 100,
-        updatedAtMs: 100,
-        startAtMs: 1_000,
-        createdByProfileId: "profile-one",
-        createdByLoginUid: host,
-        createdByUsername: "ivan",
-        participants: {},
-        rounds: {},
-      },
-    });
+    await repository.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}`]: {
+          schemaVersion: 2,
+          eventId,
+          status: "scheduled",
+          createdAtMs: 100,
+          updatedAtMs: 100,
+          startAtMs: 1_000,
+          createdByProfileId: "profile-one",
+          createdByLoginUid: host,
+          createdByUsername: "ivan",
+          participants: {},
+          rounds: {},
+        },
+      }),
+    );
     const fen = new Game().toFen();
-    await repository.patchStateRoot({
-      [`events/${eventId}/status`]: "active",
-      [`events/${eventId}/updatedAtMs`]: 200,
-      [`invites/${inviteId}`]: {
-        eventId,
-        eventOwned: true,
-        hostId: host,
-        guestId: guest,
-      },
-      [`players/${host}/matches/${inviteId}`]: {
-        fen,
-        flatMovesString: "",
-        color: "white",
-        emojiId: 1,
-        aura: "",
-      },
-      [`players/${guest}/matches/${inviteId}`]: {
-        fen,
-        flatMovesString: "",
-        color: "black",
-        emojiId: 2,
-        aura: "",
-      },
-    });
+    await repository.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}/status`]: "active",
+        [`events/${eventId}/updatedAtMs`]: 200,
+        [`invites/${inviteId}`]: {
+          eventId,
+          eventOwned: true,
+          hostId: host,
+          guestId: guest,
+        },
+        [`players/${host}/matches/${inviteId}`]: {
+          fen,
+          flatMovesString: "",
+          color: "white",
+          emojiId: 1,
+          aura: "",
+        },
+        [`players/${guest}/matches/${inviteId}`]: {
+          fen,
+          flatMovesString: "",
+          color: "black",
+          emojiId: 2,
+          aura: "",
+        },
+      }),
+    );
     expect(await readEventSnapshot(env.EVENT_DB, eventId)).toMatchObject({
       event: { status: "active" },
       revision: 2,
@@ -536,10 +541,12 @@ describe("gameplay with canonical Durable Object storage", () => {
     });
     expect(original.playerMatch).toMatchObject({ color: "white", fen });
     expect(original.opponentMatch).toMatchObject({ color: "black", fen });
-    await repository.patchStateRoot({
-      [`events/${eventId}/updatedAtMs`]: 300,
-      [`players/${host}/matches/${inviteId}/timer`]: MATCH_TIMER_TERMINAL,
-    });
+    await repository.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}/updatedAtMs`]: 300,
+        [`players/${host}/matches/${inviteId}/timer`]: MATCH_TIMER_TERMINAL,
+      }),
+    );
     const finished = unwrapMatchStateRpc(
       await getMatchStateRpc(workerEnv, inviteId).readCanonicalMatchPair({
         inviteId,

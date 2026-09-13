@@ -15,9 +15,24 @@ export const STATE_SERVER_TIMESTAMP = Object.freeze({
   [STATE_VALUE_FIELD]: "timestamp",
 });
 
-export function stateIncrement(delta: number): Record<string, unknown> {
+export function stateIncrement(delta: number): {
+  [STATE_VALUE_FIELD]: { increment: number };
+} {
   if (!Number.isFinite(delta)) {
     throw new TypeError("State increment must be finite");
   }
   return { [STATE_VALUE_FIELD]: { increment: delta } };
+}
+
+export class StateRepositoryFailure extends Error {
+  constructor() {
+    super(STATE_FAILURE_MESSAGES.unavailable);
+  }
+}
+
+export class StateRepositoryPermissionDenied extends StateRepositoryFailure {
+  constructor() {
+    super();
+    this.message = STATE_FAILURE_MESSAGES.permissionDenied;
+  }
 }

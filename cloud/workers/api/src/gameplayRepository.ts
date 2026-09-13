@@ -6,21 +6,22 @@ import {
 } from "./automatchPersistence.ts";
 import { notifyMatchSyncInvites } from "./matchSyncNotifications.ts";
 import { prepareCreatedMatchPresentations } from "./matchPresentationRegistry.ts";
-import { createWagerStateRepository } from "./wagerStateRepository.ts";
+import {
+  createWagerStateReader,
+  type WagerReader,
+  type WagerWriter,
+} from "./wagerStateRepository.ts";
 import { createMatchStateSource } from "./matchStateSource.ts";
-import { InviteSourceFailure } from "./inviteSourceD1.ts";
-import { isSafeRecordKey } from "./recordKeys.ts";
 import type { HistoricalMatchPair } from "@mons/shared/game-sessions";
 import type {
   MiningMaterialName,
   MiningMaterials,
   MiningSnapshot,
 } from "@mons/shared/mining";
-import type {
-  StateRepository,
-  StateQuery,
-  StateTransactionResult,
-} from "./stateRepositoryTypes.ts";
+import type { MatchStatePort } from "./repositoryContracts.ts";
+import type { GameSessionPort } from "./gameSessionContracts.ts";
+import type { EventProgressOutboxRecord } from "../../../runtime/events.js";
+import { createEventGameplayRepository } from "./eventRepository.ts";
 import {
   createCanonicalGameplayRepository,
   createCanonicalRatingRepository,
@@ -161,11 +162,15 @@ export type RatingFinalizeResult =
 
 export type RatingRepository = Pick<
   GameplayRepository,
-  | "getStatePath"
-  | "patchStateRoot"
+  | "readInviteMetadata"
+  | "readMatchRecord"
   | "readProfileOwnershipSnapshot"
   | "readMatchPair"
 > & {
+  putEventProgressOutbox(
+    outboxId: string,
+    record: EventProgressOutboxRecord,
+  ): Promise<void>;
   applyFebruaryChallengeReplay: (
     playerProfileId: string,
     opponentProfileId: string,
@@ -241,49 +246,34 @@ export type RatingProfileGameProjectionRepository = RatingRepository & {
   ) => Promise<void>;
 };
 
-export type GameplayRepository = ProfileOwnershipReader & {
-  readInviteMetadata: (
-    inviteId: string,
-    signal?: AbortSignal,
-  ) => Promise<Record<string, unknown> | null>;
-  readMatchPair?: StateRepository["readMatchPair"];
-  automatchPersistence?: AutomatchPersistence;
-  wagerFrozen?: WagerFrozenStore;
-  applyWagerTransferOnce: (
-    input: WagerTransferInput,
-  ) => Promise<WagerTransferResult>;
-  deleteNavigationGame: (
-    profileId: string,
-    inviteId: string,
-  ) => Promise<NavigationGameDeleteResult>;
-  getNavigationGame: (
-    profileId: string,
-    inviteId: string,
-  ) => Promise<NavigationGameDocument | null>;
-  getMiningMaterials: (profileId: string) => Promise<MiningMaterials>;
-  getMiningSnapshot: (profileId: string) => Promise<MiningSnapshot | null>;
-  getStatePath: (
-    path: string,
-    query?: StateQuery,
-    signal?: AbortSignal,
-  ) => Promise<unknown>;
-  patchStateRoot: (
-    updates: Record<string, unknown>,
-    signal?: AbortSignal,
-  ) => Promise<void>;
-  transactStatePath: (
-    path: string,
-    updater: (current: unknown) => unknown,
-    signal?: AbortSignal,
-  ) => Promise<StateTransactionResult>;
-};
+export type GameplayRepository = ProfileOwnershipReader &
+  GameSessionPort &
+  MatchStatePort & {
+    wagers: WagerReader;
+    wagerWriter?: WagerWriter;
+    automatchPersistence?: AutomatchPersistence;
+    wagerFrozen?: WagerFrozenStore;
+    applyWagerTransferOnce: (
+      input: WagerTransferInput,
+    ) => Promise<WagerTransferResult>;
+    deleteNavigationGame: (
+      profileId: string,
+      inviteId: string,
+    ) => Promise<NavigationGameDeleteResult>;
+    getNavigationGame: (
+      profileId: string,
+      inviteId: string,
+    ) => Promise<NavigationGameDocument | null>;
+    getMiningMaterials: (profileId: string) => Promise<MiningMaterials>;
+    getMiningSnapshot: (profileId: string) => Promise<MiningSnapshot | null>;
+  };
 
 type GameplayRepositoryDependencies = {
   wagerFrozen?: WagerFrozenStore;
   d1?: D1Database;
   fetcher?: typeof fetch;
   now?: () => number;
-  stateClient?: StateRepository;
+  stateClient?: MatchStatePort;
   timeoutMs?: number;
 };
 
@@ -314,44 +304,25 @@ export function createGameplayRepository(
       prepareCreatedMatchPresentations(env, creations),
     onCommitted: async (inviteId) => {
       await Promise.all([
-        notifyInviteSourceChanged(env, { [`invites/${inviteId}`]: true }, true),
+        notifyInviteSourceChanged(env, {
+          metadataInviteIds: [inviteId],
+          wagerInviteIds: [inviteId],
+        }),
         notifyMatchSyncInvites(env, [inviteId]),
       ]);
     },
   });
-  const source = createWagerStateRepository(
-    env.PROFILE_DB,
-    automatchPersistence.client,
-    {
-      now,
-    },
-  );
   return {
-    ...createCanonicalGameplayRepository(env.PROFILE_DB, d1, source, {
+    ...createCanonicalGameplayRepository(env.PROFILE_DB, d1, {
       createFailure: () => new GameplayRepositoryFailure(),
       maxAttempts: MAX_WAGER_TRANSFER_TRANSACTION_ATTEMPTS,
       now,
     }),
+    ...matchSource,
+    ...automatchPersistence.client,
+    wagers: createWagerStateReader(env.PROFILE_DB),
     wagerFrozen,
     automatchPersistence,
-    async readInviteMetadata(inviteId, signal) {
-      signal?.throwIfAborted();
-      if (!isSafeRecordKey(inviteId)) {
-        throw new TypeError("invalid-invite-source-key");
-      }
-      const value = await automatchPersistence.client.getPath(
-        `invites/${inviteId}`,
-        undefined,
-        signal,
-      );
-      signal?.throwIfAborted();
-      if (value === null) return null;
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new InviteSourceFailure("invite-source-corrupt");
-      }
-      return value as Record<string, unknown>;
-    },
-    readMatchPair: matchSource.readMatchPair,
   };
 }
 
@@ -369,9 +340,16 @@ export function createRatingRepository(
     Number.isInteger(maxTransactionAttempts) && maxTransactionAttempts > 0
       ? maxTransactionAttempts
       : MAX_RATING_TRANSACTION_ATTEMPTS;
-  return createCanonicalRatingRepository(env.PROFILE_DB, gameplayRepository, {
-    createFailure: () => new GameplayRepositoryFailure(),
-    maxAttempts: attempts,
-    now,
-  });
+  return {
+    ...createCanonicalRatingRepository(env.PROFILE_DB, gameplayRepository, {
+      createFailure: () => new GameplayRepositoryFailure(),
+      maxAttempts: attempts,
+      now,
+    }),
+    putEventProgressOutbox: (outboxId, record) =>
+      createEventGameplayRepository(
+        env,
+        gameplayRepository,
+      ).putEventProgressOutbox(outboxId, record),
+  };
 }

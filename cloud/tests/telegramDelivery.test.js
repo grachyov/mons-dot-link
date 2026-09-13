@@ -5,7 +5,7 @@ const test = require("node:test");
 const {
   buildEventTelegramProjection,
   buildEventTelegramProjectionUpdates,
-} = require("../runtime/telegram/eventProjectionCore");
+} = require("./eventProjectionChangesFixture");
 const {
   buildTelegramDeleteDesired,
   buildTelegramDeleteUpdates,
@@ -15,7 +15,7 @@ const {
   buildTelegramSendUpdates,
   resolveTelegramDestination,
   validateTelegramMessageKey,
-} = require("../runtime/telegram/desiredStateCore");
+} = require("./telegramDesiredFixture");
 const {
   createTelegramDeliveryEngine,
   createTelegramLocalRetryBarrier,

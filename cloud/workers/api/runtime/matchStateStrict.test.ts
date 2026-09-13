@@ -101,7 +101,7 @@ describe("strict match runtime", () => {
     const workerEnv = strictEnv({ PROFILE_GAMES_DB: retiredDb });
     const source = createMatchStateSource(workerEnv);
     await expect(
-      source.getPath("players/player/matches/invite"),
+      source.readMatchRecord({ playerId: "player", matchId: "invite" }),
     ).rejects.toThrow("match-state-durable-authority-required");
     await expect(canonicalMatchOperations(workerEnv)).rejects.toThrow(
       "match-state-durable-authority-required",
@@ -139,9 +139,10 @@ describe("strict match runtime", () => {
       }),
     ).toMatchObject({ outcome: "applied" });
     expect(
-      await source.getPath(
-        `players/${request.playerId}/matches/${request.matchId}`,
-      ),
+      await source.readMatchRecord({
+        playerId: request.playerId,
+        matchId: request.matchId,
+      }),
     ).toMatchObject({ fen: "first", sessionCreation: "created" });
     expect(await admissions()).toEqual(before);
     expect(fetcher).not.toHaveBeenCalled();

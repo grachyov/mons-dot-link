@@ -1,3 +1,7 @@
+import {
+  createMemoryWagerState,
+  type WagerTestState,
+} from "./wagerStateTestUtils.ts";
 import { normalizeMaterials } from "@mons/shared/mining";
 import type { WagerReservationRuntime } from "../src/wagerReservationRuntime.ts";
 import type { GameplayRepository } from "../src/gameplayRepository.ts";
@@ -24,10 +28,7 @@ type MemoryBackend = {
   ): Promise<Transaction>;
 };
 
-export type TestGameplayRepository = GameplayRepository & {
-  readState: GameplayRepository["getStatePath"];
-  transactState: GameplayRepository["transactStatePath"];
-};
+export type TestGameplayRepository = GameplayRepository & WagerTestState;
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -123,18 +124,47 @@ export function createMemoryWagerFrozenStore(
 }
 
 export function attachMemoryWagerFrozenStore(
-  state: Omit<
-    TestGameplayRepository,
-    "getStatePath" | "transactStatePath" | "readInviteMetadata"
-  > &
-    Partial<Pick<TestGameplayRepository, "readInviteMetadata">>,
+  state: WagerTestState &
+    Pick<
+      GameplayRepository,
+      | "applyWagerTransferOnce"
+      | "deleteNavigationGame"
+      | "getNavigationGame"
+      | "getMiningMaterials"
+      | "getMiningSnapshot"
+      | "readProfileOwnershipSnapshot"
+    > &
+    Partial<GameplayRepository>,
 ): TestGameplayRepository {
-  const assertGameplayPath = (path: string) => {
-    if (/^(?:reservations\/|players\/[^/]+\/mining(?:\/|$))/.test(path)) {
-      throw new Error("unexpected-reservation-source-path");
-    }
+  const unexpected = async () => {
+    throw new Error("unexpected-gameplay-operation");
   };
-  const repository: TestGameplayRepository = {
+  const repository = {
+    readAutomatchTelegramSource: unexpected,
+    transactAutomatchTelegramSource: unexpected,
+    readAutomatchTelegramOutbox: unexpected,
+    transactAutomatchTelegramOutbox: unexpected,
+    listDueAutomatchTelegramOutboxes: unexpected,
+    readAutomatchProfileOutbox: unexpected,
+    transactAutomatchProfileOutbox: unexpected,
+    listDueAutomatchProfileOutboxes: unexpected,
+    listMalformedAutomatchProfileOutboxes: unexpected,
+    readAutomatchEntry: unexpected,
+    listAutomatchEntriesByLogin: unexpected,
+    readFirstAutomatchEntry: unexpected,
+    readMutationReceipt: unexpected,
+    commitSessionChanges: unexpected,
+    createMatchRecords: unexpected,
+    applyMatchEventEffects: unexpected,
+    readMatchRecord: async (
+      { playerId, matchId }: { playerId: string; matchId: string },
+      signal?: AbortSignal,
+    ) =>
+      (await state.readState(
+        `players/${playerId}/matches/${matchId}`,
+        undefined,
+        signal,
+      )) as import("../src/matchStateTypes.ts").MatchStateRecord | null,
     ...state,
     readInviteMetadata:
       state.readInviteMetadata ??
@@ -144,15 +174,28 @@ export function attachMemoryWagerFrozenStore(
           undefined,
           signal,
         )) as Record<string, unknown> | null),
-    getStatePath: (...args) => {
-      assertGameplayPath(args[0]);
-      return repository.readState(...args);
-    },
-    transactStatePath: (...args) => {
-      assertGameplayPath(args[0]);
-      return repository.transactState(...args);
-    },
-  };
+  } as TestGameplayRepository;
+  const wagerState = createMemoryWagerState(repository);
+  repository.wagers ??= wagerState;
+  repository.wagerWriter ??= wagerState;
+  repository.readMatchPair ??= async (input, signal) => ({
+    ...input,
+    epoch: 1,
+    revision: 1,
+    claim: null,
+    playerMatch: (await repository.readState(
+      `players/${input.playerId}/matches/${input.matchId}`,
+      undefined,
+      signal,
+    )) as import("../src/matchStateTypes.ts").MatchStateRecord | null,
+    opponentMatch: input.opponentId
+      ? ((await repository.readState(
+          `players/${input.opponentId}/matches/${input.matchId}`,
+          undefined,
+          signal,
+        )) as import("../src/matchStateTypes.ts").MatchStateRecord | null)
+      : null,
+  });
   repository.wagerFrozen ??= createMemoryWagerFrozenStore({
     read: (playerUid) => repository.readState(`reservations/${playerUid}`),
     transact: (playerUid, update, signal) =>

@@ -1,12 +1,12 @@
-import { requireWagerFrozenStore } from "./wagerFrozenStore.ts";
 import {
-  isMaterialName,
-  normalizeCount,
-  type MiningMaterialName,
-} from "@mons/shared/mining";
+  requireWagerWriter,
+  type WagerKey,
+  type ModernProposalLineage,
+} from "./wagerStateRepository.ts";
+import { requireWagerFrozenStore } from "./wagerFrozenStore.ts";
+import { isMaterialName, normalizeCount } from "@mons/shared/mining";
 import {
   isWagerAgreement,
-  type WagerAgreement,
   type WagerProposalAcceptRequest,
   type WagerProposalAcceptResponse,
   type WagerProposalRemovalRequest,
@@ -68,18 +68,6 @@ type WagerParticipantUids = Pick<
 type WagerParticipantFailure = {
   ok: false;
   reason: "invite-not-found" | "missing-opponent" | "profile-not-found";
-};
-
-type WagerProposalTransition = {
-  decision: "replayed" | "unavailable" | "write";
-  value?: Record<string, unknown>;
-};
-
-type ModernProposalLineage = {
-  count: number;
-  material: MiningMaterialName;
-  operationId: string;
-  reservationOperationId: string;
 };
 
 const WAGER_CRITICAL_PHASE_TIMEOUT_MS = 30_000;
@@ -249,141 +237,6 @@ async function resolveWagerParticipants(
   return resolveWagerParticipantProfiles(participants, repository);
 }
 
-function transitionWagerProposal(
-  current: unknown,
-  input: {
-    material: MiningMaterialName;
-    now: number;
-    opponentAdjustmentOperationId: string;
-    opponentProposal: ModernProposalLineage | null;
-    operationId: string;
-    opponentUid: string;
-    playerUid: string;
-    reservationOperationId: string;
-    reservedCount: number;
-    selfAdjustmentOperationId: string;
-  },
-): WagerProposalTransition {
-  const wager = toRecord(current) || {};
-  const agreement = toRecord(wager.agreed);
-  const agreementOperation = toRecord(wager.agreementOperation);
-  if (
-    agreementOperation?.id === input.operationId &&
-    agreement?.accepterId === input.playerUid
-  ) {
-    return { decision: "replayed" };
-  }
-  const proposals = { ...(toRecord(wager.proposals) || {}) };
-  const ownProposal = toRecord(proposals[input.playerUid]);
-  if (ownProposal?.operationId === input.operationId) {
-    return { decision: "replayed" };
-  }
-  if (wager.resolved || wager.agreed || wager.settlement) {
-    return { decision: "unavailable" };
-  }
-  const proposedBy = { ...(toRecord(wager.proposedBy) || {}) };
-  if (proposals[input.playerUid] || proposedBy[input.playerUid]) {
-    return { decision: "unavailable" };
-  }
-  const opponentProposal = toRecord(proposals[input.opponentUid]);
-  const opponentCount = normalizeCount(opponentProposal?.count);
-  if (
-    opponentProposal &&
-    opponentProposal.material === input.material &&
-    opponentCount > 0
-  ) {
-    if (
-      !input.opponentProposal ||
-      input.opponentProposal.material !== input.material ||
-      input.opponentProposal.count !== opponentCount ||
-      opponentProposal.operationId !== input.opponentProposal.operationId ||
-      opponentProposal.reservationOperationId !==
-        input.opponentProposal.reservationOperationId
-    ) {
-      return { decision: "unavailable" };
-    }
-    const acceptedCount = Math.min(input.reservedCount, opponentCount);
-    if (acceptedCount <= 0) {
-      return { decision: "unavailable" };
-    }
-    const agreement: WagerAgreement = {
-      material: input.material,
-      count: acceptedCount,
-      total: acceptedCount * 2,
-      proposerId: input.opponentUid,
-      accepterId: input.playerUid,
-      acceptedAt: input.now,
-    };
-    proposedBy[input.playerUid] = true;
-    const opponentReservationOperationId =
-      input.opponentProposal.reservationOperationId;
-    const opponentOperationId = input.opponentProposal.operationId;
-    const reservationAdjustments = [
-      ...(acceptedCount !== input.reservedCount
-        ? [
-            {
-              uid: input.playerUid,
-              operationId: input.selfAdjustmentOperationId,
-              kind: "send-self-adjustment",
-              material: input.material,
-              delta: acceptedCount - input.reservedCount,
-            },
-          ]
-        : []),
-      ...(acceptedCount !== opponentCount
-        ? [
-            {
-              uid: input.opponentUid,
-              operationId: input.opponentAdjustmentOperationId,
-              kind: "send-proposer-adjustment",
-              material: input.material,
-              delta: acceptedCount - opponentCount,
-            },
-          ]
-        : []),
-    ];
-    return {
-      decision: "write",
-      value: {
-        ...wager,
-        proposals: null,
-        proposedBy,
-        agreed: agreement,
-        agreementOperation: {
-          id: input.operationId,
-          proposerOperationId: opponentOperationId,
-          proposerReservedCount: opponentCount,
-          reservationLineageVersion: 1,
-          reservationLineageReady: reservationAdjustments.length === 0,
-          ...(reservationAdjustments.length > 0
-            ? { reservationAdjustments }
-            : {}),
-          accepterReservationOperationIds: [
-            input.selfAdjustmentOperationId,
-            input.reservationOperationId,
-          ],
-          proposerReservationOperationIds: [
-            input.opponentAdjustmentOperationId,
-            opponentReservationOperationId,
-          ],
-        },
-      },
-    };
-  }
-  proposals[input.playerUid] = {
-    material: input.material,
-    count: input.reservedCount,
-    createdAt: input.now,
-    operationId: input.operationId,
-    reservationOperationId: input.reservationOperationId,
-  };
-  proposedBy[input.playerUid] = true;
-  return {
-    decision: "write",
-    value: { ...wager, proposals, proposedBy },
-  };
-}
-
 async function runWagerMutationWithLease<T>(
   identity: RequestIdentity,
   request: { inviteId: string; matchId: string },
@@ -505,7 +358,10 @@ async function sendWagerProposalUnlocked(
     operationId,
     "proposer-adjustment",
   );
-  const wagerPath = `invites/${request.inviteId}/wagers/${request.matchId}`;
+  const wagerKey: WagerKey = {
+    inviteId: request.inviteId,
+    matchId: request.matchId,
+  };
   if (participants.playerProfileId === participants.opponentProfileId) {
     await recoverUnreferencedWagerReservation(
       repository,
@@ -513,7 +369,7 @@ async function sendWagerProposalUnlocked(
         playerUid: participants.playerUid,
         mutation,
         reservationOperationId,
-        wagerPath,
+        wagerKey,
       },
       "send-reserve",
     );
@@ -536,7 +392,7 @@ async function sendWagerProposalUnlocked(
     throw new Error("wager-operation-unavailable");
   }
   if (existingReservationState.status === "consumed") {
-    const wager = toRecord(await repository.getStatePath(wagerPath));
+    const wager = toRecord(await repository.wagers.readWager(wagerKey));
     const agreementOperation = toRecord(wager?.agreementOperation);
     const agreement = isWagerAgreement(wager?.agreed) ? wager.agreed : null;
     if (
@@ -554,7 +410,7 @@ async function sendWagerProposalUnlocked(
     }
     return { ok: false, reason: "proposal-unavailable" };
   }
-  const wagerBefore = toRecord(await repository.getStatePath(wagerPath));
+  const wagerBefore = toRecord(await repository.wagers.readWager(wagerKey));
   const opponentProposalBefore = toRecord(
     toRecord(wagerBefore?.proposals)?.[participants.opponentUid],
   );
@@ -587,7 +443,7 @@ async function sendWagerProposalUnlocked(
       playerUid: participants.playerUid,
       mutation,
       reservationOperationId,
-      wagerPath,
+      wagerKey,
     });
     if (cleanup === "referenced") {
       return { ok: false, reason: "proposal-unavailable" };
@@ -614,30 +470,25 @@ async function sendWagerProposalUnlocked(
   let wagerAfter: Record<string, unknown> | null = null;
   await mutation.refreshLease();
   try {
-    const result = await repository.transactStatePath(
-      wagerPath,
-      (current) => {
-        const transition = transitionWagerProposal(current, {
-          playerUid: participants.playerUid,
-          opponentUid: participants.opponentUid,
-          material: request.material,
-          opponentAdjustmentOperationId,
-          opponentProposal,
-          reservedCount,
-          operationId,
-          now: now(),
-          reservationOperationId,
-          selfAdjustmentOperationId,
-        });
-        return transition.decision === "write"
-          ? { value: transition.value }
-          : { commit: false, decision: transition.decision };
+    const result = await requireWagerWriter(repository).sendProposal(
+      wagerKey,
+      {
+        playerUid: participants.playerUid,
+        opponentUid: participants.opponentUid,
+        material: request.material,
+        opponentAdjustmentOperationId,
+        opponentProposal,
+        reservedCount,
+        operationId,
+        now: now(),
+        reservationOperationId,
+        selfAdjustmentOperationId,
       },
       mutation.createCriticalPhaseSignal(),
     );
     wagerAfter = toRecord(result.value);
   } catch {
-    wagerAfter = toRecord(await repository.getStatePath(wagerPath));
+    wagerAfter = toRecord(await repository.wagers.readWager(wagerKey));
   }
   const agreementOperation = toRecord(wagerAfter?.agreementOperation);
   const removalOperations = toRecord(wagerAfter?.proposalRemovalOperations);
@@ -661,7 +512,7 @@ async function sendWagerProposalUnlocked(
       playerUid: participants.playerUid,
       mutation,
       reservationOperationId,
-      wagerPath,
+      wagerKey,
     });
     return { ok: false, reason: "proposal-unavailable" };
   }
@@ -673,7 +524,7 @@ async function sendWagerProposalUnlocked(
       playerUid: participants.playerUid,
       mutation,
       reservationOperationId,
-      wagerPath,
+      wagerKey,
     });
     return { ok: false, reason: "proposal-unavailable" };
   }
@@ -685,7 +536,7 @@ async function sendWagerProposalUnlocked(
   await dependencies.assertMutationAllowed?.();
   await ensureWagerAgreementLineageReady(
     repository,
-    wagerPath,
+    wagerKey,
     now,
     dependencies.assertMutationAllowed,
   );
@@ -753,8 +604,11 @@ async function acceptWagerProposalUnlocked(
     operationId,
     "proposer-adjustment",
   );
-  const wagerPath = `invites/${request.inviteId}/wagers/${request.matchId}`;
-  const wager = toRecord(await repository.getStatePath(wagerPath));
+  const wagerKey: WagerKey = {
+    inviteId: request.inviteId,
+    matchId: request.matchId,
+  };
+  const wager = toRecord(await repository.wagers.readWager(wagerKey));
   const replayOperation = toRecord(wager?.agreementOperation);
   const replayAgreement = wager?.agreed;
   if (
@@ -764,7 +618,7 @@ async function acceptWagerProposalUnlocked(
     await dependencies.assertMutationAllowed?.();
     await ensureWagerAgreementLineageReady(
       repository,
-      wagerPath,
+      wagerKey,
       now,
       dependencies.assertMutationAllowed,
     );
@@ -776,7 +630,7 @@ async function acceptWagerProposalUnlocked(
       playerUid: participants.playerUid,
       mutation,
       reservationOperationId,
-      wagerPath,
+      wagerKey,
     },
     "accept-reserve",
   );
@@ -842,104 +696,31 @@ async function acceptWagerProposalUnlocked(
   let wagerAfter: Record<string, unknown> | null = null;
   await mutation.refreshLease();
   try {
-    const result = await repository.transactStatePath(
-      wagerPath,
-      (current) => {
-        const currentWager = toRecord(current);
-        const existingOperation = toRecord(currentWager?.agreementOperation);
-        const existingAgreement = toRecord(currentWager?.agreed);
-        if (
-          existingOperation?.id === operationId &&
-          existingAgreement?.accepterId === participants.playerUid
-        ) {
-          return { commit: false, decision: "replayed" };
-        }
-        if (
-          !currentWager ||
-          currentWager.resolved ||
-          currentWager.agreed ||
-          currentWager.settlement
-        ) {
-          return { commit: false, decision: "proposal-unavailable" };
-        }
-        const currentProposals = toRecord(currentWager.proposals) || {};
-        const currentOpponentProposal = toRecord(
-          currentProposals[participants.opponentUid],
-        );
-        const currentOwnProposal = toRecord(
-          currentProposals[participants.playerUid],
-        );
-        const opponentMatches =
-          currentOpponentProposal?.material === material &&
-          normalizeCount(currentOpponentProposal.count) === proposedCount &&
-          normalizeString(currentOpponentProposal.operationId) ===
-            opponentProposalOperationId &&
-          normalizeString(currentOpponentProposal.reservationOperationId) ===
-            opponentReservationOperationId;
-        const ownMatches = ownProposal
-          ? currentOwnProposal?.material === ownMaterial &&
-            normalizeCount(currentOwnProposal.count) === ownCount &&
-            normalizeString(currentOwnProposal.operationId) ===
-              ownProposalOperationId &&
-            normalizeString(currentOwnProposal.reservationOperationId) ===
-              ownReservationOperationId
-          : !currentOwnProposal;
-        if (!opponentMatches || !ownMatches) {
-          return { commit: false, decision: "proposal-unavailable" };
-        }
-        const agreement: WagerAgreement = {
-          material,
-          count: reservation.acceptedCount,
-          total: reservation.acceptedCount * 2,
-          proposerId: participants.opponentUid,
-          accepterId: participants.playerUid,
-          acceptedAt: now(),
-        };
-        const reservationAdjustments =
-          reservation.acceptedCount !== proposedCount
-            ? [
-                {
-                  uid: participants.opponentUid,
-                  operationId: proposerAdjustmentOperationId,
-                  kind: "accept-proposer-adjustment",
-                  material,
-                  delta: reservation.acceptedCount - proposedCount,
-                },
-              ]
-            : [];
-        return {
-          value: {
-            ...currentWager,
-            agreed: agreement,
-            proposals: null,
-            agreementOperation: {
-              id: operationId,
-              proposerOperationId: opponentProposalOperationId,
-              proposerReservedCount: proposedCount,
-              reservationLineageVersion: 1,
-              reservationLineageReady: reservationAdjustments.length === 0,
-              ...(reservationAdjustments.length > 0
-                ? { reservationAdjustments }
-                : {}),
-              accepterReservationOperationIds: [
-                reservationOperationId,
-                ...(ownReservationOperationId
-                  ? [ownReservationOperationId]
-                  : []),
-              ],
-              proposerReservationOperationIds: [
-                proposerAdjustmentOperationId,
-                opponentReservationOperationId,
-              ],
-            },
-          },
-        };
+    const result = await requireWagerWriter(repository).acceptProposal(
+      wagerKey,
+      {
+        playerUid: participants.playerUid,
+        opponentUid: participants.opponentUid,
+        operationId,
+        material,
+        proposedCount,
+        opponentProposalOperationId,
+        opponentReservationOperationId,
+        hasOwnProposal: Boolean(ownProposal),
+        ownMaterial,
+        ownCount,
+        ownProposalOperationId,
+        ownReservationOperationId,
+        acceptedCount: reservation.acceptedCount,
+        now: now(),
+        proposerAdjustmentOperationId,
+        reservationOperationId,
       },
       mutation.createCriticalPhaseSignal(),
     );
     wagerAfter = toRecord(result.value);
   } catch {
-    wagerAfter = toRecord(await repository.getStatePath(wagerPath));
+    wagerAfter = toRecord(await repository.wagers.readWager(wagerKey));
   }
   const agreementOperation = toRecord(wagerAfter?.agreementOperation);
   const storedAgreement = wagerAfter?.agreed;
@@ -949,7 +730,7 @@ async function acceptWagerProposalUnlocked(
       playerUid: participants.playerUid,
       mutation,
       reservationOperationId,
-      wagerPath,
+      wagerKey,
     });
     return { ok: false, reason: "proposal-unavailable" };
   }
@@ -957,7 +738,7 @@ async function acceptWagerProposalUnlocked(
   await dependencies.assertMutationAllowed?.();
   await ensureWagerAgreementLineageReady(
     repository,
-    wagerPath,
+    wagerKey,
     now,
     dependencies.assertMutationAllowed,
   );
@@ -973,8 +754,8 @@ async function removeProposal(
   expectedReservationOperationId: string,
   mutation: WagerMutationContext,
 ): Promise<Record<string, unknown> | null> {
-  const wagerPath = `invites/${inviteId}/wagers/${matchId}`;
-  const wagerBefore = toRecord(await repository.getStatePath(wagerPath));
+  const wagerKey: WagerKey = { inviteId, matchId };
+  const wagerBefore = toRecord(await repository.wagers.readWager(wagerKey));
   const proposalBefore = toRecord(
     toRecord(wagerBefore?.proposals)?.[proposalUid],
   );
@@ -995,58 +776,12 @@ async function removeProposal(
   let wagerAfter: unknown;
   await mutation.refreshLease();
   try {
-    const result = await repository.transactStatePath(
-      wagerPath,
-      (current) => {
-        const wager = toRecord(current);
-        const removalOperations =
-          toRecord(wager?.proposalRemovalOperations) || {};
-        const replayOperation = toRecord(removalOperations[operationId]);
-        if (replayOperation) {
-          return replayOperation.reservationOperationId ===
-            expectedReservationOperationId &&
-            validOperationId(replayOperation.proposalOperationId)
-            ? { commit: false, decision: "replayed" }
-            : { commit: false, decision: "proposal-invalid" };
-        }
-        const proposals = toRecord(wager?.proposals);
-        const proposal = toRecord(proposals?.[proposalUid]);
-        if (
-          !wager ||
-          wager.agreed ||
-          wager.resolved ||
-          wager.settlement ||
-          !proposals ||
-          !proposal
-        ) {
-          return { commit: false, decision: "proposal-missing" };
-        }
-        const proposalOperationId = normalizeString(proposal.operationId);
-        const reservationOperationId = normalizeString(
-          proposal.reservationOperationId,
-        );
-        if (
-          !validOperationId(proposalOperationId) ||
-          reservationOperationId !== expectedReservationOperationId
-        ) {
-          return { commit: false, decision: "proposal-invalid" };
-        }
-        const nextProposals = { ...proposals };
-        delete nextProposals[proposalUid];
-        const nextWager = { ...wager };
-        if (Object.keys(nextProposals).length > 0) {
-          nextWager.proposals = nextProposals;
-        } else {
-          delete nextWager.proposals;
-        }
-        nextWager.proposalRemovalOperations = {
-          ...removalOperations,
-          [operationId]: {
-            proposalOperationId,
-            reservationOperationId,
-          },
-        };
-        return { value: nextWager };
+    const result = await requireWagerWriter(repository).removeProposal(
+      wagerKey,
+      {
+        proposalUid,
+        operationId,
+        expectedReservationOperationId,
       },
       mutation.createCriticalPhaseSignal(),
     );
@@ -1055,7 +790,7 @@ async function removeProposal(
     }
     wagerAfter = result.value;
   } catch {
-    wagerAfter = await repository.getStatePath(wagerPath);
+    wagerAfter = await repository.wagers.readWager(wagerKey);
     const recoveredWager = toRecord(wagerAfter);
     const recoveredOperations = toRecord(
       recoveredWager?.proposalRemovalOperations,
@@ -1161,13 +896,13 @@ async function removeWagerProposalUnlocked(
       playerUid: proposalUid,
       mutation,
       reservationOperationId: acceptReservationOperationId,
-      wagerPath: `invites/${request.inviteId}/wagers/${request.matchId}`,
+      wagerKey: { inviteId: request.inviteId, matchId: request.matchId },
     });
     await releaseUnreferencedWagerReservation(repository, {
       playerUid: proposalUid,
       mutation,
       reservationOperationId: proposalReservationOperationId,
-      wagerPath: `invites/${request.inviteId}/wagers/${request.matchId}`,
+      wagerKey: { inviteId: request.inviteId, matchId: request.matchId },
     });
   } catch {
     (

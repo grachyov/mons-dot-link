@@ -104,7 +104,7 @@ describe("historical match presentation", () => {
         readInviteMetadata: async () => {
           throw new Error("unexpected-invite-metadata-read");
         },
-        getStatePath: async () => {
+        readAutomatchEntry: async () => {
           throw new Error("unexpected-source-read");
         },
       },
@@ -159,7 +159,7 @@ describe("historical match presentation", () => {
         readInviteMetadata: async () => {
           throw new Error("unexpected-invite-metadata-read");
         },
-        getStatePath: async () => {
+        readAutomatchEntry: async () => {
           throw new Error("unexpected-source-read");
         },
       },
@@ -185,7 +185,7 @@ describe("historical match presentation", () => {
         readInviteMetadata: async () => {
           throw new Error("unexpected-invite-metadata-read");
         },
-        getStatePath: async () => {
+        readAutomatchEntry: async () => {
           throw new Error("unexpected-source-read");
         },
       },
@@ -204,7 +204,7 @@ describe("historical match presentation", () => {
         readInviteMetadata: async () => {
           throw new Error("unexpected-invite-metadata-read");
         },
-        getStatePath: async () => {
+        readAutomatchEntry: async () => {
           throw new Error("unexpected-source-read");
         },
       },
@@ -231,7 +231,7 @@ describe("historical match presentation", () => {
           readInviteMetadata: async () => {
             throw new Error("unexpected-invite-metadata-read");
           },
-          getStatePath: async () => {
+          readAutomatchEntry: async () => {
             throw new Error("unexpected-source-read");
           },
         },
@@ -310,7 +310,7 @@ describe("historical match presentation", () => {
         readInviteMetadata: async () => {
           throw new Error("unexpected-invite-metadata-read");
         },
-        getStatePath: async () => {
+        readAutomatchEntry: async () => {
           throw new Error("unexpected-source-read");
         },
       },

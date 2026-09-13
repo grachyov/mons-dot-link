@@ -1,3 +1,8 @@
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import {
+  eventMatchTestPort,
+  readEventRepositoryFixture,
+} from "./eventRepositoryFixture.ts";
 import { env } from "cloudflare:workers";
 import { resetMatchPresentationTestState } from "./matchPresentationTestFixture.ts";
 import type { D1Migration } from "cloudflare:test";
@@ -14,7 +19,7 @@ import { createEventProfileGameProjectionRuntime } from "../src/profileGameProje
 import type {
   StateRepository,
   StateQuery,
-} from "../src/stateRepositoryTypes.ts";
+} from "../test/stateRepositoryTestTypes.ts";
 import type { EventReads } from "../../../runtime/eventReads.js";
 import { eventReadFixture } from "../test/eventReadFixture.ts";
 import { applyEventTestMigrations } from "./eventTestMigrations.ts";
@@ -90,7 +95,7 @@ function stateFixture(initial: Record<string, unknown> = {}) {
   const metadataReads: string[] = [];
   const read = async (path: string, query?: StateQuery) => {
     reads.push(path);
-    if (path.startsWith("players/")) expect(query).toEqual({ shallow: true });
+    if (path.startsWith("players/")) expect(query).toBeUndefined();
     return values.get(path) ?? null;
   };
   const client: StateRepository & EventReads = {
@@ -108,10 +113,16 @@ function stateFixture(initial: Record<string, unknown> = {}) {
     },
   };
   const reader = {
-    async getStatePath(path: string, query?: StateQuery) {
-      if (path.startsWith("invites/"))
-        throw new Error("unexpected-invite-aggregate-read");
-      return read(path, query);
+    async readMatchRecord({
+      playerId,
+      matchId,
+    }: {
+      playerId: string;
+      matchId: string;
+    }) {
+      return read(`players/${playerId}/matches/${matchId}`) as Promise<
+        import("../src/matchStateTypes.ts").MatchStateRecord | null
+      >;
     },
     async readInviteMetadata(inviteId: string, signal?: AbortSignal) {
       signal?.throwIfAborted();
@@ -209,15 +220,19 @@ describe("event login-match discovery", () => {
   it("keeps the event intent pending when indexing fails after match creation", async () => {
     const fixture = eventTransitionFixture(testEnv);
     const repository = fixture.client;
-    await repository.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await repository.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     await rejectIndexWrites();
     try {
       await expect(
-        repository.patchRoot({
-          [`events/${eventId}/status`]: "active",
-          [`events/${eventId}/rounds`]: eventRounds(),
-          ...matchEffects(),
-        }),
+        repository.commitEventPlan(
+          decodeEventUpdates({
+            [`events/${eventId}/status`]: "active",
+            [`events/${eventId}/rounds`]: eventRounds(),
+            ...matchEffects(),
+          }),
+        ),
       ).rejects.toThrow("event-discovery-write-failed");
       expect(
         await listPendingEventTransitionIntents(testEnv.EVENT_DB),
@@ -248,22 +263,27 @@ describe("event login-match discovery", () => {
 
   it("captures old Workflow output before event outbox acknowledgment", async () => {
     const fixture = stateFixture(matchEffects());
-    const repository = createEventStateRepository(testEnv, fixture.client);
+    const repository = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort(fixture.client),
+    );
     const outboxPath = `profileGameProjectionOutbox/event/${eventId}`;
-    await repository.patchRoot({
-      [`events/${eventId}`]: {
-        ...eventRecord(),
-        status: "active",
-        rounds: eventRounds(),
-      },
-      [outboxPath]: {
-        schemaVersion: 1,
-        status: "pending",
-        requestId: "old-workflow-projection",
-        lastQueuedAtMs: 100,
-        cleanupOwnerProfileIds: {},
-      },
-    });
+    await repository.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}`]: {
+          ...eventRecord(),
+          status: "active",
+          rounds: eventRounds(),
+        },
+        [outboxPath]: {
+          schemaVersion: 1,
+          status: "pending",
+          requestId: "old-workflow-projection",
+          lastQueuedAtMs: 100,
+          cleanupOwnerProfileIds: {},
+        },
+      }),
+    );
     const runtime = createEventProfileGameProjectionRuntime(testEnv, {
       state: {
         ...fixture.reader,
@@ -279,21 +299,21 @@ describe("event login-match discovery", () => {
           requestId: "old-workflow-projection",
         },
         {
-          getStatePath: repository.getPath,
-          readInviteMetadata: fixture.reader.readInviteMetadata,
-          transactStatePath: repository.transactPath,
+          ...repository,
         },
         runtime,
       );
     await rejectIndexWrites();
     try {
       await expect(process()).rejects.toThrow("event-discovery-write-failed");
-      expect(await repository.getPath(outboxPath)).not.toBeNull();
+      expect(
+        await readEventRepositoryFixture(repository, outboxPath),
+      ).not.toBeNull();
     } finally {
       await permitIndexWrites();
     }
     await expect(process()).resolves.toBe("projected");
-    expect(await repository.getPath(outboxPath)).toBeNull();
+    expect(await readEventRepositoryFixture(repository, outboxPath)).toBeNull();
     expect((await indexedRows()).map((row) => row.login_uid)).toEqual(
       [hostUid, guestUid].sort(),
     );
@@ -361,20 +381,19 @@ describe("event login-match discovery", () => {
 
   it("rejects unjournaled match creation before applying any effects", async () => {
     const fixture = stateFixture();
-    const repository = createEventStateRepository(testEnv, fixture.client);
+    const repository = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort(fixture.client),
+    );
     for (const updates of [
       matchEffects(),
       { [`events/${eventId}`]: eventRecord(), ...matchEffects() },
     ]) {
-      await expect(repository.patchRoot(updates)).rejects.toThrow(
-        "event-match-creation-requires-transition",
-      );
+      await expect(
+        repository.commitEventPlan(decodeEventUpdates(updates)),
+      ).rejects.toThrow("event-match-creation-requires-transition");
     }
-    await expect(
-      repository.transactPath(`players/${hostUid}/matches/${inviteId}`, () => ({
-        value: { fen: "new" },
-      })),
-    ).rejects.toThrow("event-match-creation-requires-transition");
+    expect("transactPath" in repository).toBe(false);
     expect(fixture.patches).toEqual([]);
     expect(await repository.readEvent(eventId)).toBeNull();
   });

@@ -1,6 +1,5 @@
 import { RETIRED_STATE_BACKEND } from "./stateCompatibility.ts";
 import { STATE_VALUE_FIELD } from "./stateCompatibility.ts";
-import type { StateQuery } from "./stateRepositoryTypes.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 
 const RETIRED_FIELDS = new Set([
@@ -31,6 +30,12 @@ export type InviteSourceSnapshot = {
   inviteId: string;
   value: Record<string, unknown> | null;
   revision: number;
+};
+
+export type InviteSourceChange = {
+  inviteId: string;
+  value: Record<string, unknown>;
+  operationIds?: Record<string, string>;
 };
 
 export type InviteSourceMutation = {
@@ -118,17 +123,6 @@ export function normalizeInviteSource(value: unknown): Record<string, unknown> {
         return [key, copy(child, 1)];
       }),
   );
-}
-
-export function inviteSourcePath(path: string): {
-  inviteId: string;
-  nested: string[];
-} | null {
-  const parts = path.replace(/^\/+|\/+$/g, "").split("/");
-  if (parts[0] !== "invites") return null;
-  if (!parts[1]) throw new TypeError("invite-source-root-scan-unsupported");
-  parts.slice(1).forEach(requireId);
-  return { inviteId: parts[1], nested: parts.slice(2) };
 }
 
 export async function readInviteSourceControl(
@@ -533,79 +527,47 @@ export function createInviteSourceD1Store(
     read,
     buildRevisionGuardStatements,
     buildCommitStatements,
-    async getPath(
-      path: string,
-      query?: StateQuery,
-      signal?: AbortSignal,
-    ): Promise<unknown> {
-      const owned = inviteSourcePath(path);
-      if (!owned) throw new TypeError("invalid-invite-source-path");
-      if (query && Object.keys(query).some((key) => key !== "shallow"))
-        throw new TypeError("invite-source-query-unsupported");
-      if (query?.shallow !== undefined && typeof query.shallow !== "boolean")
-        throw new TypeError("invite-source-query-unsupported");
-      const snapshot = await read(owned.inviteId, signal);
-      const value = getNested(snapshot.value, owned.nested);
-      return query?.shallow && value !== null && typeof value === "object"
-        ? Object.fromEntries(Object.keys(value).map((key) => [key, true]))
-        : value;
-    },
-    async preparePatch(
-      updates: Record<string, unknown>,
+    async prepareChanges(
+      changes: readonly InviteSourceChange[],
       nowMs = now(),
       signal?: AbortSignal,
     ): Promise<InviteSourceMutation[]> {
       if (!integer(nowMs))
         throw new TypeError("invalid-invite-source-timestamp");
-      const paths = Object.keys(updates);
-      if (
-        paths.some((path) =>
-          paths.some((other) => path !== other && path.startsWith(`${other}/`)),
-        )
-      )
-        throw new TypeError("overlapping-invite-source-updates");
-      const grouped = new Map<string, { nested: string[]; value: unknown }[]>();
-      for (const [path, value] of Object.entries(updates)) {
-        const owned = inviteSourcePath(path);
-        if (!owned) throw new TypeError("invalid-invite-source-path");
-        const fields = owned.nested.length
-          ? [owned.nested[0]]
-          : record(value)
-            ? Object.keys(value)
-            : [];
+      const grouped = new Map<string, InviteSourceChange[]>();
+      for (const change of changes) {
+        requireId(change.inviteId);
+        if (!record(change.value))
+          throw new TypeError("invite-source-deletion-unsupported");
         if (
-          fields.some(
+          Object.keys(change.value).some(
             (field) =>
               RETIRED_FIELDS.has(field) || field === "sessionTransition",
           )
         )
           throw new TypeError("reserved-invite-source-field");
-        if (!owned.nested.length && !record(value))
-          throw new TypeError("invite-source-deletion-unsupported");
-        const entries = grouped.get(owned.inviteId) || [];
-        entries.push({ nested: owned.nested, value });
-        grouped.set(owned.inviteId, entries);
+        const group = grouped.get(change.inviteId) || [];
+        group.push(change);
+        grouped.set(change.inviteId, group);
       }
       const mutations: InviteSourceMutation[] = [];
-      for (const [inviteId, entries] of grouped) {
+      for (const [inviteId, group] of grouped) {
         const current = await read(inviteId, signal);
         const next = structuredClone(current.value || {});
-        for (const entry of entries) {
-          if (!entry.nested.length && record(entry.value)) {
-            for (const [key, value] of Object.entries(entry.value)) {
-              requireId(key);
-              setNested(
-                next,
-                [key],
-                resolveValue(value, getNested(next, [key]), nowMs),
-              );
-            }
-          } else {
+        for (const change of group) {
+          for (const [key, value] of Object.entries(change.value)) {
+            requireId(key);
             setNested(
               next,
-              entry.nested,
-              resolveValue(entry.value, getNested(next, entry.nested), nowMs),
+              [key],
+              resolveValue(value, getNested(next, [key]), nowMs),
             );
+          }
+          for (const [loginUid, operationId] of Object.entries(
+            change.operationIds || {},
+          )) {
+            requireId(loginUid);
+            setNested(next, ["automatchOperationIds", loginUid], operationId);
           }
         }
         mutations.push({ current, value: normalizeInviteSource(next) });

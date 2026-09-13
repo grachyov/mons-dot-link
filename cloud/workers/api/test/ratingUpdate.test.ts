@@ -1,3 +1,4 @@
+import type { MatchStateRecord } from "../src/matchStateTypes.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isHistoricalMatchPair } from "@mons/shared/game-sessions";
@@ -242,26 +243,31 @@ function createRepository({
       finalPlan = buildPlan(playerProfile, opponentProfile);
       return { status: "committed", data: finalPlan.repairData };
     },
-    getStatePath: async (path) => {
-      assert.doesNotMatch(path, /matchesRatingUpdates/);
-      if (path === `invites/${request.inviteId}`) return invite;
-      if (path === `players/${request.playerId}/matches/${request.matchId}`) {
-        if (failMatchReads) throw new Error("match-read-failed");
-        return playerMatchValue;
-      }
-      if (path === `players/${request.opponentId}/matches/${request.matchId}`) {
-        if (failMatchReads) throw new Error("match-read-failed");
-        return opponentMatchValue;
-      }
-      return null;
+    readInviteMetadata: async () => invite as Record<string, unknown> | null,
+    readMatchRecord: async ({ playerId }) => {
+      if (failMatchReads) throw new Error("match-read-failed");
+      return (
+        playerId === request.playerId ? playerMatchValue : opponentMatchValue
+      ) as MatchStateRecord | null;
     },
-    patchStateRoot: async (updates) => {
-      assert.ok(
-        Object.keys(updates).every(
-          (path) => !path.includes("matchesRatingUpdates"),
-        ),
-      );
-      patches.push(updates);
+    async readMatchPair(input) {
+      return {
+        ...input,
+        epoch: 1,
+        revision: 1,
+        claim: null,
+        playerMatch: (await this.readMatchRecord(input)) as
+          import("../src/matchStateTypes.ts").MatchStateRecord | null,
+        opponentMatch: input.opponentId
+          ? ((await this.readMatchRecord({
+              playerId: input.opponentId,
+              matchId: input.matchId,
+            })) as import("../src/matchStateTypes.ts").MatchStateRecord | null)
+          : null,
+      };
+    },
+    putEventProgressOutbox: async (outboxId, record) => {
+      patches.push({ [`eventProgressOutbox/${outboxId}`]: record });
     },
     hasCompletedRatingUpdate: async (inviteId, matchId) => {
       assert.equal(inviteId, request.inviteId);
@@ -658,7 +664,7 @@ test("event ratings retain a pending recovery marker when match repair fails", a
       eventId: "event-1",
     },
   });
-  state.repository.patchStateRoot = async () => {
+  state.repository.putEventProgressOutbox = async () => {
     throw new Error("state-unavailable");
   };
   await assert.rejects(

@@ -1,8 +1,9 @@
 import type { AutomatchPersistence } from "../src/automatchPersistence.ts";
-import type { GameplayRepository } from "../src/gameplayRepository.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
+import { gameplayTestPort } from "./gameSessionTestPorts.ts";
 
 export function createAutomatchQueueLookup(
-  readState?: GameplayRepository["getStatePath"],
+  readState?: StateRepository["getPath"],
 ): AutomatchPersistence["readQueuedByLogins"] {
   return async (loginUids, signal) => {
     const rows = await Promise.all(
@@ -33,11 +34,11 @@ export function createAutomatchPersistenceStub(
     throw new Error("unexpected-persistence-operation");
   };
   return {
-    client: {
+    client: gameplayTestPort({
       getPath: unavailable,
       patchRoot: unavailable,
       transactPath: unavailable,
-    },
+    }),
     recoverLogins: async () => {},
     writesEnabled: async () => true,
     readQueuedByLogins: async () => ({}),

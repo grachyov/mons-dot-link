@@ -1,3 +1,8 @@
+import {
+  attachEventTestPorts,
+  type EventTestSource,
+} from "./eventTestPorts.ts";
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { EventLockManager } from "../../../runtime/events/lockManagerCore.js";
@@ -28,7 +33,7 @@ const participant = {
 
 const lockHandle = {
   eventId: "event-1",
-  path: "eventLocks/event-1",
+  key: { kind: "event" as const, id: "event-1" },
   lockId: "lock-1",
   ownerUid: identity.uid,
   lockRoot: "eventLocks",
@@ -49,8 +54,14 @@ const lockManager: EventLockManager = {
   startEventLockHeartbeat: () => () => undefined,
 };
 
-function createRepository(): EventGameplayRepository {
-  const read: EventGameplayRepository["getStatePath"] = async (path) =>
+function createRepository(): EventGameplayRepository &
+  Required<
+    Pick<
+      EventTestSource,
+      "getStatePath" | "patchStateRoot" | "transactStatePath"
+    >
+  > {
+  const read: NonNullable<EventTestSource["getStatePath"]> = async (path) =>
     path === "events/event-1"
       ? {
           eventId: "event-1",
@@ -61,7 +72,15 @@ function createRepository(): EventGameplayRepository {
           participants: { [profileId]: participant },
         }
       : null;
-  return {
+  return attachEventTestPorts<
+    EventGameplayRepository &
+      Required<
+        Pick<
+          EventTestSource,
+          "getStatePath" | "patchStateRoot" | "transactStatePath"
+        >
+      >
+  >({
     ...eventReadFixture(read),
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
@@ -128,7 +147,7 @@ function createRepository(): EventGameplayRepository {
     getStatePath: read,
     patchStateRoot: async () => undefined,
     transactStatePath: async () => ({ committed: false, value: null }),
-  };
+  });
 }
 
 const ctx = { waitUntil: () => undefined };
@@ -352,7 +371,10 @@ test("returns strict join and removal responses", async () => {
     participation: {
       lockManager,
       now: () => 100,
-      buildDueUpdates: async () => ({ didChange: false, updates: {} }),
+      buildDueUpdates: async () => ({
+        didChange: false,
+        updates: decodeEventUpdates({}),
+      }),
     },
   };
   const join = await handleEventRoute(

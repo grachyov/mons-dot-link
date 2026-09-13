@@ -1,51 +1,26 @@
 import { normalizeRecordKey } from "@mons/shared/ids";
-import { changedInviteMetadataIds } from "./inviteMetadataNotifications.ts";
 import {
   notifyInviteRooms,
   type InviteRoomNotificationOptions,
 } from "./inviteRoomNotifications.ts";
 
-const WAGER_SOURCE_FIELDS = new Set([
-  "wagers",
-  "hostId",
-  "guestId",
-  "password",
-]);
+export type InviteSourceChanges = {
+  metadataInviteIds: readonly string[];
+  wagerInviteIds: readonly string[];
+};
 
-export function changedInviteWagersIds(
-  updates: Record<string, unknown>,
-): string[] {
-  const inviteIds = new Set<string>();
-  for (const [path, value] of Object.entries(updates)) {
-    const parts = path.replace(/^\/+|\/+$/g, "").split("/");
-    if (parts[0] !== "invites") continue;
-    if (
-      parts.length === 1 &&
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value)
-    ) {
-      for (const inviteId of Object.keys(value)) {
-        if (normalizeRecordKey(inviteId) === inviteId) inviteIds.add(inviteId);
-      }
-    } else if (
-      normalizeRecordKey(parts[1]) === parts[1] &&
-      (parts.length === 2 || WAGER_SOURCE_FIELDS.has(parts[2]))
-    ) {
-      inviteIds.add(parts[1]);
-    }
-  }
-  return [...inviteIds];
+function validIds(ids: readonly string[]): string[] {
+  return [...new Set(ids)].filter((id) => normalizeRecordKey(id) === id);
 }
 
 export function notifyInviteWagersChanged(
   env: Env,
-  updates: Record<string, unknown>,
+  inviteIds: readonly string[],
   options: InviteRoomNotificationOptions = {},
 ): Promise<void> {
   return notifyInviteRooms(
     env,
-    changedInviteWagersIds(updates),
+    validIds(inviteIds),
     "notifyWagersChanged",
     "invite_wagers_notify_failed",
     options,
@@ -54,12 +29,9 @@ export function notifyInviteWagersChanged(
 
 export async function notifyInviteSourceChanged(
   env: Env,
-  updates: Record<string, unknown>,
-  metadataCommitted: boolean,
+  changes: InviteSourceChanges,
 ): Promise<void> {
-  const metadataIds = new Set(
-    metadataCommitted ? changedInviteMetadataIds(updates) : [],
-  );
+  const metadataIds = new Set(validIds(changes.metadataInviteIds));
   await Promise.all([
     notifyInviteRooms(
       env,
@@ -69,7 +41,7 @@ export async function notifyInviteSourceChanged(
     ),
     notifyInviteRooms(
       env,
-      changedInviteWagersIds(updates).filter(
+      validIds(changes.wagerInviteIds).filter(
         (inviteId) => !metadataIds.has(inviteId),
       ),
       "notifyWagersChanged",

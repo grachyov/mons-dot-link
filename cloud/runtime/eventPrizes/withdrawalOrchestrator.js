@@ -7,7 +7,6 @@ const {
 } = require("@mons/shared/event-prizes");
 const {
   EVENT_PRIZE_ADMIN_WALLET,
-  getEventPrizeWithdrawalPath,
   isCompletedEventPrizeWithdrawal,
   isWithdrawalRecordForPrize,
   isWithdrawalRecordOwnedByRequest,
@@ -112,7 +111,7 @@ const handleWithdrawEventPrize = async (request, dependencies) => {
   }
 
   const {
-    state,
+    withdrawals,
     createEventPrizeUmi,
     readProfileByLoginUid,
     resolveWithdrawalProfileId,
@@ -123,11 +122,7 @@ const handleWithdrawEventPrize = async (request, dependencies) => {
   if (!profileId) {
     throw new HttpsError("not-found", "profile-not-found");
   }
-  const withdrawalPath = getEventPrizeWithdrawalPath(eventId, prizeId);
-  const withdrawalRecord = {
-    read: () => state.read(withdrawalPath),
-    transaction: (updater) => state.transaction(withdrawalPath, updater),
-  };
+  const withdrawalRecord = withdrawals.record(eventId, prizeId);
   const existingWithdrawal = await withdrawalRecord.read();
   const existingProfileId = normalizeString(existingWithdrawal?.profileId);
   let canonicalRecordProfileId = existingProfileId;

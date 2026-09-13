@@ -4,6 +4,9 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { createEventRuntime } = require("../runtime/events");
 
+const {
+  encodeEventUpdates,
+} = require("../workers/api/src/eventCompatibilityCodec.ts");
 const eventId = "NN3eRzoZo80";
 
 function createRuntime({
@@ -34,8 +37,8 @@ function createRuntime({
       },
       readEventPrizeSelections: () =>
         assert.fail("snapshot already includes prize selections"),
-      update: async (path, updates) => {
-        assert.equal(path, "");
+      commitEventPlan: async (plan) => {
+        const updates = encodeEventUpdates(plan);
         calls.push("write");
         patches.push(updates);
         for (const [key, value] of Object.entries(updates)) {

@@ -1,3 +1,4 @@
+import { gameplayTestPort } from "../test/gameSessionTestPorts.ts";
 import { socketTestIdentity } from "../test/socketTestSession.ts";
 import { env } from "cloudflare:workers";
 import {
@@ -95,7 +96,7 @@ async function registeredRepository(
     ).bind(inviteId, JSON.stringify({ hostId: actors[0], guestId: actors[1] })),
   ]);
   return createGameplayRepository(env, {
-    stateClient: {
+    stateClient: gameplayTestPort({
       getPath: async () => {
         throw new Error("unexpected-source-read");
       },
@@ -105,7 +106,7 @@ async function registeredRepository(
       transactPath: async () => {
         throw new Error("unexpected-source-write");
       },
-    },
+    }),
   });
 }
 

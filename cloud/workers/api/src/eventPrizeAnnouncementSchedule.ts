@@ -1,3 +1,4 @@
+import type { EventCommitPlan } from "../../../runtime/eventCommands.js";
 import {
   EVENT_ANNOUNCEMENT_KINDS,
   EVENT_ANNOUNCEMENT_SPECS,
@@ -20,7 +21,7 @@ const SCHEDULE_FIELDS = new Set(["isSundayMons", "startAtMs", "status"]);
 
 type ScheduleRepository = Pick<
   EventGameplayRepository,
-  "getStatePath" | "patchStateRoot" | "readEvent"
+  "readEventProgressOutbox" | "commitEventPlan" | "readEvent"
 >;
 
 type ScheduleDependencies = {
@@ -80,11 +81,7 @@ async function preserveSchedule(
 ): Promise<EventProgressPlan> {
   const existing = await parseEventProgressOutbox(
     plan.outboxId,
-    await repository.getStatePath(
-      `eventProgressOutbox/${plan.outboxId}`,
-      undefined,
-      signal,
-    ),
+    await repository.readEventProgressOutbox(plan.outboxId, signal),
   );
   return existing || plan;
 }
@@ -105,9 +102,9 @@ async function scheduleEventAnnouncement(
   );
   if (!candidate) return;
   const plan = await preserveSchedule(repository, candidate);
-  await repository.patchStateRoot({
-    [`eventProgressOutbox/${plan.outboxId}`]: plan.outbox,
-  });
+  await repository.commitEventPlan([
+    { kind: "progress-outbox", outboxId: plan.outboxId, value: plan.outbox },
+  ]);
   await ensureEventProgressWorkflow(env, plan);
 }
 
@@ -151,36 +148,37 @@ export function createEventAnnouncementScheduleRepository(
   const logger = dependencies.logger || console;
   return {
     ...repository,
-    async patchStateRoot(updates, signal) {
+    async commitEventPlan(updates, signal) {
       const eventIds = new Set<string>();
-      for (const path of Object.keys(updates)) {
-        const [root, eventId, field, ...nested] = path.split("/");
+      for (const command of updates) {
         if (
-          root === "events" &&
-          eventId &&
-          isSafeRecordKey(eventId) &&
-          nested.length === 0 &&
-          (field === undefined || SCHEDULE_FIELDS.has(field))
-        ) {
-          eventIds.add(eventId);
-        }
+          (command.kind === "event" ||
+            (command.kind === "event-field" &&
+              SCHEDULE_FIELDS.has(command.field))) &&
+          isSafeRecordKey(command.eventId)
+        )
+          eventIds.add(command.eventId);
       }
       const plans: EventProgressPlan[] = [];
-      const nextUpdates = { ...updates };
+      const nextUpdates: EventCommitPlan = [...updates];
       for (const eventId of eventIds) {
-        const path = `events/${eventId}`;
+        const replacement = updates.findLast(
+          (command) => command.kind === "event" && command.eventId === eventId,
+        );
         const event = toRecord(
-          Object.hasOwn(updates, path)
-            ? updates[path]
+          replacement?.kind === "event"
+            ? replacement.value
             : await repository.readEvent(eventId, signal),
         );
         if (!event) continue;
         const nextEvent = { ...event };
-        for (const field of SCHEDULE_FIELDS) {
-          if (Object.hasOwn(updates, `${path}/${field}`)) {
-            nextEvent[field] = updates[`${path}/${field}`];
-          }
-        }
+        for (const command of updates)
+          if (
+            command.kind === "event-field" &&
+            command.eventId === eventId &&
+            SCHEDULE_FIELDS.has(command.field)
+          )
+            nextEvent[command.field] = command.value;
         const discoveredAtMs = now();
         for (const kind of EVENT_ANNOUNCEMENT_KINDS) {
           const candidate = await buildEventAnnouncementPlan(
@@ -191,11 +189,15 @@ export function createEventAnnouncementScheduleRepository(
           );
           if (!candidate) continue;
           const plan = await preserveSchedule(repository, candidate, signal);
-          nextUpdates[`eventProgressOutbox/${plan.outboxId}`] = plan.outbox;
+          nextUpdates.push({
+            kind: "progress-outbox",
+            outboxId: plan.outboxId,
+            value: plan.outbox,
+          });
           plans.push(plan);
         }
       }
-      await repository.patchStateRoot(nextUpdates, signal);
+      await repository.commitEventPlan(nextUpdates, signal);
       if (plans.length === 0) return;
       const dispatch = async () => {
         const results = await Promise.allSettled(plans.map(enqueue));

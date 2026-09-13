@@ -1,3 +1,10 @@
+import {
+  eventField,
+  getEventField,
+  mergeEventPlans,
+} from "../../../runtime/eventCommands.js";
+import type { EventCommitPlan } from "../../../runtime/eventCommands.js";
+import type { EventStore } from "./eventStoreContracts.ts";
 import { createGameVariantHelpers } from "@mons/shared/game-variants";
 import {
   isEventPrizeEvent,
@@ -50,13 +57,11 @@ const gameVariantHelpers = createGameVariantHelpers(monsRules);
 type EventRecord = Record<string, unknown>;
 type EventDueTransition = {
   didChange: boolean;
-  updates: Record<string, unknown>;
+  updates: EventCommitPlan;
 };
 
-export type EventParticipationRepository = Pick<
-  GameplayRepository,
-  "patchStateRoot" | "readProfileOwnershipSnapshot" | "transactStatePath"
-> &
+export type EventParticipationRepository = EventStore &
+  Pick<GameplayRepository, "readProfileOwnershipSnapshot"> &
   Pick<
     EventReads,
     "readEvent" | "readEventPrizeSelections" | "readEventSnapshot"
@@ -248,10 +253,10 @@ function createDefaultLockManager(
 ): EventLockManager {
   return createEventLockManagerCore({
     createLockId: () => crypto.randomUUID(),
-    transactPath: (path, updater) =>
-      repository.transactStatePath(path, updater, signal),
-    releaseTransactPath: (path, updater) =>
-      repository.transactStatePath(path, updater),
+    transactEventLease: (key, updater) =>
+      repository.transactEventLease(key, updater, signal),
+    releaseTransactEventLease: (key, updater) =>
+      repository.transactEventLease(key, updater),
     sleep: (milliseconds) => scheduler.wait(milliseconds, { signal }),
     logger: {
       error: (_message, error) => {
@@ -280,13 +285,13 @@ type ReconciliationCheck = (snapshot: EventSnapshot) => boolean;
 
 async function patchWithReconciliation(
   eventId: string,
-  updates: Record<string, unknown>,
+  updates: EventCommitPlan,
   repository: EventParticipationRepository,
   operationSignal: AbortSignal,
   checks: readonly ReconciliationCheck[],
 ): Promise<void> {
   try {
-    await repository.patchStateRoot(updates, operationSignal);
+    await repository.commitEventPlan(mergeEventPlans(updates), operationSignal);
   } catch (error) {
     const signal = AbortSignal.timeout(EVENT_RECONCILIATION_TIMEOUT_MS);
     const snapshot = await repository
@@ -344,11 +349,13 @@ async function persistDueTransition(
   if (!dueTransition.didChange) {
     return;
   }
-  const statusPath = `events/${eventId}/status`;
-  const updatedAtPath = `events/${eventId}/updatedAtMs`;
-  const expectedStatus = dueTransition.updates[statusPath];
+  const expectedStatus = getEventField(
+    dueTransition.updates,
+    eventId,
+    "status",
+  );
   const expectedUpdatedAtMs = requireTimestamp(
-    dueTransition.updates[updatedAtPath],
+    getEventField(dueTransition.updates, eventId, "updatedAtMs"),
   );
   if (expectedStatus !== "active" && expectedStatus !== "dismissed") {
     throw new AuthApiFailure(
@@ -373,13 +380,14 @@ async function persistDueTransition(
 async function persistJoin(
   eventId: string,
   participant: EventParticipantSnapshot,
-  updates: Record<string, unknown>,
+  updates: EventCommitPlan,
   expectedTransitionStatus: "active" | "dismissed" | undefined,
   repository: EventParticipationRepository,
   signal: AbortSignal,
 ): Promise<EventParticipantSnapshot> {
-  const updatedAtPath = `events/${eventId}/updatedAtMs`;
-  const expectedUpdatedAtMs = requireTimestamp(updates[updatedAtPath]);
+  const expectedUpdatedAtMs = requireTimestamp(
+    getEventField(updates, eventId, "updatedAtMs"),
+  );
   const checks: ReconciliationCheck[] = [
     ({ event }) =>
       isSameParticipant(
@@ -400,12 +408,13 @@ async function persistJoin(
 async function persistRemoval(
   eventId: string,
   participantProfileId: string,
-  updates: Record<string, unknown>,
+  updates: EventCommitPlan,
   repository: EventParticipationRepository,
   signal: AbortSignal,
 ): Promise<void> {
-  const updatedAtPath = `events/${eventId}/updatedAtMs`;
-  const expectedUpdatedAtMs = requireTimestamp(updates[updatedAtPath]);
+  const expectedUpdatedAtMs = requireTimestamp(
+    getEventField(updates, eventId, "updatedAtMs"),
+  );
   await patchWithReconciliation(eventId, updates, repository, signal, [
     ({ event }) =>
       (toRecord(event?.participants)?.[participantProfileId] ?? null) === null,
@@ -625,11 +634,15 @@ export async function joinEvent(
     participants[existingParticipantProfileId] = participant;
     event.participants = participants;
     event.updatedAtMs = nowMs;
-    const updates: Record<string, unknown> = {
-      [`events/${eventId}/participants/${existingParticipantProfileId}`]:
-        participant,
-      [`events/${eventId}/updatedAtMs`]: nowMs,
-    };
+    const updates: EventCommitPlan = [
+      {
+        kind: "event-participant",
+        eventId: eventId,
+        profileId: existingParticipantProfileId,
+        value: participant,
+      },
+      eventField(eventId, "updatedAtMs", nowMs),
+    ];
     const settleNowMs = now();
     const isDueAtSettle =
       typeof event.startAtMs === "number" && settleNowMs >= event.startAtMs;
@@ -651,9 +664,12 @@ export async function joinEvent(
     });
     let expectedTransitionStatus: "active" | "dismissed" | undefined;
     if (dueTransition.didChange) {
-      Object.assign(updates, dueTransition.updates);
-      const transitionStatus =
-        dueTransition.updates[`events/${eventId}/status`];
+      updates.push(...dueTransition.updates);
+      const transitionStatus = getEventField(
+        dueTransition.updates,
+        eventId,
+        "status",
+      );
       if (transitionStatus !== "active" && transitionStatus !== "dismissed") {
         throw new AuthApiFailure(
           503,
@@ -664,13 +680,21 @@ export async function joinEvent(
       expectedTransitionStatus = transitionStatus;
     }
     let storedParticipant = participant;
-    const participantsPath = `events/${eventId}/participants`;
-    if (Object.hasOwn(updates, participantsPath)) {
-      delete updates[
-        `events/${eventId}/participants/${existingParticipantProfileId}`
-      ];
+    const canonicalParticipants = getEventField(
+      updates,
+      eventId,
+      "participants",
+    );
+    if (canonicalParticipants !== undefined) {
+      const index = updates.findIndex(
+        (command) =>
+          command.kind === "event-participant" &&
+          command.eventId === eventId &&
+          command.profileId === existingParticipantProfileId,
+      );
+      if (index >= 0) updates.splice(index, 1);
       storedParticipant = participantFromCanonicalParent(
-        updates[participantsPath],
+        canonicalParticipants,
         participant.loginUid,
       );
     }
@@ -864,11 +888,21 @@ export async function removeEventParticipant(
     await persistRemoval(
       eventId,
       participantProfileId,
-      {
-        [`events/${eventId}/participants/${participantProfileId}`]: null,
-        [`eventPrizeSelections/${eventId}/${participantProfileId}`]: null,
-        [`events/${eventId}/updatedAtMs`]: commitNowMs,
-      },
+      [
+        {
+          kind: "event-participant",
+          eventId: eventId,
+          profileId: participantProfileId,
+          value: null,
+        },
+        {
+          kind: "prize-selection",
+          eventId: eventId,
+          profileId: participantProfileId,
+          value: null,
+        },
+        eventField(eventId, "updatedAtMs", commitNowMs),
+      ],
       repository,
       signal,
     );
@@ -963,8 +997,9 @@ export async function toggleEventPrizeSelection(
       );
     }
     await requireOwnedLock(lockManager, lockHandle, busyMessage);
-    const result = await repository.transactStatePath(
-      `eventPrizeSelections/${eventId}/${participantProfileId}`,
+    const result = await repository.transactEventPrizeSelection(
+      eventId,
+      participantProfileId,
       (current) => ({
         value: current === request.prizeId ? null : request.prizeId,
       }),

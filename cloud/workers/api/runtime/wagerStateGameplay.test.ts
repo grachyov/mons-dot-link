@@ -3,7 +3,7 @@ import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createEmptyMaterials } from "@mons/shared/mining";
 import type { CompletePlayerProfile } from "@mons/shared/profiles";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { MatchStatePort } from "../src/repositoryContracts.ts";
 import { createGameplayRepository } from "../src/gameplayRepository.ts";
 import { createInviteSourceReader } from "../src/inviteSource.ts";
 import {
@@ -86,37 +86,48 @@ async function fixture(failCompletedWrite = false) {
   ]);
   let sourceWrites = 0;
   let failureInjected = false;
-  const staleWager = {
-    proposals: { [host]: { material: "dust", count: 999 } },
-  };
-  const memoryState: StateRepository = {
-    async getPath(path) {
-      if (path === `invites/${inviteId}`)
-        return {
-          hostId: host,
-          guestId: guest,
-          hostColor: "white",
-          wagers: { [inviteId]: staleWager },
-          matchesWagerResolutions: { [inviteId]: true },
-        };
-      if (path === `players/${host}/matches/${inviteId}`)
+  const memoryState: MatchStatePort = {
+    async readMatchRecord({
+      playerId,
+      matchId,
+    }): Promise<import("../src/matchStateTypes.ts").MatchStateRecord | null> {
+      if (matchId !== inviteId) throw new Error("unexpected-match-read");
+      if (playerId === host)
         return { color: "white", fen: "fixture", flatMovesString: "" };
-      if (path === `players/${guest}/matches/${inviteId}`)
+      if (playerId === guest)
         return {
           color: "black",
           fen: "fixture",
           flatMovesString: "",
           status: "surrendered",
         };
-      throw new Error(`unexpected-source-read:${path}`);
+      throw new Error("unexpected-player-read");
     },
-    async patchRoot() {
+    async readMatchPair(input, signal) {
+      return {
+        ...input,
+        epoch: 1,
+        revision: 1,
+        claim: null,
+        playerMatch: (await memoryState.readMatchRecord(
+          { playerId: input.playerId, matchId: input.matchId },
+          signal,
+        )) as import("../src/matchStateTypes.ts").MatchStateRecord | null,
+        opponentMatch: input.opponentId
+          ? ((await memoryState.readMatchRecord(
+              { playerId: input.opponentId, matchId: input.matchId },
+              signal,
+            )) as import("../src/matchStateTypes.ts").MatchStateRecord | null)
+          : null,
+      };
+    },
+    async createMatchRecords() {
       sourceWrites++;
       throw new Error("unexpected-source-write");
     },
-    async transactPath() {
+    async applyMatchEventEffects() {
       sourceWrites++;
-      throw new Error("unexpected-source-transaction");
+      throw new Error("unexpected-source-write");
     },
   };
   const profileDb = new Proxy(env.PROFILE_DB, {
@@ -221,13 +232,14 @@ describe("D1 wager gameplay integration", () => {
     ]);
   });
 
-  it("ignores retained Firebase wagers and safely cancels and declines D1 proposals", async () => {
+  it("reads only canonical wager state and safely cancels and declines D1 proposals", async () => {
     for (const action of ["cancel", "decline"] as const) {
       const state = await fixture();
       expect(
-        await state.repository.getStatePath(
-          `invites/${state.inviteId}/wagers/${state.inviteId}`,
-        ),
+        await state.repository.wagers.readWager({
+          inviteId: state.inviteId,
+          matchId: state.inviteId,
+        }),
       ).toBeNull();
       expect(await state.send()).toEqual({ ok: true, count: 2 });
       expect(await state.send()).toEqual({ ok: true, count: 2 });
@@ -292,20 +304,18 @@ describe("D1 wager gameplay integration", () => {
     expect((await state.runtime.readBalance(state.host)).frozen.dust).toBe(0);
     expect((await state.runtime.readBalance(state.guest)).frozen.dust).toBe(0);
     expect(
-      await state.repository.getStatePath(
-        `invites/${state.inviteId}/matchesWagerResolutions/${state.inviteId}`,
-      ),
+      await state.repository.wagers.readResolutionMarker({
+        inviteId: state.inviteId,
+        matchId: state.inviteId,
+      }),
     ).toBe(true);
-    const stored = await state.repository.getStatePath(
-      `invites/${state.inviteId}`,
-    );
+    const stored = await state.repository.wagers.readWager({
+      inviteId: state.inviteId,
+      matchId: state.inviteId,
+    });
     expect(stored).toMatchObject({
-      wagers: {
-        [state.inviteId]: {
-          resolved: { count: 2 },
-          settlement: { state: "completed" },
-        },
-      },
+      resolved: { count: 2 },
+      settlement: { state: "completed" },
     });
     expect(await state.readSource(state.inviteId)).toEqual({
       hostId: state.host,

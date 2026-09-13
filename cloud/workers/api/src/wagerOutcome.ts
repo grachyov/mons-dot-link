@@ -1,9 +1,12 @@
-import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
+import { requireWagerWriter, type WagerKey } from "./wagerStateRepository.ts";
 import {
-  isMaterialName,
-  normalizeCount,
-  type MiningMaterialName,
-} from "@mons/shared/mining";
+  readStoredSettlement,
+  WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON,
+  type WagerSettlement,
+  type SettlementRelease,
+  type WagerSettlementResolution,
+} from "./wagerStateCommands.ts";
+import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
 import {
   MAX_MATCH_FEN_BYTES,
   MAX_MATCH_HISTORY_BYTES,
@@ -29,13 +32,8 @@ import {
   resolveWagerParticipants,
 } from "./wagerProposal.ts";
 
-const SETTLEMENT_VERSION = 2;
+export { WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON } from "./wagerStateCommands.ts";
 export const WAGER_SETTLEMENT_INITIAL_RETRY_DELAY_SECONDS = 60;
-export const WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON =
-  "insufficient-materials";
-
-type WagerSettlementFailureReason =
-  typeof WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON;
 
 type MatchRecord = {
   color: "black" | "white" | null;
@@ -44,39 +42,6 @@ type MatchRecord = {
   status: string;
   timer: string;
 };
-
-type SettlementRelease = {
-  reservationOperationIds: string[];
-  uid: string;
-};
-
-type SettlementBase = {
-  claimedAtMs: number;
-  completedAtMs: number | null;
-  failureReason: WagerSettlementFailureReason | null;
-  fingerprint: string;
-  operationId: string;
-  state: "completed" | "pending";
-  version: typeof SETTLEMENT_VERSION;
-};
-
-type AgreedSettlement = SettlementBase & {
-  count: number;
-  kind: "agreed";
-  loserProfileId: string;
-  loserUid: string;
-  material: MiningMaterialName;
-  releases: SettlementRelease[];
-  winnerProfileId: string;
-  winnerUid: string;
-};
-
-type ProposalSettlement = SettlementBase & {
-  kind: "proposals";
-  releases: SettlementRelease[];
-};
-
-type WagerSettlement = AgreedSettlement | ProposalSettlement;
 
 export type WagerOutcomeDependencies = {
   assertMutationAllowed?: () => Promise<void>;
@@ -89,12 +54,7 @@ export type WagerOutcomeDependencies = {
   signal?: AbortSignal;
 };
 
-export type WagerSettlementResolution = {
-  loserProfileId: string;
-  loserUid: string;
-  winnerProfileId: string;
-  winnerUid: string;
-};
+export type { WagerSettlementResolution } from "./wagerStateCommands.ts";
 
 export type WagerSettlementRetryTask = {
   inviteId: string;
@@ -210,151 +170,12 @@ async function createSettlementId(
   );
 }
 
-function settlementFingerprint(value: Record<string, unknown>): string {
-  return JSON.stringify(value);
-}
-
-function parseReservationOperationIds(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const operationIds = value.map(normalizeString);
-  return operationIds.length > 0 &&
-    operationIds.every(
-      (operationId, index) =>
-        /^[a-f0-9]{64}$/.test(operationId) &&
-        operationIds.indexOf(operationId) === index,
-    )
-    ? operationIds
-    : null;
-}
-
-function parseRelease(value: unknown): SettlementRelease | null {
-  const release = toRecord(value);
-  const uid = normalizeString(release?.uid);
-  const operationIds = parseReservationOperationIds(
-    release?.reservationOperationIds,
-  );
-  return release &&
-    Object.keys(release).length === 2 &&
-    Object.hasOwn(release, "uid") &&
-    Object.hasOwn(release, "reservationOperationIds") &&
-    uid &&
-    operationIds
-    ? { uid, reservationOperationIds: operationIds }
-    : null;
-}
-
-function parseSettlement(value: unknown): WagerSettlement | null {
-  const settlement = toRecord(value);
-  const state = settlement?.state;
-  const completedAtMs = settlement?.completedAtMs;
-  const failureReason = settlement?.failureReason;
-  if (
-    settlement?.version !== SETTLEMENT_VERSION ||
-    (state !== "pending" && state !== "completed") ||
-    typeof settlement.fingerprint !== "string" ||
-    !settlement.fingerprint ||
-    typeof settlement.operationId !== "string" ||
-    !settlement.operationId ||
-    !Number.isSafeInteger(settlement.claimedAtMs) ||
-    (completedAtMs !== undefined &&
-      completedAtMs !== null &&
-      !Number.isSafeInteger(completedAtMs)) ||
-    (failureReason !== undefined &&
-      failureReason !== null &&
-      failureReason !== WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON) ||
-    (state === "pending" &&
-      failureReason !== undefined &&
-      failureReason !== null) ||
-    (state === "completed" && !Number.isSafeInteger(completedAtMs))
-  ) {
-    return null;
-  }
-  const base: SettlementBase = {
-    version: SETTLEMENT_VERSION,
-    state,
-    fingerprint: settlement.fingerprint,
-    operationId: settlement.operationId,
-    claimedAtMs: Number(settlement.claimedAtMs),
-    completedAtMs: Number.isSafeInteger(completedAtMs)
-      ? Number(completedAtMs)
-      : null,
-    failureReason:
-      failureReason === WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON
-        ? failureReason
-        : null,
-  };
-  if (settlement.kind === "agreed") {
-    const winnerUid = normalizeString(settlement.winnerUid);
-    const loserUid = normalizeString(settlement.loserUid);
-    const winnerProfileId = normalizeString(settlement.winnerProfileId);
-    const loserProfileId = normalizeString(settlement.loserProfileId);
-    const material = normalizeString(settlement.material);
-    const count = normalizeCount(settlement.count);
-    const storedReleases = settlement.releases;
-    const releases = Array.isArray(storedReleases)
-      ? storedReleases.map(parseRelease)
-      : [null];
-    return winnerUid &&
-      loserUid &&
-      winnerProfileId &&
-      loserProfileId &&
-      isMaterialName(material) &&
-      count > 0 &&
-      releases.length === 2 &&
-      releases.every((release) => release !== null)
-      ? {
-          ...base,
-          kind: "agreed",
-          winnerUid,
-          loserUid,
-          winnerProfileId,
-          loserProfileId,
-          material,
-          count,
-          releases: releases.filter(
-            (release): release is SettlementRelease => release !== null,
-          ),
-        }
-      : null;
-  }
-  const storedReleases = settlement.releases ?? [];
-  if (
-    settlement.kind !== "proposals" ||
-    !Array.isArray(storedReleases) ||
-    base.failureReason
-  ) {
-    return null;
-  }
-  const releases = storedReleases.map(parseRelease);
-  if (releases.some((release) => release === null)) {
-    return null;
-  }
-  return {
-    ...base,
-    kind: "proposals",
-    releases: releases.filter(
-      (release): release is SettlementRelease => release !== null,
-    ),
-  };
-}
-
-function readStoredSettlement(
-  wager: Record<string, unknown> | null,
-): WagerSettlement | null {
-  const rawSettlement = wager?.settlement;
-  const settlement = parseSettlement(rawSettlement);
-  if (rawSettlement !== null && rawSettlement !== undefined && !settlement) {
-    throw new Error("wager-settlement-malformed");
-  }
-  return settlement;
-}
-
 async function readMatchPair(
   inviteId: string,
   playerUid: string,
   opponentUid: string,
   matchId: string,
-  repository: Pick<GameplayRepository, "getStatePath" | "readMatchPair">,
+  repository: Pick<GameplayRepository, "readMatchPair">,
   signal?: AbortSignal,
 ): Promise<[MatchRecord | null, MatchRecord | null]> {
   const values = await readGameplayMatchPair(
@@ -368,16 +189,6 @@ async function readMatchPair(
     signal,
   );
   return [parseMatchRecord(values[0]), parseMatchRecord(values[1])];
-}
-
-function createLineageRelease(
-  uid: string,
-  operationIds: readonly string[],
-): SettlementRelease {
-  return {
-    uid,
-    reservationOperationIds: [...operationIds],
-  };
 }
 
 async function createAcceptReservationOperationIdByUid(
@@ -400,114 +211,8 @@ async function createAcceptReservationOperationIdByUid(
   );
 }
 
-function createSettlement(
-  wager: Record<string, unknown>,
-  resolution: WagerSettlementResolution,
-  operationId: string,
-  nowMs: number,
-  acceptReservationOperationIdByUid: Readonly<Record<string, string>>,
-): WagerSettlement {
-  const base = {
-    version: 2 as const,
-    state: "pending" as const,
-    operationId,
-    claimedAtMs: nowMs,
-    completedAtMs: null,
-  };
-  const agreement = toRecord(wager.agreed);
-  const material = normalizeString(agreement?.material);
-  const count = normalizeCount(agreement?.count);
-  const proposerUid = normalizeString(agreement?.proposerId);
-  const accepterUid = normalizeString(agreement?.accepterId);
-  if (isMaterialName(material) && count > 0) {
-    const agreementOperation = toRecord(wager.agreementOperation);
-    if (agreementOperation?.reservationLineageVersion !== 1) {
-      throw new Error("wager-reservation-lineage-invalid");
-    }
-    if (agreementOperation.reservationLineageReady !== true) {
-      throw new Error("wager-reservation-lineage-pending");
-    }
-    const proposerOperationIds = parseReservationOperationIds(
-      agreementOperation.proposerReservationOperationIds,
-    );
-    const accepterOperationIds = parseReservationOperationIds(
-      agreementOperation.accepterReservationOperationIds,
-    );
-    if (
-      !proposerOperationIds ||
-      !accepterOperationIds ||
-      Object.hasOwn(agreementOperation, "proposerLegacyReservation") ||
-      Object.hasOwn(agreementOperation, "accepterLegacyReservation")
-    ) {
-      throw new Error("wager-reservation-lineage-invalid");
-    }
-    const proposerRelease = createLineageRelease(
-      proposerUid,
-      proposerOperationIds,
-    );
-    const accepterRelease = createLineageRelease(
-      accepterUid,
-      accepterOperationIds,
-    );
-    const releaseByUid = new Map([
-      [proposerRelease.uid, proposerRelease],
-      [accepterRelease.uid, accepterRelease],
-    ]);
-    const winnerRelease = releaseByUid.get(resolution.winnerUid);
-    const loserRelease = releaseByUid.get(resolution.loserUid);
-    if (!winnerRelease || !loserRelease) {
-      throw new Error("wager-reservation-lineage-invalid");
-    }
-    const releases = [winnerRelease, loserRelease];
-    const candidate = {
-      ...base,
-      kind: "agreed" as const,
-      ...resolution,
-      material,
-      count,
-      releases,
-    };
-    return {
-      ...candidate,
-      failureReason: null,
-      fingerprint: settlementFingerprint(candidate),
-    };
-  }
-  const proposals = toRecord(wager.proposals) || {};
-  const releases = [resolution.winnerUid, resolution.loserUid].map((uid) => {
-    const proposal = toRecord(proposals[uid]);
-    const proposalReservationOperationId = normalizeString(
-      proposal?.reservationOperationId,
-    );
-    const proposalOperationId = normalizeString(proposal?.operationId);
-    if (
-      proposal &&
-      (!/^[a-f0-9]{64}$/.test(proposalReservationOperationId) ||
-        !/^[a-f0-9]{64}$/.test(proposalOperationId))
-    ) {
-      throw new Error("wager-reservation-lineage-invalid");
-    }
-    return createLineageRelease(uid, [
-      acceptReservationOperationIdByUid[uid],
-      ...(proposalReservationOperationId
-        ? [proposalReservationOperationId]
-        : []),
-    ]);
-  });
-  const candidate = {
-    ...base,
-    kind: "proposals" as const,
-    releases,
-  };
-  return {
-    ...candidate,
-    failureReason: null,
-    fingerprint: settlementFingerprint(candidate),
-  };
-}
-
 async function claimSettlement(
-  wagerPath: string,
+  wagerKey: WagerKey,
   resolution: WagerSettlementResolution,
   operationId: string,
   nowMs: number,
@@ -521,37 +226,13 @@ async function claimSettlement(
   let current: unknown;
   await assertMutationAllowed?.();
   try {
-    const transaction = await repository.transactStatePath(
-      wagerPath,
-      (value) => {
-        const wager = toRecord(value);
-        if (!wager) {
-          return { commit: false, decision: "no-wager" };
-        }
-        const existing = readStoredSettlement(wager);
-        if (wager.resolved) {
-          return { commit: false, decision: "already-resolved" };
-        }
-        if (existing) {
-          return {
-            commit: false,
-            decision:
-              existing.state !== "completed"
-                ? "resume"
-                : existing.failureReason ===
-                    WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON
-                  ? WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON
-                  : "already-resolved",
-          };
-        }
-        const settlement = createSettlement(
-          wager,
-          resolution,
-          operationId,
-          nowMs,
-          acceptReservationOperationIdByUid,
-        );
-        return { value: { ...wager, settlement } };
+    const transaction = await requireWagerWriter(repository).claimSettlement(
+      wagerKey,
+      {
+        resolution,
+        operationId,
+        now: nowMs,
+        acceptReservationOperationIdByUid,
       },
       signal,
     );
@@ -568,7 +249,7 @@ async function claimSettlement(
     }
     current = transaction.value;
   } catch {
-    current = await repository.getStatePath(wagerPath, undefined, signal);
+    current = await repository.wagers.readWager(wagerKey, signal);
   }
   const wager = toRecord(current);
   const settlement = readStoredSettlement(wager);
@@ -600,7 +281,7 @@ async function completeSettlement(
   signal?: AbortSignal,
   assertMutationAllowed?: () => Promise<void>,
 ): Promise<null | typeof WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON> {
-  const wagerPath = `invites/${inviteId}/wagers/${matchId}`;
+  const wagerKey: WagerKey = { inviteId, matchId };
   let insufficientMaterials = false;
   const release = async (entry: SettlementRelease) => {
     for (const reservationOperationId of entry.reservationOperationIds) {
@@ -631,28 +312,16 @@ async function completeSettlement(
   }
 
   const completedAtMs = now();
-  const updates: Record<string, unknown> = {
-    [`${wagerPath}/settlement/state`]: "completed",
-    [`${wagerPath}/settlement/completedAtMs`]: completedAtMs,
-    [`${wagerPath}/proposals`]: null,
-    [`invites/${inviteId}/matchesWagerResolutions/${matchId}`]: true,
-  };
-  if (insufficientMaterials) {
-    updates[`${wagerPath}/settlement/failureReason`] =
-      WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON;
-    updates[`${wagerPath}/agreed`] = null;
-  } else if (settlement.kind === "agreed") {
-    updates[`${wagerPath}/resolved`] = {
-      winnerId: settlement.winnerUid,
-      loserId: settlement.loserUid,
-      material: settlement.material,
-      count: settlement.count,
-      total: settlement.count * 2,
-      resolvedAt: completedAtMs,
-    };
-  }
   await assertMutationAllowed?.();
-  await repository.patchStateRoot(updates, signal);
+  await requireWagerWriter(repository).completeSettlement(
+    wagerKey,
+    {
+      settlement,
+      completedAtMs,
+      insufficientMaterials,
+    },
+    signal,
+  );
   return insufficientMaterials
     ? WAGER_SETTLEMENT_INSUFFICIENT_MATERIALS_REASON
     : null;
@@ -660,7 +329,7 @@ async function completeSettlement(
 
 async function readWagerSettlementRetry(
   task: WagerSettlementRetryTask,
-  repository: Pick<GameplayRepository, "getStatePath">,
+  repository: Pick<GameplayRepository, "wagers">,
 ): Promise<
   | { state: "completed" | "stale" }
   | { state: "unclaimed" }
@@ -672,9 +341,10 @@ async function readWagerSettlementRetry(
   ) {
     return { state: "stale" };
   }
-  const rawWager = await repository.getStatePath(
-    `invites/${task.inviteId}/wagers/${task.matchId}`,
-  );
+  const rawWager = await repository.wagers.readWager({
+    inviteId: task.inviteId,
+    matchId: task.matchId,
+  });
   if (rawWager === null || rawWager === undefined) {
     return { state: "stale" };
   }
@@ -694,7 +364,7 @@ async function readWagerSettlementRetry(
 
 export async function classifyWagerSettlementRetry(
   task: WagerSettlementRetryTask,
-  repository: Pick<GameplayRepository, "getStatePath">,
+  repository: Pick<GameplayRepository, "wagers">,
 ): Promise<WagerSettlementRetryState> {
   return (await readWagerSettlementRetry(task, repository)).state;
 }
@@ -711,12 +381,12 @@ export async function resumeWagerSettlement(
     if (!task.resolution) return "stale";
     await ensureWagerAgreementLineageReady(
       repository,
-      `invites/${task.inviteId}/wagers/${task.matchId}`,
+      { inviteId: task.inviteId, matchId: task.matchId },
       now,
       assertMutationAllowed,
     );
     const claimed = await claimSettlement(
-      `invites/${task.inviteId}/wagers/${task.matchId}`,
+      { inviteId: task.inviteId, matchId: task.matchId },
       task.resolution,
       task.operationId,
       now(),
@@ -815,17 +485,18 @@ export async function resolveWagerOutcome(
 
   const mining = () =>
     repository.getMiningSnapshot(participants.playerProfileId);
-  const wagerPath = `invites/${request.inviteId}/wagers/${request.matchId}`;
-  const markerPath = `invites/${request.inviteId}/matchesWagerResolutions/${request.matchId}`;
+  const wagerKey: WagerKey = {
+    inviteId: request.inviteId,
+    matchId: request.matchId,
+  };
   if (
-    (await repository.getStatePath(
-      markerPath,
-      undefined,
+    (await repository.wagers.readResolutionMarker(
+      wagerKey,
       dependencies.signal,
     )) === true
   ) {
     const markedWager = toRecord(
-      await repository.getStatePath(wagerPath, undefined, dependencies.signal),
+      await repository.wagers.readWager(wagerKey, dependencies.signal),
     );
     const markedSettlement = readStoredSettlement(markedWager);
     const proposals = toRecord(markedWager?.proposals);
@@ -892,12 +563,12 @@ export async function resolveWagerOutcome(
   await dependencies.scheduleRetry?.(task);
   await ensureWagerAgreementLineageReady(
     repository,
-    wagerPath,
+    wagerKey,
     now,
     dependencies.assertMutationAllowed,
   );
   const settlement = await claimSettlement(
-    wagerPath,
+    wagerKey,
     resolution,
     operationId,
     now(),

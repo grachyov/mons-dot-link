@@ -1,5 +1,4 @@
-import type { EventStateRepository } from "./stateRepository.js";
-import type { EventReads } from "./eventReads.js";
+import type { EventRuntimeStore } from "./eventCommands.js";
 export type EventRuntimeCode =
   | "aborted"
   | "failed-precondition"
@@ -52,17 +51,13 @@ export type EventRuntime = {
 };
 
 export function createEventRuntime(dependencies: {
-  readMatchPair?: (input: {
+  readMatchPair: (input: {
     inviteId: string;
     matchId: string;
     playerId: string;
     opponentId: string;
   }) => Promise<[unknown, unknown]>;
-  state: EventStateRepository &
-    Pick<
-      EventReads,
-      "readEvent" | "readEventPrizeSelections" | "readEventSnapshot"
-    >;
+  state: EventRuntimeStore;
   enqueueEventProgressTask(input: {
     eventId: string;
     sourceKey: string;

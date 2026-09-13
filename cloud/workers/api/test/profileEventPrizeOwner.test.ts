@@ -1,3 +1,6 @@
+import type { EventCommitPlan } from "../../../runtime/eventCommands.js";
+import { encodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import { attachEventTestPorts } from "./eventTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createEventBracketRuntime } from "../../../runtime/events/bracket.js";
@@ -7,7 +10,7 @@ function createState(
   values: Map<string, unknown>,
   beforeTransaction?: (path: string, values: Map<string, unknown>) => void,
 ) {
-  return {
+  return attachEventTestPorts({
     async read(path: string) {
       return values.get(path) ?? null;
     },
@@ -32,7 +35,7 @@ function createState(
       else values.set(path, next);
       return { committed: true, value: next };
     },
-  };
+  });
 }
 
 function prizeOwnership(
@@ -75,6 +78,9 @@ const mergedPrizeOwnership = prizeOwnership([
 test("reconciles canonical prize projections without changing event history", async () => {
   const values = new Map<string, unknown>();
   const runtime = createEventBracketRuntime({
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
+    },
     state: createState(values),
     readEventPrizeWithdrawals: async () => ({}),
   });
@@ -85,13 +91,14 @@ test("reconciles canonical prize projections without changing event history", as
     prizeId: "1092",
     assignedAtMs: 100,
   };
-  const updates: Record<string, unknown> = {};
+  const plan: EventCommitPlan = [];
   await runtime.addEventPrizeAssignmentUpdates({
     assignments: { 1: assignment },
     eventId: assignment.eventId,
     includeEventAssignments: true,
-    updates,
+    updates: plan,
   });
+  const updates = encodeEventUpdates(plan);
   assert.deepEqual(updates[`events/${assignment.eventId}/prizeAssignments`], {
     1: assignment,
   });
@@ -130,6 +137,9 @@ test("uses injected canonical withdrawals when filtering prize projections", asy
   const prizeId = "1092";
   const values = new Map<string, unknown>();
   const runtime = createEventBracketRuntime({
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
+    },
     state: createState(values),
     readEventPrizeWithdrawals: async () => ({
       [prizeId]: {
@@ -174,6 +184,9 @@ test("does not overwrite a canonical prize assignment inserted concurrently", as
   const values = new Map<string, unknown>();
   let inserted = false;
   const runtime = createEventBracketRuntime({
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
+    },
     state: createState(values, (path, currentValues) => {
       if (path === targetPath && !inserted) {
         currentValues.set(path, conflictingAssignment);
@@ -205,6 +218,9 @@ test("does not overwrite a canonical prize assignment inserted concurrently", as
 test("rejects two awards that collapse to one canonical profile", async () => {
   const eventId = "NN3eRzoZo80";
   const runtime = createEventBracketRuntime({
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
+    },
     state: createState(new Map()),
     readEventPrizeWithdrawals: async () => ({}),
   });

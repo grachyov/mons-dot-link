@@ -3,7 +3,6 @@ import {
   acquireAutomatchWriteAdmission,
   automatchAdmissionGuardStatements,
   createAutomatchD1Store,
-  parseAutomatchPath,
   readAutomatchRuntimeControl,
   releaseAutomatchWriteAdmission,
   type AutomatchWriteAdmission,
@@ -14,12 +13,15 @@ import {
   type GameSessionLeaseProof,
 } from "./gameSessionTransitions.ts";
 import type { GameSessionMutationLockStore } from "./gameplayCoordinationD1.ts";
-import type { StateRepository } from "./stateRepositoryTypes.ts";
+import type {
+  MatchStatePort,
+  TransactionDecision,
+} from "./repositoryContracts.ts";
+import type { GameSessionPort } from "./gameSessionContracts.ts";
 import type { PrepareMatchPresentations } from "./matchPresentationRegistry.ts";
 import {
   acquireInviteSourceAdmission,
   createInviteSourceD1Store,
-  inviteSourcePath,
   InviteSourceFailure,
   readInviteSourceControl,
   releaseInviteSourceAdmission,
@@ -32,21 +34,9 @@ export class AutomatchPersistenceFrozen extends AuthApiFailure {
   }
 }
 
-function resourceForPath(path: string): string | null {
-  const owned = parseAutomatchPath(path);
-  if (owned?.key) {
-    return owned.root === "gameplayMutationReceipts" ||
-      owned.root === "gameplayMutationReceiptExpirations"
-      ? `gameplay-operation:${owned.key}`
-      : owned.key;
-  }
-  const [root, key] = path.replace(/^\/+|\/+$/g, "").split("/");
-  return root === "invites" && key ? key : null;
-}
-
 export function createAutomatchPersistence(
   db: D1Database,
-  raw: StateRepository,
+  raw: MatchStatePort,
   {
     now = Date.now,
     onCommitted,
@@ -160,48 +150,143 @@ export function createAutomatchPersistence(
   const recover = (key: string, signal?: AbortSignal) =>
     recoverResources([key], signal);
 
-  const client: StateRepository = {
-    ...raw,
-    async getPath(path, query, signal) {
-      const owned = parseAutomatchPath(path);
-      const invite = inviteSourcePath(path);
-      const resource = resourceForPath(path);
-      if (!owned && !resource) return raw.getPath(path, query, signal);
-      const mode = await control();
-      const inviteControl = invite ? await readInviteSourceControl(db) : null;
-      if (inviteControl && inviteControl.backend !== "d1") {
-        throw new InviteSourceFailure("invite-source-backend-retired");
-      }
-      if (resource) {
-        if (
-          mode.state === "active" &&
-          owned?.root === "gameplayMutationReceipts"
-        ) {
-          await recover(resource, signal);
-        }
-        await reader.assertResourceAvailable(resource);
-      }
-      const value = owned
-        ? await store.getPath(path, query, signal)
-        : await inviteStore.getPath(path, query, signal);
-      if (resource) await reader.assertResourceAvailable(resource);
-      return value;
+  const readResource = async <T>(
+    key: string,
+    work: () => Promise<T>,
+    signal?: AbortSignal,
+    receipt = false,
+  ): Promise<T> => {
+    const mode = await control();
+    if (receipt && mode.state === "active") await recover(key, signal);
+    await reader.assertResourceAvailable(key);
+    const value = await work();
+    await reader.assertResourceAvailable(key);
+    return value;
+  };
+  const transactProjection = (
+    method:
+      | "transactAutomatchTelegramSource"
+      | "transactAutomatchTelegramOutbox"
+      | "transactAutomatchProfileOutbox",
+    inviteId: string,
+    update: (current: unknown) => TransactionDecision<unknown>,
+    signal?: AbortSignal,
+  ) =>
+    write("automatch-persistence-transaction", async (admission) => {
+      const guarded = createAutomatchD1Store(db, {
+        now,
+        writeGuards: () => [
+          ...automatchAdmissionGuardStatements(db, admission),
+          ...gameSessionResourceGuardStatements(db, [inviteId]),
+        ],
+      });
+      return guarded[method](inviteId, update, signal);
+    });
+  const client: GameSessionPort = {
+    readInviteMetadata: (inviteId, signal) =>
+      readResource(
+        inviteId,
+        async () => {
+          if ((await readInviteSourceControl(db)).backend !== "d1")
+            throw new InviteSourceFailure("invite-source-backend-retired");
+          return (await inviteStore.read(inviteId, signal)).value;
+        },
+        signal,
+      ),
+    readAutomatchEntry: (inviteId, signal) =>
+      readResource(
+        inviteId,
+        () => store.readAutomatchEntry(inviteId, signal),
+        signal,
+      ),
+    listAutomatchEntriesByLogin: async (uid, limit, signal) => {
+      await control();
+      return store.listAutomatchEntriesByLogin(uid, limit, signal);
     },
-    async patchRoot(updates, signal) {
-      const paths = Object.keys(updates);
-      const owned = paths.filter((path) => parseAutomatchPath(path));
-      const invitePaths = paths.filter((path) => inviteSourcePath(path));
-      if (!owned.length && !invitePaths.length)
-        return raw.patchRoot(updates, signal);
-      return write(
+    readFirstAutomatchEntry: async (signal) => {
+      await control();
+      return store.readFirstAutomatchEntry(signal);
+    },
+    readMutationReceipt: (operationId, signal) =>
+      readResource(
+        `gameplay-operation:${operationId}`,
+        () => store.readMutationReceipt(operationId, signal),
+        signal,
+        true,
+      ),
+    readAutomatchTelegramSource: (inviteId, signal) =>
+      readResource(
+        inviteId,
+        () => store.readAutomatchTelegramSource(inviteId, signal),
+        signal,
+      ),
+    readAutomatchTelegramOutbox: (inviteId, signal) =>
+      readResource(
+        inviteId,
+        () => store.readAutomatchTelegramOutbox(inviteId, signal),
+        signal,
+      ),
+    readAutomatchProfileOutbox: (inviteId, signal) =>
+      readResource(
+        inviteId,
+        () => store.readAutomatchProfileOutbox(inviteId, signal),
+        signal,
+      ),
+    transactAutomatchTelegramSource: (inviteId, update, signal) =>
+      transactProjection(
+        "transactAutomatchTelegramSource",
+        inviteId,
+        update,
+        signal,
+      ),
+    transactAutomatchTelegramOutbox: (inviteId, update, signal) =>
+      transactProjection(
+        "transactAutomatchTelegramOutbox",
+        inviteId,
+        update,
+        signal,
+      ),
+    transactAutomatchProfileOutbox: (inviteId, update, signal) =>
+      transactProjection(
+        "transactAutomatchProfileOutbox",
+        inviteId,
+        update,
+        signal,
+      ),
+    listDueAutomatchTelegramOutboxes: async (atMs, limit, signal) => {
+      await control();
+      return store.listDueAutomatchTelegramOutboxes(atMs, limit, signal);
+    },
+    listDueAutomatchProfileOutboxes: async (atMs, limit, signal) => {
+      await control();
+      return store.listDueAutomatchProfileOutboxes(atMs, limit, signal);
+    },
+    listMalformedAutomatchProfileOutboxes: async (limit, signal) => {
+      await control();
+      return store.listMalformedAutomatchProfileOutboxes(limit, signal);
+    },
+    commitSessionChanges: (changes, signal) =>
+      write(
         "automatch-persistence-patch",
         async (admission, inviteAdmission) => {
-          if (!owned.length) {
-            throw new InviteSourceFailure("invite-source-transition-required");
-          }
           const guards = () => automatchAdmissionGuardStatements(db, admission);
-          if (owned.length !== paths.length) {
-            const transitions = createGameSessionTransitions({
+          if (
+            changes.some((change) => change.kind.startsWith("invite-")) &&
+            !changes.some(
+              (change) =>
+                !change.kind.startsWith("invite-") &&
+                change.kind !== "match-create",
+            )
+          )
+            throw new InviteSourceFailure("invite-source-transition-required");
+          if (
+            changes.some(
+              (change) =>
+                change.kind.startsWith("invite-") ||
+                change.kind === "match-create",
+            )
+          ) {
+            return createGameSessionTransitions({
               db,
               state: raw,
               store,
@@ -210,13 +295,15 @@ export function createAutomatchPersistence(
               prepareMatchPresentations,
               writeGuards: guards,
               inviteAdmission,
-            });
-            return transitions.commit(updates, [...held.values()], signal);
+            }).commit(changes, [...held.values()], signal);
           }
-          const resources = owned.flatMap((path) => {
-            const resource = resourceForPath(path);
-            return resource ? [resource] : [];
-          });
+          const resources = changes.map((change) =>
+            change.kind === "mutation-receipt"
+              ? `gameplay-operation:${change.operationId}`
+              : "inviteId" in change
+                ? change.inviteId
+                : "",
+          );
           const guarded = createAutomatchD1Store(db, {
             now,
             writeGuards: () => [
@@ -224,32 +311,19 @@ export function createAutomatchPersistence(
               ...gameSessionResourceGuardStatements(db, resources),
             ],
           });
-          await guarded.patchRoot(updates, signal);
+          const nowMs = now();
+          for (let attempt = 0; attempt < 25; attempt++) {
+            if (
+              await guarded.commit(
+                await guarded.prepareChanges(changes, nowMs, signal),
+                signal,
+              )
+            )
+              return;
+          }
+          throw new Error("automatch-patch-contention");
         },
-      );
-    },
-    async transactPath(path, updater, signal) {
-      if (inviteSourcePath(path)) {
-        throw new InviteSourceFailure("invite-source-transition-required");
-      }
-      if (!parseAutomatchPath(path)) {
-        return raw.transactPath(path, updater, signal);
-      }
-      return write("automatch-persistence-transaction", async (admission) => {
-        const resource = resourceForPath(path);
-        const guarded = createAutomatchD1Store(db, {
-          now,
-          writeGuards: () => [
-            ...automatchAdmissionGuardStatements(db, admission),
-            ...gameSessionResourceGuardStatements(
-              db,
-              resource ? [resource] : [],
-            ),
-          ],
-        });
-        return guarded.transactPath(path, updater, signal);
-      });
-    },
+      ),
   };
 
   return {

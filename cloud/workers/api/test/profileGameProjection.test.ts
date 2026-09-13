@@ -1,3 +1,4 @@
+import { attachProjectionTestPorts } from "./projectionTestPorts.ts";
 import assert from "node:assert/strict";
 import test, { beforeEach } from "node:test";
 import { Color, Game, GameVariant } from "mons-rules";
@@ -28,7 +29,7 @@ import {
   buildEventProfileGameProjectionOutboxUpdates,
   parseAutomatchProfileGameProjectionOutbox,
   parseEventProfileGameProjectionOutbox,
-} from "../src/profileGameProjectionOutbox.ts";
+} from "../test/legacyProjectionOutboxFixture.ts";
 import type {
   EventProfileGameProjectionRuntime,
   ProfileGameProjectionRuntime,
@@ -128,9 +129,10 @@ function ratingRepository(
     applyFebruaryChallengeReplay: async () => undefined,
     claimRatingProfileGameProjection: async () => true,
     finalizeRatingUpdate: async () => ({ status: "lost" }),
-    getStatePath: async (path) => {
-      assert.doesNotMatch(path, /matchesRatingUpdates/);
-      return null;
+    readInviteMetadata: async () => null,
+    readMatchRecord: async () => null,
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
     },
     listDueRatingProfileGameProjections: async () => [],
     markRatingProfileGameProjection: async (
@@ -144,13 +146,8 @@ function ratingRepository(
         ...(reason ? { reason } : {}),
       });
     },
-    patchStateRoot: async (updates) => {
-      assert.ok(
-        Object.keys(updates).every(
-          (path) => !path.includes("matchesRatingUpdates"),
-        ),
-      );
-      state.patches.push(updates);
+    putEventProgressOutbox: async (outboxId, record) => {
+      state.patches.push({ [`eventProgressOutbox/${outboxId}`]: record });
     },
     readProfileOwnershipSnapshot: async () => ({
       canonicalProfileIdByProfileId: new Map(),
@@ -379,7 +376,7 @@ function applyStateTransaction(
 }
 
 function projectionLockState(values = new Map<string, unknown>()) {
-  return {
+  return attachProjectionTestPorts({
     listDueEventProfileGameProjectionOutboxes: async () => [],
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
@@ -399,7 +396,7 @@ function projectionLockState(values = new Map<string, unknown>()) {
       }
       return result;
     },
-  };
+  });
 }
 
 test("profile game projection tasks require exact safe payloads", () => {
@@ -726,7 +723,7 @@ test("automatch projection uses the immutable source timestamp and exact-clears"
     options: Record<string, unknown>;
     reason: string;
   }> = [];
-  const state = {
+  const state = attachProjectionTestPorts({
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
@@ -741,7 +738,7 @@ test("automatch projection uses the immutable source timestamp and exact-clears"
       }
       return result;
     },
-  };
+  });
   assert.equal(
     await processAutomatchProfileGameProjection(
       automatchTask(),
@@ -1122,7 +1119,7 @@ test("automatch projection serializes newer work behind the current invite", asy
   const started = new Promise<void>((resolve) => {
     firstStarted = resolve;
   });
-  const state = {
+  const state = attachProjectionTestPorts({
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
@@ -1138,7 +1135,7 @@ test("automatch projection serializes newer work behind the current invite", asy
       }
       return result;
     },
-  };
+  });
   const first = processAutomatchProfileGameProjection(
     automatchTask(),
     state,
@@ -1316,9 +1313,9 @@ test("event projection cannot write after its lease is taken over", async () => 
           const contender = createEventLockManagerCore({
             createLockId: () => "successor-lock",
             includeLegacyOwnerId: true,
-            lockRoot: "profileGameProjectionLocks/event",
+            lockKind: "profile-game-projection",
             now: () => nowMs,
-            transactPath: state.transactStatePath,
+            transactEventLease: state.transactEventLease,
           });
           assert.ok(
             await contender.acquireEventLock("event-1", "successor-owner"),
@@ -1808,22 +1805,23 @@ test("automatch Queue retries transient work without settling its outbox", async
   let transactions = 0;
   await handleProfileGameProjectionMessage(failed.message, TELEGRAM_TEST_ENV, {
     createLocks: () => locks,
-    createStateRepository: () => ({
-      listDueEventProfileGameProjectionOutboxes: async () => [],
-      readInviteMetadata: async () => {
-        throw new Error("unexpected-invite-metadata-read");
-      },
-      getStatePath: async (path) => values.get(path),
-      transactStatePath: async (path, updater) => {
-        transactions++;
-        assertActiveStatePath(path);
-        const result = applyStateTransaction(values.get(path), updater);
-        if (result.committed) {
-          values.set(path, result.value);
-        }
-        return result;
-      },
-    }),
+    createStateRepository: () =>
+      attachProjectionTestPorts({
+        listDueEventProfileGameProjectionOutboxes: async () => [],
+        readInviteMetadata: async () => {
+          throw new Error("unexpected-invite-metadata-read");
+        },
+        getStatePath: async (path) => values.get(path),
+        transactStatePath: async (path, updater) => {
+          transactions++;
+          assertActiveStatePath(path);
+          const result = applyStateTransaction(values.get(path), updater);
+          if (result.committed) {
+            values.set(path, result.value);
+          }
+          return result;
+        },
+      }),
     createRuntime: () => ({
       recomputeInviteProjection: async () => {
         throw new Error("temporary-projection-failure");
@@ -2091,7 +2089,7 @@ test("event recovery normalizes every non-null malformed marker", async () => {
   const runRepair = async (value: unknown, eventId = "event-1") => {
     let current = value;
     const result = await repairInvalidEventSweepEntry(
-      {
+      attachProjectionTestPorts({
         getStatePath: async () => null,
         readInviteMetadata: async () => {
           throw new Error("unexpected-invite-metadata-read");
@@ -2103,7 +2101,7 @@ test("event recovery normalizes every non-null malformed marker", async () => {
           }
           return transaction;
         },
-      },
+      }),
       eventId,
       600_000,
       () => "repair-request",
@@ -2200,7 +2198,7 @@ test("event recovery claims due outboxes and repairs malformed records", async (
     ["event-negative", { ...eventOutbox(), lastQueuedAtMs: -1 }],
     ["event-boolean", { ...eventOutbox(), lastQueuedAtMs: false }],
   ]);
-  const state = {
+  const state = attachProjectionTestPorts({
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
@@ -2226,7 +2224,7 @@ test("event recovery claims due outboxes and repairs malformed records", async (
       }
       return result;
     },
-  };
+  });
   const requestIds = ["repair-bad", "repair-negative", "repair-boolean"];
   assert.equal(
     await sweepEventProfileGameProjections(
@@ -2338,7 +2336,7 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
       },
     ],
   ]);
-  const state = {
+  const state = attachProjectionTestPorts({
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
@@ -2377,7 +2375,7 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
       }
       return result;
     },
-  };
+  });
   const requestIds = [
     "repair-1",
     "repair-2",
@@ -2465,7 +2463,7 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
 
 test("automatch recovery claims an outbox only once", async () => {
   let current: unknown = automatchOutbox("request-1", 50, 100);
-  const state = {
+  const state = attachProjectionTestPorts({
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
     },
@@ -2480,7 +2478,7 @@ test("automatch recovery claims an outbox only once", async () => {
       }
       return result;
     },
-  };
+  });
   const candidate = {
     lastQueuedAtMs: 100,
     task: automatchTask(),

@@ -22,7 +22,7 @@ const MATCH_TIMER_START_INVITE_CANDIDATE_LIMIT = 17;
 
 type MatchTimerStartSweepRepository = Pick<
   GameplayRepository,
-  "getStatePath" | "readInviteMetadata"
+  "readMatchRecord" | "readInviteMetadata"
 >;
 
 export type MatchTimerStartSweepDependencies = {
@@ -165,9 +165,9 @@ async function reconcileMarker(
   resolveGame: NonNullable<MatchTimerStartSweepDependencies["resolveGame"]>,
   assertMutationAllowed: () => Promise<void>,
 ): Promise<"deleted" | "retained" | "stale"> {
-  const playerPath = `players/${marker.playerId}/matches/${marker.matchId}`;
+  const playerKey = { playerId: marker.playerId, matchId: marker.matchId };
   if (marker.opponentId === null) {
-    const playerValue = await repository.getStatePath(playerPath);
+    const playerValue = await repository.readMatchRecord(playerKey);
     if (rawMatchProvesMarkerObsolete(marker, playerValue)) {
       await assertMutationAllowed();
       return (await store.deleteIfUnchanged(marker)) ? "deleted" : "stale";
@@ -184,9 +184,10 @@ async function reconcileMarker(
       return "stale";
     }
     const activeMarker = { ...marker, opponentId };
-    const opponentValue = await repository.getStatePath(
-      `players/${opponentId}/matches/${marker.matchId}`,
-    );
+    const opponentValue = await repository.readMatchRecord({
+      playerId: opponentId,
+      matchId: marker.matchId,
+    });
     return reconcileKnownMatch(
       activeMarker,
       playerValue,
@@ -198,10 +199,11 @@ async function reconcileMarker(
     );
   }
   const [playerValue, opponentValue] = await Promise.all([
-    repository.getStatePath(playerPath),
-    repository.getStatePath(
-      `players/${marker.opponentId}/matches/${marker.matchId}`,
-    ),
+    repository.readMatchRecord(playerKey),
+    repository.readMatchRecord({
+      playerId: marker.opponentId,
+      matchId: marker.matchId,
+    }),
   ]);
   return reconcileKnownMatch(
     marker,

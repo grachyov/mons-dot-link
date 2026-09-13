@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTelegramRepository } from "../../../runtime/telegram/repositoryCore.js";
+import {
+  createTelegramRepository,
+  type TelegramStorage,
+  type TelegramStoredRecord,
+} from "../../../runtime/telegram/repositoryCore.js";
 import {
   handleTelegramCommand,
   MAX_TELEGRAM_COMMAND_BODY_BYTES,
@@ -13,30 +17,39 @@ const SECRET = TELEGRAM_TEST_ENV.TELEGRAM_QUEUE_BRIDGE_SECRET;
 
 function repositoryState(initial: Record<string, unknown> = {}) {
   const values = new Map(Object.entries(initial));
-  const repository = createTelegramRepository({
-    async getPath(path) {
-      return values.get(path) ?? null;
-    },
-    async transactPath(path, updater) {
-      const current = values.get(path) ?? null;
-      const output = updater(current) as
-        | { commit: false; decision?: string }
-        | { value: unknown; decision?: string };
-      if ("commit" in output && output.commit === false) {
-        return {
-          committed: false,
-          decision: output.decision,
-          value: current,
-        };
-      }
-      if (!("value" in output)) throw new Error("invalid transaction");
-      values.set(path, output.value);
+  const transact = async (
+    key: string,
+    updater: Parameters<TelegramStorage["transactMessage"]>[1],
+  ) => {
+    const current = (values.get(key) ?? null) as TelegramStoredRecord | null;
+    const output = updater(current) as
+      | { commit: false; decision?: string }
+      | { value: unknown; decision?: string };
+    if ("commit" in output && output.commit === false) {
       return {
-        committed: true,
+        committed: false,
         decision: output.decision,
-        value: output.value,
+        value: current,
       };
-    },
+    }
+    if (!("value" in output)) throw new Error("invalid transaction");
+    values.set(key, output.value);
+    return {
+      committed: true,
+      decision: output.decision,
+      value: output.value as TelegramStoredRecord | null,
+    };
+  };
+  const repository = createTelegramRepository({
+    readMessage: async (key) =>
+      (values.get(`telegramMessages/${key}`) ??
+        null) as TelegramStoredRecord | null,
+    transactMessage: (key, updater) =>
+      transact(`telegramMessages/${key}`, updater),
+    readControl: async () =>
+      (values.get("telegramDeliveryControl") ??
+        null) as TelegramStoredRecord | null,
+    transactControl: (updater) => transact("telegramDeliveryControl", updater),
   });
   return { repository, values };
 }

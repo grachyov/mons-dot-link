@@ -6,7 +6,7 @@ import type { GameplayRepository } from "./gameplayRepository.ts";
 import { assertProfileMutationAllowed } from "./profileCanonicalActivation.ts";
 import { createWagerFrozenD1Store } from "./wagerFrozenD1.ts";
 import { createWagerStateRepository } from "./wagerStateRepository.ts";
-import { notifyInviteSourceChanged } from "./inviteWagersNotifications.ts";
+import { notifyInviteRooms } from "./inviteRoomNotifications.ts";
 import type { WagerFrozenBalance } from "./wagerFrozenStore.ts";
 import {
   acquireWagerReservationAdmission,
@@ -82,27 +82,24 @@ export function createWagerReservationRuntime(
           now,
           writeGuards,
         });
-        const wagerState = createWagerStateRepository(
-          db,
-          {
-            getPath: repository.getStatePath,
-            patchRoot: repository.patchStateRoot,
-            transactPath: repository.transactStatePath,
-          },
-          {
-            now,
-            writeGuards,
-            notify: (updates, committed) =>
-              notifyInviteSourceChanged(env, updates, committed),
-          },
-        );
+        const wagerState = createWagerStateRepository(db, {
+          now,
+          writeGuards,
+          notify: (inviteId) =>
+            notifyInviteRooms(
+              env,
+              [inviteId],
+              "notifyWagersChanged",
+              "invite_wagers_notify_failed",
+            ),
+        });
         await assertAdmission(admission);
         return await work(
           {
             ...repository,
             wagerFrozen: store,
-            patchStateRoot: wagerState.patchRoot,
-            transactStatePath: wagerState.transactPath,
+            wagers: wagerState,
+            wagerWriter: wagerState,
           },
           () => assertAdmission(admission),
         );

@@ -1,3 +1,11 @@
+import { commitEventMutations } from "../src/eventD1.ts";
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import type { EventMutation } from "../../../runtime/eventCommands.js";
+import {
+  patchEventOwnedPaths as patchEventOwnedPathsRaw,
+  readEventOwnedPath,
+  transactEventOwnedPath as transactEventOwnedPathRaw,
+} from "./eventD1Fixture.ts";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
@@ -15,9 +23,7 @@ import {
   listDueEventTelegramProjectionOutboxes,
   listPendingEventTransitionIntents,
   listProfileEventPrizeAssignments,
-  patchEventOwnedPaths as patchEventOwnedPathsRaw,
   readEvent,
-  readEventOwnedPath,
   readEventPrizeSelections,
   readEventRuntimeControl,
   readEventSnapshot,
@@ -27,7 +33,6 @@ import {
   readProfileEventPrizesIfChanged,
   readProfileEventPrizeAssignment,
   releaseEventWriteAdmission,
-  transactEventOwnedPath as transactEventOwnedPathRaw,
   validateEventAggregate,
   type EventD1Connection,
 } from "../src/eventD1.ts";
@@ -213,6 +218,70 @@ describe("event D1 store", () => {
       testEnv.EVENT_DB.prepare("DELETE FROM event_records"),
       testEnv.EVENT_DB.prepare("DELETE FROM profile_event_prize_revisions"),
     ]);
+  });
+
+  it("rejects invalid nested typed identities and stored paths without changing the event", async () => {
+    await patchEventOwnedPaths(testEnv.EVENT_DB, {
+      [`events/${eventId}`]: eventRecord(),
+    });
+    const before = await readEventSnapshot(testEnv.EVENT_DB, eventId);
+    for (const invalid of ["", "bad/key", "bad#key", " padded "]) {
+      const changes: EventMutation[] = [
+        { kind: "event-round", eventId, roundKey: invalid, value: {} },
+        {
+          kind: "event-match-status",
+          eventId,
+          roundKey: invalid,
+          matchKey: "0_0",
+          value: "host",
+        },
+        {
+          kind: "event-match-status",
+          eventId,
+          roundKey: "0",
+          matchKey: invalid,
+          value: "host",
+        },
+        {
+          kind: "event-disqualification",
+          eventId,
+          roundKey: invalid,
+          matchKey: "0_0",
+          value: true,
+        },
+        {
+          kind: "event-disqualification",
+          eventId,
+          roundKey: "0",
+          matchKey: invalid,
+          value: true,
+        },
+      ];
+      for (const change of changes)
+        await expect(
+          withD1Admission((admission) =>
+            commitEventMutations(testEnv.EVENT_DB, [change], { admission }),
+          ),
+        ).rejects.toThrow("invalid-event-path");
+    }
+    for (const path of [
+      `events/${eventId}/rounds//matches/0_0/status`,
+      `events/${eventId}/rounds/0/matches//winnerDisqualified`,
+      `events/${eventId}/rounds/bad#key`,
+      `/events/${eventId}/status`,
+      `events/${eventId}/status/`,
+    ]) {
+      await expect(
+        withD1Admission(async (admission) =>
+          commitEventMutations(
+            testEnv.EVENT_DB,
+            decodeEventUpdates({ [path]: true }) as EventMutation[],
+            { admission },
+          ),
+        ),
+      ).rejects.toThrow("invalid-event-path");
+    }
+    expect(await readEventSnapshot(testEnv.EVENT_DB, eventId)).toEqual(before);
   });
 
   it("stores validated aggregates and returns session-compatible snapshots", async () => {
@@ -1137,10 +1206,18 @@ describe("event D1 store", () => {
         async batch(statements) {
           if (changeSibling) {
             changeSibling = false;
-            await patchEventOwnedPaths(testEnv.EVENT_DB, {
-              [`${root}/${eventId}/sibling`]:
-                root === "events" ? { retained: true } : "1111",
-            });
+            await patchEventOwnedPaths(
+              testEnv.EVENT_DB,
+              root === "events"
+                ? {
+                    [`events/${eventId}`]: {
+                      ...(await readEventSnapshot(testEnv.EVENT_DB, eventId))
+                        .event,
+                      sibling: { retained: true },
+                    },
+                  }
+                : { [`eventPrizeSelections/${eventId}/sibling`]: "1111" },
+            );
           }
           return testEnv.EVENT_DB.batch(statements);
         },
@@ -2274,6 +2351,44 @@ describe("event D1 store", () => {
     },
   );
 
+  it("rejects stale outbox deletion without other revision guards", async () => {
+    const path = `profileGameProjectionOutbox/event/${eventId}`;
+    const originalOutbox = {
+      schemaVersion: 1,
+      status: "pending",
+      requestId: "request-one",
+      lastQueuedAtMs: 100,
+    };
+    const currentOutbox = {
+      ...originalOutbox,
+      requestId: "request-two",
+      lastQueuedAtMs: 200,
+    };
+    await patchEventOwnedPaths(testEnv.EVENT_DB, {
+      [`events/${eventId}`]: eventRecord(),
+      [path]: originalOutbox,
+    });
+    await patchEventOwnedPaths(testEnv.EVENT_DB, { [path]: currentOutbox });
+
+    await expect(
+      patchEventOwnedPaths(
+        testEnv.EVENT_DB,
+        { [path]: null },
+        { expectedRecords: { profileGame: { [eventId]: originalOutbox } } },
+      ),
+    ).rejects.toBeInstanceOf(EventD1Conflict);
+    expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toEqual(
+      currentOutbox,
+    );
+
+    await patchEventOwnedPaths(
+      testEnv.EVENT_DB,
+      { [path]: null },
+      { expectedRecords: { profileGame: { [eventId]: currentOutbox } } },
+    );
+    expect(await readEventOwnedPath(testEnv.EVENT_DB, path)).toBeNull();
+  });
+
   it("rejects stale profile-prize, outbox, and Telegram-state writes", async () => {
     await patchEventOwnedPaths(testEnv.EVENT_DB, {
       [`events/${eventId}`]: eventRecord(),
@@ -2313,8 +2428,8 @@ describe("event D1 store", () => {
         },
         {
           expectedProfilePrizeRevisions: { [profileId]: 1 },
-          expectedPathValues: {
-            [`profileGameProjectionOutbox/event/${eventId}`]: originalOutbox,
+          expectedRecords: {
+            profileGame: { [eventId]: originalOutbox },
           },
           expectedTelegramStateRevisions: { [eventId]: 1 },
         },

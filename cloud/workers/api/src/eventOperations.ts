@@ -23,7 +23,7 @@ import { AuthApiFailure, type AuthErrorCode } from "./authErrors.ts";
 import { createGameplayRepository } from "./gameplayRepository.ts";
 import {
   buildEventProgressPlan,
-  createEventStateAdapter,
+  createEventRuntimeStore,
   ensureEventProgressWorkflow,
 } from "./eventProgress.ts";
 import { createD1EventPrizeWithdrawalReader } from "./eventPrizeWithdrawalD1.ts";
@@ -108,10 +108,10 @@ function createRuntime(env: Env, dependencies: EventControlDependencies) {
     );
   const lockManager = createEventLockManagerCore({
     createLockId: () => crypto.randomUUID(),
-    transactPath: (path, updater) =>
-      repository.transactStatePath(path, updater, signal),
-    releaseTransactPath: (path, updater) =>
-      repository.transactStatePath(path, updater),
+    transactEventLease: (key, updater) =>
+      repository.transactEventLease(key, updater, signal),
+    releaseTransactEventLease: (key, updater) =>
+      repository.transactEventLease(key, updater),
     sleep:
       dependencies.sleep ||
       ((milliseconds) => scheduler.wait(milliseconds, { signal })),
@@ -127,7 +127,7 @@ function createRuntime(env: Env, dependencies: EventControlDependencies) {
     },
   });
   return createEventRuntime({
-    state: createEventStateAdapter(repository, signal),
+    state: createEventRuntimeStore(repository, signal),
     readMatchPair: (input) => readGameplayMatchPair(repository, input, signal),
     enqueueEventProgressTask: async ({
       eventId,

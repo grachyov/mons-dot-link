@@ -1,6 +1,7 @@
 import type { D1Migration } from "cloudflare:test";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
-import { createInviteSourceD1Store } from "../src/inviteSourceD1.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
+import { createLegacyInviteSourceD1Store as createInviteSourceD1Store } from "../test/legacyInviteSourceFixture.ts";
+import { eventMatchTestPort } from "./eventRepositoryFixture.ts";
 import {
   createEventStateRepository,
   recoverEventTransitionIntents,
@@ -125,9 +126,14 @@ export function eventTransitionFixture(
     reads,
     writes,
     hooks,
-    raw,
+    raw: Object.assign(raw, eventMatchTestPort(raw)),
     source,
-    client: createEventStateRepository(env, base, raw),
-    recover: () => recoverEventTransitionIntents(env, 100, raw),
+    client: createEventStateRepository(
+      env,
+      eventMatchTestPort(base),
+      eventMatchTestPort(raw),
+    ),
+    recover: () =>
+      recoverEventTransitionIntents(env, 100, eventMatchTestPort(raw)),
   };
 }

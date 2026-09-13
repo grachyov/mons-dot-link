@@ -1,7 +1,12 @@
-import { createTelegramRepository } from "../../../runtime/telegram/repositoryCore.js";
+import { attachProjectionTestPorts } from "./projectionTestPorts.ts";
+import {
+  createTelegramRepository,
+  type TelegramTransactionResult,
+  type TelegramStoredRecord,
+} from "../../../runtime/telegram/repositoryCore.js";
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import type { EventReads } from "../../../runtime/eventReads.js";
 import type { EventOutboxReads } from "../src/eventOutboxReadRepository.ts";
 import { eventReadFixture } from "./eventReadFixture.ts";
@@ -72,10 +77,24 @@ function memoryState(initial: Record<string, unknown>) {
     },
   };
   return {
-    client,
+    client: attachProjectionTestPorts(client),
     telegram: createTelegramRepository({
-      getPath: client.getPath,
-      transactPath: client.transactPath,
+      readMessage: async (key) =>
+        (await client.getPath(
+          `telegramMessages/${key}`,
+        )) as TelegramStoredRecord | null,
+      transactMessage: async (key, updater) =>
+        (await client.transactPath(`telegramMessages/${key}`, (current) =>
+          updater(current as TelegramStoredRecord | null),
+        )) as TelegramTransactionResult,
+      readControl: async () =>
+        (await client.getPath(
+          "telegramDeliveryControl",
+        )) as TelegramStoredRecord | null,
+      transactControl: async (updater) =>
+        (await client.transactPath("telegramDeliveryControl", (current) =>
+          updater(current as TelegramStoredRecord | null),
+        )) as TelegramTransactionResult,
     }),
     read: (path: string) => state.get(path),
   };
@@ -117,7 +136,11 @@ function ratingRepository(
     applyFebruaryChallengeReplay: async () => undefined,
     claimRatingTelegramProjection: async () => true,
     finalizeRatingUpdate: async () => ({ status: "lost" }),
-    getStatePath: async () => null,
+    readInviteMetadata: async () => null,
+    readMatchRecord: async () => null,
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
+    },
     listDueRatingTelegramProjections: async (updatedBeforeMs) =>
       data && (data.telegramProjectionUpdatedAtMs || 0) <= updatedBeforeMs
         ? [
@@ -135,7 +158,7 @@ function ratingRepository(
     ) => {
       marks.push({ state, ...(reason ? { reason } : {}) });
     },
-    patchStateRoot: async () => undefined,
+    putEventProgressOutbox: async () => undefined,
     readProfileOwnershipSnapshot: async () => {
       throw new Error("unexpected-profile-ownership-read");
     },

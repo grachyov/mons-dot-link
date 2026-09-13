@@ -1,3 +1,6 @@
+import { parseAutomatchPath } from "../test/legacyAutomatchStoreFixture.ts";
+import { createLegacyAutomatchD1Store as createAutomatchD1Store } from "../test/legacyAutomatchStoreFixture.ts";
+import { matchTestPort } from "../test/gameSessionTestPorts.ts";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
@@ -18,12 +21,8 @@ import {
   proposeRematch,
 } from "../src/gameSessionMutations.ts";
 import { createAutomatchPersistence } from "../src/automatchPersistence.ts";
-import {
-  createAutomatchD1Store,
-  parseAutomatchPath,
-} from "../src/automatchD1.ts";
 import { createGameSessionMutationLockStore } from "../src/gameplayCoordinationD1.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import type { GameplayRepository } from "../src/gameplayRepository.ts";
 import {
   prepareCreatedMatchPresentations,
@@ -182,20 +181,26 @@ function client(
   prepareMatchPresentations: PrepareMatchPresentations = (creations) =>
     prepareCreatedMatchPresentations(env, creations),
 ) {
-  const persistence = createAutomatchPersistence(database, memoryState, {
-    prepareMatchPresentations,
-  });
+  const persistence = createAutomatchPersistence(
+    database,
+    matchTestPort(memoryState),
+    {
+      prepareMatchPresentations,
+    },
+  );
   const repository: GameplayRepository = {
     automatchPersistence: persistence,
-    readInviteMetadata: async (inviteId, signal) =>
-      (await persistence.client.getPath(
-        `invites/${inviteId}`,
-        undefined,
-        signal,
-      )) as Record<string, unknown> | null,
-    getStatePath: persistence.client.getPath,
-    patchStateRoot: persistence.client.patchRoot,
-    transactStatePath: persistence.client.transactPath,
+    ...matchTestPort(memoryState),
+    ...persistence.client,
+    wagers: {
+      readWager: async () => null,
+      readResolutionMarker: async () => null,
+      readInviteWagerState: async () => [],
+      readInviteWagerPresence: async () => ({
+        wagerMatchIds: [],
+        resolutionMatchIds: [],
+      }),
+    },
     readProfileOwnershipSnapshot: async (query) => ownership(query),
     applyWagerTransferOnce: async () => {
       throw new Error("unexpected-wager-transfer");

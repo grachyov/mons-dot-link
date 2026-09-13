@@ -38,7 +38,8 @@ const fixture = ({
               ...inviteFields,
             };
       },
-      async getStatePath(path) {
+      async readAutomatchEntry(inviteId) {
+        const path = `automatch/${inviteId}`;
         if (path === `automatch/${inviteId}`) return null;
         throw new Error(`unexpected-state-read:${path}`);
       },

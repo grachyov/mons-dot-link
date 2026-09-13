@@ -1,10 +1,14 @@
+import {
+  matchTestPort,
+  legacySessionClient,
+} from "../test/gameSessionTestPorts.ts";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { applyStrictMatchStateTestMigrations } from "./strictMatchStateTestFixture.ts";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createAutomatchPersistence } from "../src/automatchPersistence.ts";
 import { createGameSessionMutationLockStore } from "../src/gameplayCoordinationD1.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import { validateTelegramTransactionDecision } from "../src/telegramTransaction.ts";
 import { resetMatchPresentationTestState } from "./matchPresentationTestFixture.ts";
 
@@ -57,15 +61,24 @@ function memoryState() {
 }
 
 function persistence(client: StateRepository, database = db) {
-  return createAutomatchPersistence(database, client, {
-    async prepareMatchPresentations(creations) {
-      return creations.map((creation) => ({
-        ...creation,
-        seedDigest: "a".repeat(64),
-        provenance: "creation" as const,
-      }));
+  const persistence = createAutomatchPersistence(
+    database,
+    matchTestPort(client),
+    {
+      async prepareMatchPresentations(creations) {
+        return creations.map((creation) => ({
+          ...creation,
+          seedDigest: "a".repeat(64),
+          provenance: "creation" as const,
+        }));
+      },
     },
-  });
+  );
+  return {
+    ...persistence,
+    typedClient: persistence.client,
+    client: legacySessionClient(persistence.client),
+  };
 }
 
 describe("automatch persistence integration", () => {
@@ -223,7 +236,7 @@ describe("automatch persistence integration", () => {
     ).toBe(0);
   });
 
-  it("rejects frozen persistence writes while allowing raw live match updates", async () => {
+  it("rejects frozen session writes while keeping the match port separate", async () => {
     const raw = memoryState();
     const runtime = persistence(raw.client);
     await db
@@ -237,10 +250,21 @@ describe("automatch persistence integration", () => {
       status: 503,
       message: "automatch-persistence-frozen",
     });
-    await runtime.client.patchRoot({
-      "players/host/matches/live/timer": "1;1000",
+    await matchTestPort(raw.client).createMatchRecords({
+      inviteId: "live",
+      transitionId: "test",
+      records: [
+        {
+          playerId: "host",
+          matchId: "live",
+          marker: "created",
+          value: { timer: "1;1000" },
+        },
+      ],
     });
-    expect(raw.values.get("players/host/matches/live/timer")).toBe("1;1000");
+    expect(raw.values.get("players/host/matches/live")).toMatchObject({
+      timer: "1;1000",
+    });
     expect(await runtime.sweep()).toEqual({ recovered: 0, failed: 0 });
   });
 
@@ -270,9 +294,12 @@ describe("automatch persistence integration", () => {
         runtime.client.patchRoot({ "automatch/invite-one": { uid: "host" } }),
       ).rejects.toThrow("backend-retired");
       await expect(
-        runtime.client.transactPath("automatch/invite-one", () => ({
-          value: null,
-        })),
+        runtime.typedClient.transactAutomatchProfileOutbox(
+          "invite-one",
+          () => ({
+            value: null,
+          }),
+        ),
       ).rejects.toThrow("backend-retired");
       await expect(runtime.writesEnabled()).rejects.toThrow("backend-retired");
       if (backend === "automatch") {
@@ -297,29 +324,22 @@ describe("automatch persistence integration", () => {
     },
   );
 
-  it("rejects direct invite mutations while preserving raw match and timer operations", async () => {
+  it("rejects direct invite changes and exposes no generic raw fallback", async () => {
     const raw = memoryState();
     const runtime = persistence(raw.client);
     await expect(
-      runtime.client.patchRoot({ "invites/invite-one": { hostId: "host" } }),
+      runtime.typedClient.commitSessionChanges([
+        {
+          kind: "invite-merge",
+          inviteId: "invite-one",
+          value: { hostId: "host" },
+        },
+      ]),
     ).rejects.toThrow("invite-source-transition-required");
-    await expect(
-      runtime.client.transactPath("invites/invite-one", () => ({
-        value: { hostId: "host" },
-      })),
-    ).rejects.toThrow("invite-source-transition-required");
-    await runtime.client.patchRoot({
-      "players/host/matches/live/timer": "1;1000",
-    });
-    await runtime.client.transactPath("matchTimerClaims/live", () => ({
-      value: { status: "pending" },
-    }));
-    expect(
-      await runtime.client.getPath("players/host/matches/live/timer"),
-    ).toBe("1;1000");
-    expect(await runtime.client.getPath("matchTimerClaims/live")).toEqual({
-      status: "pending",
-    });
+    expect(runtime.typedClient).not.toHaveProperty("getPath");
+    expect(runtime.typedClient).not.toHaveProperty("patchRoot");
+    expect(runtime.typedClient).not.toHaveProperty("transactPath");
+    expect(raw.values.size).toBe(0);
   });
 
   it("checks all 512 linked logins with two queries when no recovery is pending", async () => {

@@ -1,28 +1,15 @@
-import { STATE_FAILURE_MESSAGES } from "./stateCompatibility.ts";
 import type {
   MatchStateCreation,
   MatchStateEventEffectsRequest,
   MatchStatePair,
   MatchStatePairRequest,
-} from "./matchStateTypes.ts";
-
+} from "../src/matchStateTypes.ts";
 export {
+  StateRepositoryFailure,
+  StateRepositoryPermissionDenied,
   STATE_SERVER_TIMESTAMP,
   stateIncrement,
-} from "./stateCompatibility.ts";
-
-export class StateRepositoryFailure extends Error {
-  constructor() {
-    super(STATE_FAILURE_MESSAGES.unavailable);
-  }
-}
-
-export class StateRepositoryPermissionDenied extends StateRepositoryFailure {
-  constructor() {
-    super();
-    this.message = STATE_FAILURE_MESSAGES.permissionDenied;
-  }
-}
+} from "../src/stateCompatibility.ts";
 
 export type StateQuery = {
   endAt?: string | number | boolean | null;

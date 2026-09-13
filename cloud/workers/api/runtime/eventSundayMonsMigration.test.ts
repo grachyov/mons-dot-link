@@ -1,3 +1,4 @@
+import { patchEventOwnedPaths } from "./eventD1Fixture.ts";
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -5,7 +6,6 @@ import {
   acquireEventWriteAdmission,
   createEventTransitionIntent,
   EventD1Conflict,
-  patchEventOwnedPaths,
   readEventSnapshot,
   releaseEventWriteAdmission,
 } from "../src/eventD1.ts";

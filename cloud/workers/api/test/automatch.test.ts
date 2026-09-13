@@ -1,3 +1,7 @@
+import {
+  attachGameplayTestPorts,
+  type LegacyGameplayTestMethods,
+} from "./gameSessionTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -16,7 +20,7 @@ import type { RequestIdentity } from "../src/requestIdentity.ts";
 import {
   STATE_SERVER_TIMESTAMP,
   stateIncrement,
-} from "../src/stateRepositoryTypes.ts";
+} from "../test/stateRepositoryTestTypes.ts";
 import type {
   GameplayProfile,
   GameplayRepository,
@@ -255,9 +259,9 @@ function ownershipSnapshot(
 }
 
 function repository(
-  overrides: Partial<GameplayRepository> = {},
+  overrides: Partial<GameplayRepository & LegacyGameplayTestMethods> = {},
   readReceipt: (() => unknown) | null = null,
-): GameplayRepository {
+): GameplayRepository & LegacyGameplayTestMethods {
   const transactionValues = new Map<string, unknown>();
   const receiptValues = new Map<string, unknown>();
   const getStatePath = overrides.getStatePath;
@@ -267,7 +271,14 @@ function repository(
     patchStateRoot: _ignoredPatch,
     ...remainingOverrides
   } = overrides;
-  return {
+  const source: Omit<
+    GameplayRepository,
+    | keyof import("../src/gameSessionContracts.ts").GameSessionPort
+    | keyof import("../src/repositoryContracts.ts").MatchStatePort
+    | "wagers"
+  > &
+    LegacyGameplayTestMethods &
+    Pick<GameplayRepository, "readInviteMetadata"> = {
     automatchPersistence: createAutomatchPersistenceStub({
       readQueuedByLogins: createAutomatchQueueLookup(getStatePath),
     }),
@@ -327,6 +338,15 @@ function repository(
     },
     ...remainingOverrides,
   };
+  const result = attachGameplayTestPorts(source);
+  result.readAutomatchProfileOutbox = async (inviteId, signal) => ({
+    requestId: await getStatePath?.(
+      `profileGameProjectionOutbox/automatch/${inviteId}/requestId`,
+      undefined,
+      signal,
+    ),
+  });
+  return result as GameplayRepository & LegacyGameplayTestMethods;
 }
 
 test("requires canonical persistence for owner lookup without reading a Firebase queue", async () => {
@@ -1547,6 +1567,7 @@ test("requires commit proof after a lock release failure", async () => {
       if (path === `invites/${queued.inviteId}/guestId`) return null;
       if (path === `invites/${queued.inviteId}/hostId`) return identity.uid;
       if (path === `invites/${queued.inviteId}`) {
+        if (patches === 0) return { hostId: identity.uid, guestId: null };
         proofReads++;
         return null;
       }
@@ -1786,7 +1807,8 @@ test("reconciles a committed cancellation after the operation signal aborts", as
           return invite.hostId;
         }
         if (path === `invites/${queued.inviteId}`) {
-          reconciliationSignals.push(signal);
+          if (queue === null) reconciliationSignals.push(signal);
+          else assert.equal(signal, operation.signal);
           return invite;
         }
         if (
@@ -2246,6 +2268,8 @@ test("bounds repeated duplicate convergence to 512 cancellation attempts", async
             cancellationReads += 1;
             return { uid: identity.uid, timestamp: 3 };
           }
+          if (path === "invites/auto_stale")
+            return { hostId: identity.uid, guestId: null };
           if (path === "invites/auto_stale/guestId") return null;
           if (path === "invites/auto_stale/hostId") return identity.uid;
           assert.fail(`unexpected path ${path}`);

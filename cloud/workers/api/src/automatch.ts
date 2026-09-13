@@ -17,11 +17,10 @@ import {
 import * as monsRules from "mons-rules";
 import {
   TELEGRAM_AUTOMATCH_VERSION,
-  buildAutomatchTelegramProjectionOutboxUpdates,
-  buildAutomatchTelegramLifecycleUpdates,
-  buildMatchedAutomatchTelegramUpdates,
+  buildAutomatchTelegramProjectionChanges,
+  buildAutomatchTelegramLifecycleChanges,
+  buildMatchedAutomatchTelegramChanges,
   buildPendingAutomatchTelegramSource,
-  getAutomatchTelegramSourcePath,
 } from "../../../runtime/telegram/automatchSource.js";
 import {
   AUTOMATCH_WAITING_EMOJI_ID,
@@ -33,17 +32,15 @@ import type { RequestIdentity } from "./requestIdentity.ts";
 import {
   STATE_SERVER_TIMESTAMP,
   stateIncrement,
-} from "./stateRepositoryTypes.ts";
+} from "./stateCompatibility.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import type {
   GameplayProfile,
   GameplayRepository,
 } from "./gameplayRepository.ts";
 import type { GameSessionMutationLockStore } from "./gameplayCoordinationD1.ts";
-import {
-  buildAutomatchProfileGameProjectionOutboxUpdates,
-  getAutomatchProfileGameProjectionOutboxPath,
-} from "./profileGameProjectionOutbox.ts";
+import { requestAutomatchProfileProjection } from "./gameSessionProjectionChanges.ts";
+import type { GameSessionChange } from "./gameSessionContracts.ts";
 import type {
   AutomatchProfileGameProjectionTask,
   ProfileGameProjectionTask,
@@ -53,8 +50,6 @@ import type {
   TelegramProjectionTask,
 } from "./telegramProjectionTasks.ts";
 import {
-  GAME_SESSION_MUTATION_RECEIPT_EXPIRATION_ROOT,
-  GAME_SESSION_MUTATION_RECEIPT_ROOT,
   GameSessionMutationLeaseReleaseFailure,
   withGameSessionMutationLease,
 } from "./gameSessionMutations.ts";
@@ -155,14 +150,6 @@ function normalizeString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function automatchReceiptPath(operationId: string): string {
-  return `${GAME_SESSION_MUTATION_RECEIPT_ROOT}/${operationId}`;
-}
-
-function automatchReceiptExpirationPath(operationId: string): string {
-  return `${GAME_SESSION_MUTATION_RECEIPT_EXPIRATION_ROOT}/${operationId}`;
-}
-
 function parseAutomatchReceipt(value: unknown): AutomatchReceipt | null {
   const receipt = toRecord(value);
   const response = receipt?.response;
@@ -209,32 +196,36 @@ function parseAutomatchReceipt(value: unknown): AutomatchReceipt | null {
   };
 }
 
-function buildAutomatchReceiptUpdates(
+function buildAutomatchReceiptChanges(
   requesterUid: string,
   request: StartAutomatchOperationRequest,
   response: SuccessfulStartAutomatchResponse,
   profileProjectionRequestId: string | null,
   telegramProjection: boolean,
-): Record<string, unknown> {
+): GameSessionChange[] {
   const completedAtMs = STATE_SERVER_TIMESTAMP;
-  return {
-    [automatchReceiptPath(request.operationId)]: {
-      schemaVersion: 1,
-      aura: request.aura,
-      completedAtMs,
-      emojiId: request.emojiId,
-      inviteId: response.inviteId,
-      kind: AUTOMATCH_RECEIPT_KIND,
+  return [
+    {
+      kind: "mutation-receipt",
       operationId: request.operationId,
-      profileProjectionRequestId,
-      requesterUid,
-      response,
-      telegramProjection,
+      value: {
+        schemaVersion: 1,
+        aura: request.aura,
+        completedAtMs,
+        emojiId: request.emojiId,
+        inviteId: response.inviteId,
+        kind: AUTOMATCH_RECEIPT_KIND,
+        operationId: request.operationId,
+        profileProjectionRequestId,
+        requesterUid,
+        response,
+        telegramProjection,
+      },
+      expiration: {
+        completedAtMs,
+      },
     },
-    [automatchReceiptExpirationPath(request.operationId)]: {
-      completedAtMs,
-    },
-  };
+  ];
 }
 
 async function readAutomatchReceipt(
@@ -243,9 +234,8 @@ async function readAutomatchReceipt(
   repository: GameplayRepository,
   signal?: AbortSignal,
 ): Promise<AutomatchReceipt | null> {
-  const rawReceipt = await repository.getStatePath(
-    automatchReceiptPath(request.operationId),
-    undefined,
+  const rawReceipt = await repository.readMutationReceipt(
+    request.operationId,
     signal,
   );
   if (rawReceipt === null || rawReceipt === undefined) return null;
@@ -316,13 +306,9 @@ async function readQueuedAutomatchesByUid(
   signal?: AbortSignal,
 ): Promise<QueuedAutomatch[]> {
   return getQueuedAutomatchesForUid(
-    await repository.getStatePath(
-      "automatch",
-      {
-        orderBy: "uid",
-        equalTo: uid,
-        limitToFirst: AUTOMATCH_UID_LOOKUP_LIMIT,
-      },
+    await repository.listAutomatchEntriesByLogin(
+      uid,
+      AUTOMATCH_UID_LOOKUP_LIMIT,
       signal,
     ),
     uid,
@@ -577,13 +563,9 @@ async function readAutomatchCancellationProof(
 ): Promise<boolean> {
   try {
     const [queueValue, inviteValue, outboxRequestId] = await Promise.all([
-      repository.getStatePath(`automatch/${inviteId}`, undefined, signal),
+      repository.readAutomatchEntry(inviteId, signal),
       repository.readInviteMetadata(inviteId, signal),
-      repository.getStatePath(
-        `${getAutomatchProfileGameProjectionOutboxPath(inviteId)}/requestId`,
-        undefined,
-        signal,
-      ),
+      repository.readAutomatchProfileOutbox(inviteId, signal),
     ]);
     const invite = toRecord(inviteValue);
     return Boolean(
@@ -593,7 +575,7 @@ async function readAutomatchCancellationProof(
       invite?.automatchStateHint === "canceled" &&
       typeof invite.automatchCanceledAt === "number" &&
       Number.isFinite(invite.automatchCanceledAt) &&
-      normalizeString(outboxRequestId) === requestId,
+      normalizeString(toRecord(outboxRequestId)?.requestId) === requestId,
     );
   } catch {
     return false;
@@ -671,24 +653,12 @@ export async function cancelQueuedAutomatch(
       profileGameProjectionTask.requestId,
       dependencies.mutationLocks,
       async () => {
-        const [currentQueueValue, currentGuestId, currentHostId] =
-          await Promise.all([
-            repository.getStatePath(
-              `automatch/${queued.inviteId}`,
-              undefined,
-              signal,
-            ),
-            repository.getStatePath(
-              `invites/${queued.inviteId}/guestId`,
-              undefined,
-              signal,
-            ),
-            repository.getStatePath(
-              `invites/${queued.inviteId}/hostId`,
-              undefined,
-              signal,
-            ),
-          ]);
+        const [currentQueueValue, currentInvite] = await Promise.all([
+          repository.readAutomatchEntry(queued.inviteId, signal),
+          repository.readInviteMetadata(queued.inviteId, signal),
+        ]);
+        const currentGuestId = currentInvite?.guestId;
+        const currentHostId = currentInvite?.hostId;
         const currentQueue = toRecord(currentQueueValue);
         const currentUid = normalizeString(currentQueue?.uid);
         if (
@@ -703,27 +673,31 @@ export async function cancelQueuedAutomatch(
         ) {
           return false;
         }
-        const updates: Record<string, unknown> = {
-          [`automatch/${queued.inviteId}`]: null,
-          [`invites/${queued.inviteId}/automatchStateHint`]: "canceled",
-          [`invites/${queued.inviteId}/automatchCanceledAt`]:
-            STATE_SERVER_TIMESTAMP,
-          ...buildAutomatchProfileGameProjectionOutboxUpdates({
+        const changes: GameSessionChange[] = [
+          { kind: "automatch-entry", inviteId: queued.inviteId, value: null },
+          {
+            kind: "invite-fields",
+            inviteId: queued.inviteId,
+            value: {
+              automatchStateHint: "canceled",
+              automatchCanceledAt: STATE_SERVER_TIMESTAMP,
+            },
+          },
+          ...requestAutomatchProfileProjection({
             inviteId: queued.inviteId,
             requestId: profileGameProjectionTask.requestId,
             timestamp: STATE_SERVER_TIMESTAMP,
           }),
-        };
+        ];
         if (expectedTelegramDeliveryVersion) {
-          Object.assign(
-            updates,
-            buildAutomatchTelegramLifecycleUpdates({
+          changes.push(
+            ...buildAutomatchTelegramLifecycleChanges({
               inviteId: queued.inviteId,
               lifecycle: "canceled",
               timestamp: STATE_SERVER_TIMESTAMP,
               generation: stateIncrement(1),
             }),
-            buildAutomatchTelegramProjectionOutboxUpdates({
+            ...buildAutomatchTelegramProjectionChanges({
               inviteId: queued.inviteId,
               requestId: projectionTask?.requestId || "",
               timestamp: STATE_SERVER_TIMESTAMP,
@@ -732,7 +706,7 @@ export async function cancelQueuedAutomatch(
         }
         await dependencies.assertMutationAllowed?.();
         patchAttempted = true;
-        await repository.patchStateRoot(updates, signal);
+        await repository.commitSessionChanges(changes, signal);
         return true;
       },
     );
@@ -1041,7 +1015,7 @@ async function persistExistingAutomatchReceipt(
       dependencies.mutationLocks,
       async () => {
         const [queueValue, inviteValue] = await Promise.all([
-          repository.getStatePath(`automatch/${inviteId}`, undefined, signal),
+          repository.readAutomatchEntry(inviteId, signal),
           repository.readInviteMetadata(inviteId, signal),
         ]);
         const queueUid = normalizeString(toRecord(queueValue)?.uid);
@@ -1063,18 +1037,22 @@ async function persistExistingAutomatchReceipt(
         }
         await dependencies.assertMutationAllowed?.();
         patchAttempted = true;
-        await repository.patchStateRoot(
-          {
-            ...buildAutomatchReceiptUpdates(
+        await repository.commitSessionChanges(
+          [
+            ...buildAutomatchReceiptChanges(
               identity.uid,
               request,
               response,
               null,
               false,
             ),
-            [`invites/${inviteId}/automatchOperationIds/${identity.uid}`]:
-              request.operationId,
-          },
+            {
+              kind: "invite-operation",
+              inviteId,
+              loginUid: identity.uid,
+              operationId: request.operationId,
+            },
+          ],
           signal,
         );
       },
@@ -1115,14 +1093,7 @@ async function attemptAutomatch(
   }
 
   const queued = getFirstQueuedAutomatch(
-    await repository.getStatePath(
-      "automatch",
-      {
-        orderBy: "$key",
-        limitToFirst: 1,
-      },
-      signal,
-    ),
+    await repository.readFirstAutomatchEntry(signal),
   );
   let profile = profileOrFallback(requester.profile, request);
   const existingUid = queued ? normalizeString(queued.data.uid) : "";
@@ -1247,61 +1218,77 @@ async function attemptAutomatch(
         async () => {
           await dependencies.assertMutationAllowed?.();
           patchAttempted = true;
-          await repository.patchStateRoot(
-            {
-              [`players/${identity.uid}/matches/${inviteId}`]: match,
-              [`automatch/${inviteId}`]: {
-                uid: identity.uid,
-                rating: profile.rating,
-                timestamp,
-                username: profile.username,
-                ethAddress: profile.eth,
-                solAddress: profile.sol,
-                profileId: profile.profileId,
-                hostColor,
-                password,
-                emojiId,
-                gameVariant: matchSeed.gameVariant,
-                telegramDeliveryVersion: TELEGRAM_AUTOMATCH_VERSION,
+          await repository.commitSessionChanges(
+            [
+              {
+                kind: "match-create",
+                playerId: identity.uid,
+                matchId: inviteId,
+                value: match,
               },
-              [`invites/${inviteId}`]: {
-                version: CONTROLLER_VERSION,
-                hostId: identity.uid,
-                hostColor,
-                guestId: null,
-                password,
-                automatchStateHint: "pending",
-                automatchCanceledAt: null,
-                automatchOperationIds: {
-                  [identity.uid]: request.operationId,
+              {
+                kind: "automatch-entry",
+                inviteId,
+                value: {
+                  uid: identity.uid,
+                  rating: profile.rating,
+                  timestamp,
+                  username: profile.username,
+                  ethAddress: profile.eth,
+                  solAddress: profile.sol,
+                  profileId: profile.profileId,
+                  hostColor,
+                  password,
+                  emojiId,
+                  gameVariant: matchSeed.gameVariant,
+                  telegramDeliveryVersion: TELEGRAM_AUTOMATCH_VERSION,
                 },
-                telegramDeliveryVersion: TELEGRAM_AUTOMATCH_VERSION,
               },
-              [getAutomatchTelegramSourcePath(inviteId)]:
-                buildPendingAutomatchTelegramSource({
+              {
+                kind: "invite-merge",
+                inviteId,
+                value: {
+                  version: CONTROLLER_VERSION,
+                  hostId: identity.uid,
+                  hostColor,
+                  guestId: null,
+                  password,
+                  automatchStateHint: "pending",
+                  automatchCanceledAt: null,
+                  automatchOperationIds: {
+                    [identity.uid]: request.operationId,
+                  },
+                  telegramDeliveryVersion: TELEGRAM_AUTOMATCH_VERSION,
+                },
+              },
+              {
+                kind: "telegram-source",
+                inviteId,
+                value: buildPendingAutomatchTelegramSource({
                   inviteId,
                   waitingText,
                   canceledText,
                   timestamp,
                 }),
-              ...buildAutomatchTelegramProjectionOutboxUpdates({
+              },
+              ...buildAutomatchTelegramProjectionChanges({
                 inviteId,
                 requestId: projectionTask.requestId,
                 timestamp,
               }),
-              ...buildAutomatchProfileGameProjectionOutboxUpdates({
+              ...requestAutomatchProfileProjection({
                 inviteId,
                 requestId: profileGameProjectionTask.requestId,
                 timestamp,
               }),
-              ...buildAutomatchReceiptUpdates(
+              ...buildAutomatchReceiptChanges(
                 identity.uid,
                 request,
                 response,
                 profileGameProjectionTask.requestId,
                 true,
               ),
-            },
+            ],
             signal,
           );
         },
@@ -1393,11 +1380,16 @@ async function attemptAutomatch(
     seed: matchSeed,
   });
   const matchedText = `${existingPlayerName} vs. ${name} https://mons.link/${queued.inviteId}`;
-  const updates: Record<string, unknown> = {
-    [`automatch/${queued.inviteId}`]: null,
-    [`invites/${queued.inviteId}`]: invite,
-    [`players/${identity.uid}/matches/${queued.inviteId}`]: match,
-  };
+  const changes: GameSessionChange[] = [
+    { kind: "automatch-entry", inviteId: queued.inviteId, value: null },
+    { kind: "invite-merge", inviteId: queued.inviteId, value: invite },
+    {
+      kind: "match-create",
+      playerId: identity.uid,
+      matchId: queued.inviteId,
+      value: match,
+    },
+  ];
   const matchedResponse = matchedAutomatchResponse(queued.inviteId);
   const profileGameProjectionTask = createAutomatchProfileGameProjectionTask(
     queued.inviteId,
@@ -1410,36 +1402,32 @@ async function attemptAutomatch(
         profileGameProjectionTask.requestId,
       )
     : null;
-  Object.assign(
-    updates,
-    buildAutomatchProfileGameProjectionOutboxUpdates({
+  changes.push(
+    ...requestAutomatchProfileProjection({
       inviteId: queued.inviteId,
       requestId: profileGameProjectionTask.requestId,
       timestamp: STATE_SERVER_TIMESTAMP,
     }),
   );
   if (usesTelegramDeliveryV2) {
-    Object.assign(
-      updates,
-      buildMatchedAutomatchTelegramUpdates({
+    changes.push(
+      ...buildMatchedAutomatchTelegramChanges({
         inviteId: queued.inviteId,
         matchedText,
         timestamp: STATE_SERVER_TIMESTAMP,
         generation: stateIncrement(1),
       }),
     );
-    Object.assign(
-      updates,
-      buildAutomatchTelegramProjectionOutboxUpdates({
+    changes.push(
+      ...buildAutomatchTelegramProjectionChanges({
         inviteId: queued.inviteId,
         requestId: projectionTask?.requestId || "",
         timestamp: STATE_SERVER_TIMESTAMP,
       }),
     );
   }
-  Object.assign(
-    updates,
-    buildAutomatchReceiptUpdates(
+  changes.push(
+    ...buildAutomatchReceiptChanges(
       identity.uid,
       request,
       matchedResponse,
@@ -1456,11 +1444,7 @@ async function attemptAutomatch(
       dependencies.mutationLocks,
       async () => {
         const [currentQueueValue, currentInviteValue] = await Promise.all([
-          repository.getStatePath(
-            `automatch/${queued.inviteId}`,
-            undefined,
-            signal,
-          ),
+          repository.readAutomatchEntry(queued.inviteId, signal),
           repository.readInviteMetadata(queued.inviteId, signal),
         ]);
         const currentInvite = toRecord(currentInviteValue);
@@ -1471,7 +1455,12 @@ async function attemptAutomatch(
         ) {
           return "stale" as const;
         }
-        updates[`invites/${queued.inviteId}`] = {
+        const inviteChange = changes.find(
+          (change) => change.kind === "invite-merge",
+        );
+        if (!inviteChange || inviteChange.kind !== "invite-merge")
+          throw new Error("automatch-invite-change-missing");
+        inviteChange.value = {
           ...invite,
           automatchOperationIds: {
             ...readAutomatchOperationIds(currentInvite?.automatchOperationIds),
@@ -1480,7 +1469,7 @@ async function attemptAutomatch(
         };
         await dependencies.assertMutationAllowed?.();
         patchAttempted = true;
-        await repository.patchStateRoot(updates, signal);
+        await repository.commitSessionChanges(changes, signal);
         return "matched" as const;
       },
     );

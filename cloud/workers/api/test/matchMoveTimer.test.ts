@@ -5,7 +5,7 @@ import type {
   SubmitMoveResponse,
 } from "@mons/shared/game-sessions";
 import { AuthApiFailure } from "../src/authErrors.ts";
-import { StateRepositoryFailure } from "../src/stateRepositoryTypes.ts";
+import { StateRepositoryFailure } from "../test/stateRepositoryTestTypes.ts";
 import { submitMove } from "../src/matchMove.ts";
 
 const request: SubmitMoveRequest = {

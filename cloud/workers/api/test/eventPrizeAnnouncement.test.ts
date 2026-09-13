@@ -1,3 +1,4 @@
+import type { EventLeaseRecord } from "../../../runtime/eventLeases.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildEventPrizeAnnouncement } from "../../../runtime/telegram/eventPrizeAnnouncement.js";
@@ -120,8 +121,9 @@ function fixture(input = INPUT) {
     controlsEnabled: async () => true,
     eventRepository: {
       readEvent: async () => eventData,
-      transactStatePath: async (path, updater) => {
-        const current = locks.get(path) ?? null;
+      transactEventLease: async (key, updater) => {
+        const path = `eventLocks/${key.id}`;
+        const current = (locks.get(path) ?? null) as EventLeaseRecord | null;
         const result = updater(current) as {
           commit?: false;
           decision?: string;
@@ -139,7 +141,7 @@ function fixture(input = INPUT) {
         return {
           committed: true,
           decision: result.decision,
-          value: result.value,
+          value: result.value as EventLeaseRecord | null,
         };
       },
     },

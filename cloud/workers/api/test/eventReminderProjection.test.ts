@@ -1,6 +1,7 @@
+import { encodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createTelegramRepository } from "../../../runtime/telegram/repositoryCore.js";
+import { telegramRepositoryFixture } from "./telegramRepositoryFixture.ts";
 import { buildSundayMonsReminder } from "../../../runtime/telegram/sundayMonsReminder.js";
 import {
   adoptSundayMonsReminderMessage,
@@ -49,7 +50,7 @@ function sentReceipt(
 function telegramStore(initial: unknown = null) {
   let message = initial;
   let transactions = 0;
-  const telegram = createTelegramRepository({
+  const telegram = telegramRepositoryFixture({
     getPath: async () => message,
     transactPath: async (path, updater) => {
       assert.equal(path, `telegramMessages/${MESSAGE_KEY}`);
@@ -84,7 +85,8 @@ function fixture() {
         assert.equal(eventId, EVENT_ID);
         return eventData;
       },
-      patchStateRoot: async (updates) => void writes.push(updates),
+      commitEventPlan: async (plan) =>
+        void writes.push(encodeEventUpdates(plan)),
     },
     announcementRepository: {
       get: async (requestId) => {
@@ -307,7 +309,7 @@ test("disabled controls and failed marker persistence retry without dispatching"
   await assert.rejects(state.refresh(), /writes-disabled/);
   assert.equal(state.writes.length, 0);
   state.dependencies.controlsEnabled = async () => true;
-  state.dependencies.eventRepository!.patchStateRoot = async () => {
+  state.dependencies.eventRepository!.commitEventPlan = async () => {
     throw new Error("persist-failed");
   };
   await assert.rejects(state.refresh(), /persist-failed/);

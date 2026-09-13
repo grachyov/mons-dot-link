@@ -334,7 +334,7 @@ const createProfileGamesProjectionCore = ({
     const nowMs = readEventTimestampMs(options);
     const [inviteData, automatchData] = await Promise.all([
       retry(() => repository.readInviteMetadata(normalizedInviteId)),
-      retry(() => repository.getStatePath(`automatch/${normalizedInviteId}`)),
+      retry(() => repository.readAutomatchEntry(normalizedInviteId)),
     ]);
     const hostLoginId = normalizeString(inviteData && inviteData.hostId);
     const guestLoginId = normalizeString(inviteData && inviteData.guestId);

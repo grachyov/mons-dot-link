@@ -1,9 +1,14 @@
 import type { EventOwnershipSnapshot } from "./ownership.js";
 
-import type { EventStateRepository } from "../stateRepository.js";
+import type { EventRuntimeStore, EventCommitPlan } from "../eventCommands.js";
 
 export type EventBracketRuntime = {
-  addEventPrizeAssignmentUpdates(input: Record<string, unknown>): Promise<void>;
+  addEventPrizeAssignmentUpdates(input: {
+    updates: EventCommitPlan;
+    eventId: string;
+    assignments: Record<string, unknown>;
+    includeEventAssignments: boolean;
+  }): Promise<void>;
   applyMatchResolution(
     matchRecord: Record<string, unknown>,
     resolved: Record<string, unknown>,
@@ -11,7 +16,7 @@ export type EventBracketRuntime = {
   ): boolean;
   buildScheduledEventDueUpdates(input: Record<string, unknown>): Promise<{
     didChange: boolean;
-    updates: Record<string, unknown>;
+    updates: EventCommitPlan;
   }>;
   getSortedRoundIndexes(rounds: unknown): number[];
   hasThirdPlaceMatchField(event: unknown): boolean;
@@ -60,16 +65,13 @@ export type EventBracketRuntime = {
 };
 
 export function createEventBracketRuntime(dependencies: {
-  readMatchPair?: (input: {
+  readMatchPair: (input: {
     inviteId: string;
     matchId: string;
     playerId: string;
     opponentId: string;
   }) => Promise<[unknown, unknown]>;
-  state: EventStateRepository;
-  batchReadWithRetry?: (
-    readers: Array<() => Promise<unknown>>,
-  ) => Promise<unknown[]>;
+  state: Pick<EventRuntimeStore, "transactProfileEventPrize">;
   buildRandomGameSeed?: (random?: () => number) => Promise<unknown>;
   resolveMatchWinner?: (
     match: unknown,

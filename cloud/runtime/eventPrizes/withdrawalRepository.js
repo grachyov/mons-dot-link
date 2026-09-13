@@ -2,7 +2,6 @@
 
 const crypto = require("node:crypto");
 const { EventPrizeWithdrawalError: HttpsError } = require("./errors");
-const { runStateDecisionTransaction } = require("../stateDecisionTransaction");
 const {
   decideWithdrawalClaim,
   isWithdrawalRecordForPrize,
@@ -42,7 +41,10 @@ const acquireWithdrawalClaim = async ({
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const result = await withdrawalRecord.transaction((current) => {
       const decision = decide(current);
-      return decision.kind === "acquired" ? decision.value : (current ?? null);
+      return {
+        value:
+          decision.kind === "acquired" ? decision.value : (current ?? null),
+      };
     });
     const withdrawal = result.value;
     if (
@@ -95,9 +97,9 @@ const releaseProcessingClaim = async ({ withdrawalRecord, leaseId }) => {
       current?.status === "processing" &&
       normalizeString(current.leaseId) === leaseId
     ) {
-      return null;
+      return { value: null };
     }
-    return current ?? null;
+    return { value: current ?? null };
   });
 };
 
@@ -112,15 +114,17 @@ const markWithdrawalBlocked = async ({
       current.status === "completed" ||
       normalizeString(current.leaseId) !== leaseId
     ) {
-      return current ?? null;
+      return { value: current ?? null };
     }
     return {
-      ...current,
-      status: "blocked",
-      observedOwner,
-      updatedAtMs: Date.now(),
-      leaseId: null,
-      leaseExpiresAtMs: null,
+      value: {
+        ...current,
+        status: "blocked",
+        observedOwner,
+        updatedAtMs: Date.now(),
+        leaseId: null,
+        leaseExpiresAtMs: null,
+      },
     };
   });
 };
@@ -139,20 +143,22 @@ const persistSubmittedTransaction = async ({
       current.status === "completed" ||
       normalizeString(current.leaseId) !== leaseId
     ) {
-      return current ?? null;
+      return { value: current ?? null };
     }
     return {
-      ...current,
-      status: "submitted",
-      transactionSignature,
-      signedTransactionBase64,
-      blockhash,
-      lastValidBlockHeight,
-      submittedAtMs:
-        Number.isFinite(current.submittedAtMs) && current.submittedAtMs > 0
-          ? Math.floor(current.submittedAtMs)
-          : Date.now(),
-      updatedAtMs: Date.now(),
+      value: {
+        ...current,
+        status: "submitted",
+        transactionSignature,
+        signedTransactionBase64,
+        blockhash,
+        lastValidBlockHeight,
+        submittedAtMs:
+          Number.isFinite(current.submittedAtMs) && current.submittedAtMs > 0
+            ? Math.floor(current.submittedAtMs)
+            : Date.now(),
+        updatedAtMs: Date.now(),
+      },
     };
   });
   const persisted = result.value;
@@ -179,14 +185,12 @@ const discardDefinitiveSubmittedTransaction = async ({
   leaseId,
   transactionSignature,
 }) => {
-  const result = await runStateDecisionTransaction(
-    withdrawalRecord,
-    (current) =>
-      current?.status === "submitted" &&
-      normalizeString(current.leaseId) === leaseId &&
-      normalizeString(current.transactionSignature) === transactionSignature
-        ? { value: null, decision: "discarded" }
-        : { commit: false, decision: "stale" },
+  const result = await withdrawalRecord.transaction((current) =>
+    current?.status === "submitted" &&
+    normalizeString(current.leaseId) === leaseId &&
+    normalizeString(current.transactionSignature) === transactionSignature
+      ? { value: null, decision: "discarded" }
+      : { commit: false, decision: "stale" },
   );
   if (
     !result.committed ||

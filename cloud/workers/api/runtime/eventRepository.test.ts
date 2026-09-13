@@ -1,3 +1,11 @@
+import { captureLoginMatchDiscovery } from "../src/loginMatchDiscoveryD1.ts";
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import {
+  eventMatchTestPort,
+  readEventRepositoryFixture,
+  transactEventRepositoryFixture,
+} from "./eventRepositoryFixture.ts";
+import { readEventOwnedPath } from "./eventD1Fixture.ts";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { resetMatchPresentationTestState } from "./matchPresentationTestFixture.ts";
@@ -11,7 +19,6 @@ import {
   acquireEventWriteAdmission,
   createEventTransitionIntent,
   listPendingEventTransitionIntents,
-  readEventOwnedPath,
   readEventSnapshot,
   releaseEventWriteAdmission,
   type EventTransitionIntent,
@@ -32,7 +39,7 @@ import {
   resetEventReceiptTestState,
 } from "./eventTransitionTestFixture.ts";
 import { processEventProfileGameProjection } from "../src/profileGameProjection.ts";
-import { buildEventProfileGameProjectionOutboxUpdates } from "../src/profileGameProjectionOutbox.ts";
+import { buildEventProfileGameProjectionOutboxUpdates } from "../test/legacyProjectionOutboxFixture.ts";
 import { sweepEventTelegramProjections } from "../src/eventTelegramProjection.ts";
 import type { TelegramProjectionTask } from "../src/telegramProjectionTasks.ts";
 
@@ -82,7 +89,7 @@ async function withD1Admission<T>(
   }
 }
 
-describe("hybrid event repository", () => {
+describe("typed event repository", () => {
   beforeAll(async () => {
     await applyStrictMatchStateTestMigrations(
       testEnv.PROFILE_GAMES_DB,
@@ -115,6 +122,24 @@ describe("hybrid event repository", () => {
          activated_at_ms = 2 WHERE singleton = 1`,
       ),
     ]);
+    await captureLoginMatchDiscovery(
+      testEnv.PROFILE_GAMES_DB,
+      [
+        "event-match",
+        "serialized-transition",
+        "a-stale-transition",
+        "b-stale-transition",
+        "conflicting-receipt",
+        "a-failing-transition",
+        "b-working-transition",
+        "admitted-recovery",
+      ].map((matchId) => ({
+        loginUid: "login-one",
+        matchId,
+        inviteId: matchId,
+      })),
+      100,
+    );
     await resetEventReceiptTestState(
       testEnv.PROFILE_GAMES_DB,
       testEnv.TEST_D1_MIGRATIONS,
@@ -132,6 +157,50 @@ describe("hybrid event repository", () => {
     ]);
   });
 
+  it("retains malformed canonical intents without applying their effect entries", async () => {
+    const fixture = eventTransitionFixture(testEnv);
+    await fixture.client.commitEventPlan([
+      { kind: "event", eventId, value: eventRecord() },
+    ]);
+    const before = await readEventSnapshot(testEnv.EVENT_DB, eventId);
+    const canonicalUpdates = {
+      [`events/${eventId}/status`]: "active",
+      "players/host/matches/poison/timer": "gg",
+    };
+    const intent = await createPendingIntent({
+      schemaVersion: 1,
+      transitionId: "malformed-canonical-effect",
+      eventId,
+      expectedRevision: before.revision,
+      canonicalUpdates,
+      rtdbEffects: {},
+      createdAtMs: 200,
+      updatedAtMs: 200,
+    });
+    await expect(fixture.recover()).rejects.toThrow(
+      "event-transition-recovery-failed",
+    );
+    expect(await readEventSnapshot(testEnv.EVENT_DB, eventId)).toEqual(before);
+    expect(fixture.writes).toEqual([]);
+    expect(
+      await readEventTransitionReceipt(
+        testEnv.PROFILE_GAMES_DB,
+        intent.transitionId,
+      ),
+    ).toBeNull();
+    expect(
+      await testEnv.PROFILE_GAMES_DB.prepare(
+        "SELECT COUNT(*) AS count FROM invite_event_effect_receipts WHERE transition_id = ?",
+      )
+        .bind(intent.transitionId)
+        .first<number>("count"),
+    ).toBe(0);
+    const pending = await listPendingEventTransitionIntents(testEnv.EVENT_DB);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].canonicalUpdates).toEqual(canonicalUpdates);
+    expect(pending[0].transitionId).toBe(intent.transitionId);
+  });
+
   it("does not let admission release failures override D1 write outcomes", async () => {
     const effects: Record<string, unknown>[] = [];
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -143,27 +212,37 @@ describe("hybrid event repository", () => {
        END`,
     ).run();
     try {
-      const client = createEventStateRepository(testEnv, {
-        getPath: async () => null,
-        patchRoot: async (updates) => {
-          effects.push(updates);
-        },
-        transactPath: async () => ({ committed: false, value: null }),
-      });
-      const update = { [`events/${eventId}`]: eventRecord() };
-      await expect(client.patchRoot(update)).resolves.toBeUndefined();
-      expect(effects).toEqual([]);
-      const failedClient = createEventStateRepository(testEnv, {
-        getPath: async () => null,
-        patchRoot: async () => {
-          throw new Error("state-write-failed");
-        },
-        transactPath: async () => ({ committed: false, value: null }),
-      });
-      await expect(
-        failedClient.patchRoot({
-          [`events/${eventId}`]: { ...eventRecord(), status: "invalid" },
+      const client = createEventStateRepository(
+        testEnv,
+        eventMatchTestPort({
+          getPath: async () => null,
+          patchRoot: async (updates) => {
+            effects.push(updates);
+          },
+          transactPath: async () => ({ committed: false, value: null }),
         }),
+      );
+      const update = { [`events/${eventId}`]: eventRecord() };
+      await expect(
+        client.commitEventPlan(decodeEventUpdates(update)),
+      ).resolves.toBeUndefined();
+      expect(effects).toEqual([]);
+      const failedClient = createEventStateRepository(
+        testEnv,
+        eventMatchTestPort({
+          getPath: async () => null,
+          patchRoot: async () => {
+            throw new Error("state-write-failed");
+          },
+          transactPath: async () => ({ committed: false, value: null }),
+        }),
+      );
+      await expect(
+        failedClient.commitEventPlan(
+          decodeEventUpdates({
+            [`events/${eventId}`]: { ...eventRecord(), status: "invalid" },
+          }),
+        ),
       ).rejects.toThrow("invalid-event-record");
       expect(
         await testEnv.EVENT_DB.prepare(
@@ -203,32 +282,37 @@ describe("hybrid event repository", () => {
 
   it("publishes event projection metadata without a legacy mirror", async () => {
     const effects: Record<string, unknown>[] = [];
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async (updates) => {
-        effects.push(updates);
-      },
-      transactPath: async () => ({ committed: false, value: null }),
-    });
-    await client.patchRoot({
-      [`events/${eventId}`]: eventRecord(),
-      ...buildEventProfileGameProjectionOutboxUpdates({
-        cleanupOwnerProfileIds: [],
-        eventId,
-        requestId: "profile-request",
-        timestamp: 100,
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async (updates) => {
+          effects.push(updates);
+        },
+        transactPath: async () => ({ committed: false, value: null }),
       }),
-      [`telegramProjectionOutbox/event/${eventId}`]: {
-        schemaVersion: 1,
-        status: "pending",
-        requestId: "telegram-request",
-        firstQueuedAtMs: 100,
-        updatedAtMs: 100,
-      },
-      [`eventTelegramProjectionGenerations/${eventId}`]: {
-        ".sv": { increment: 1 },
-      },
-    });
+    );
+    await client.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}`]: eventRecord(),
+        ...buildEventProfileGameProjectionOutboxUpdates({
+          cleanupOwnerProfileIds: [],
+          eventId,
+          requestId: "profile-request",
+          timestamp: 100,
+        }),
+        [`telegramProjectionOutbox/event/${eventId}`]: {
+          schemaVersion: 1,
+          status: "pending",
+          requestId: "telegram-request",
+          firstQueuedAtMs: 100,
+          updatedAtMs: 100,
+        },
+        [`eventTelegramProjectionGenerations/${eventId}`]: {
+          ".sv": { increment: 1 },
+        },
+      }),
+    );
     expect(effects).toEqual([]);
     expect(await readEventSnapshot(testEnv.EVENT_DB, eventId)).toMatchObject({
       event: { status: "scheduled" },
@@ -271,11 +355,14 @@ describe("hybrid event repository", () => {
     "lists raw due $kind outboxes through both event repositories",
     async ({ kind, method, path, table }) => {
       const getPath = vi.fn(async () => null);
-      const client = createEventStateRepository(testEnv, {
-        getPath,
-        patchRoot: async () => undefined,
-        transactPath: async () => ({ committed: false, value: null }),
-      });
+      const client = createEventStateRepository(
+        testEnv,
+        eventMatchTestPort({
+          getPath,
+          patchRoot: async () => undefined,
+          transactPath: async () => ({ committed: false, value: null }),
+        }),
+      );
       const rows = [
         { id: "NN3eRzoZo80", timestamp: 200 },
         { id: "VOxalSrexcA", timestamp: 100 },
@@ -311,12 +398,14 @@ describe("hybrid event repository", () => {
                   updatedAtMs: timestamp,
                 },
       }));
-      await client.patchRoot(
-        Object.fromEntries(
-          rows.flatMap(({ id, record }) => [
-            [`events/${id}`, eventRecord("scheduled", id)],
-            [`${path}/${id}`, record],
-          ]),
+      await client.commitEventPlan(
+        decodeEventUpdates(
+          Object.fromEntries(
+            rows.flatMap(({ id, record }) => [
+              [`events/${id}`, eventRecord("scheduled", id)],
+              [`${path}/${id}`, record],
+            ]),
+          ),
         ),
       );
       const malformed = { status: "pending", unrecognized: "raw-record" };
@@ -357,22 +446,28 @@ describe("hybrid event repository", () => {
 
   it("rejects legacy outbox collection queries without base fallback", async () => {
     const getPath = vi.fn(async () => null);
-    const client = createEventStateRepository(testEnv, {
-      getPath,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
     for (const path of [
       "eventProgressOutbox",
       "profileGameProjectionOutbox/event",
       "telegramProjectionOutbox/event",
     ]) {
       await expect(
-        client.getPath(path, { endAt: 200, limitToFirst: 100 }),
+        readEventRepositoryFixture(client, path, {
+          endAt: 200,
+          limitToFirst: 100,
+        }),
       ).rejects.toThrow("event-d1-query-unsupported");
     }
     await expect(
-      client.getPath("profileGameProjectionOutbox/event", {
+      readEventRepositoryFixture(client, "profileGameProjectionOutbox/event", {
         orderBy: "lastQueuedAtMs",
         startAt: "",
         limitToFirst: 100,
@@ -382,21 +477,26 @@ describe("hybrid event repository", () => {
   });
 
   it("quarantines malformed Telegram outboxes in D1 mode", async () => {
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
-    await client.patchRoot({
-      [`events/${eventId}`]: eventRecord(),
-      [`telegramProjectionOutbox/event/${eventId}`]: {
-        schemaVersion: 1,
-        status: "pending",
-        requestId: "request-one",
-        firstQueuedAtMs: 100,
-        updatedAtMs: 100,
-      },
-    });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
+    await client.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}`]: eventRecord(),
+        [`telegramProjectionOutbox/event/${eventId}`]: {
+          schemaVersion: 1,
+          status: "pending",
+          requestId: "request-one",
+          firstQueuedAtMs: 100,
+          updatedAtMs: 100,
+        },
+      }),
+    );
     const malformed = { status: "pending", updatedAtMs: 100 };
     await testEnv.EVENT_DB.prepare(
       `UPDATE event_telegram_projection_outboxes
@@ -447,11 +547,14 @@ describe("hybrid event repository", () => {
   });
 
   it("pages mixed-case profile prize IDs in binary cursor order", async () => {
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
     const profileId = "source-profile";
     const assignments = [
       ["NN3eRzoZo80", "1092"],
@@ -460,24 +563,26 @@ describe("hybrid event repository", () => {
       ["oXAceF6anag", "281"],
       ["RpPjMNyrJJa", "217"],
     ] as const;
-    await client.patchRoot(
-      Object.fromEntries(
-        assignments.flatMap(([assignmentEventId, prizeId]) => [
-          [
-            `events/${assignmentEventId}`,
-            eventRecord("scheduled", assignmentEventId),
-          ],
-          [
-            `profileEventPrizes/${profileId}/${assignmentEventId}`,
-            {
-              eventId: assignmentEventId,
-              profileId,
-              place: 1,
-              prizeId,
-              assignedAtMs: 100,
-            },
-          ],
-        ]),
+    await client.commitEventPlan(
+      decodeEventUpdates(
+        Object.fromEntries(
+          assignments.flatMap(([assignmentEventId, prizeId]) => [
+            [
+              `events/${assignmentEventId}`,
+              eventRecord("scheduled", assignmentEventId),
+            ],
+            [
+              `profileEventPrizes/${profileId}/${assignmentEventId}`,
+              {
+                eventId: assignmentEventId,
+                profileId,
+                place: 1,
+                prizeId,
+                assignedAtMs: 100,
+              },
+            ],
+          ]),
+        ),
       ),
     );
     const binaryOrder = assignments
@@ -514,11 +619,14 @@ describe("hybrid event repository", () => {
     const genericRead = vi.fn(async () => {
       throw new Error("typed-event-read-must-not-use-generic-backend");
     });
-    const client = createEventStateRepository(testEnv, {
-      getPath: genericRead,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: genericRead,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
     const profileId = "profile-one";
     const assignment = {
       profileId,
@@ -527,11 +635,13 @@ describe("hybrid event repository", () => {
       prizeId: "1092",
       assignedAtMs: 100,
     };
-    await client.patchRoot({
-      [`events/${eventId}`]: eventRecord(),
-      [`eventPrizeSelections/${eventId}/${profileId}`]: "1092",
-      [`profileEventPrizes/${profileId}/${eventId}`]: assignment,
-    });
+    await client.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}`]: eventRecord(),
+        [`eventPrizeSelections/${eventId}/${profileId}`]: "1092",
+        [`profileEventPrizes/${profileId}/${eventId}`]: assignment,
+      }),
+    );
     await expect(client.readEvent(eventId)).resolves.toEqual(eventRecord());
     await expect(client.readEventPrizeSelections(eventId)).resolves.toEqual({
       [profileId]: "1092",
@@ -567,7 +677,9 @@ describe("hybrid event repository", () => {
   it("replays a stored v2 intent with unchanged serialized effect keys and digest", async () => {
     const f = eventTransitionFixture(testEnv);
     const timerPath = "players/login-one/matches/event-match/timer";
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const pending = await createPendingIntent({
       schemaVersion: 1,
       transitionId: "compatibility-transition",
@@ -619,13 +731,17 @@ describe("hybrid event repository", () => {
       f.hooks.beforePatch = undefined;
       throw new Error("state-offline");
     };
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const update = {
       [`events/${eventId}/status`]: "active",
       [`events/${eventId}/updatedAtMs`]: 200,
       [timerPath]: "gg",
     };
-    await expect(f.client.patchRoot(update)).rejects.toThrow("state-offline");
+    await expect(
+      f.client.commitEventPlan(decodeEventUpdates(update)),
+    ).rejects.toThrow("state-offline");
     expect(
       await testEnv.EVENT_DB.prepare(
         "SELECT COUNT(*) AS count FROM event_write_admissions",
@@ -638,9 +754,11 @@ describe("hybrid event repository", () => {
     const [pending] = await listPendingEventTransitionIntents(testEnv.EVENT_DB);
     expect(pending.schemaVersion).toBe(2);
     await expect(
-      f.client.patchRoot({ [`events/${eventId}/updatedAtMs`]: 150 }),
+      f.client.commitEventPlan(
+        decodeEventUpdates({ [`events/${eventId}/updatedAtMs`]: 150 }),
+      ),
     ).rejects.toThrow("event-transition-pending");
-    await f.client.patchRoot(update);
+    await f.client.commitEventPlan(decodeEventUpdates(update));
     expect(f.patches).toEqual([{ [timerPath]: "gg" }, { [timerPath]: "gg" }]);
     expect(
       await readEventTransitionReceipt(
@@ -665,24 +783,28 @@ describe("hybrid event repository", () => {
       f.hooks.afterTransaction = undefined;
       throw new Error("ambiguous-state-commit");
     };
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     await expect(
-      f.client.patchRoot({
-        [`events/${eventId}/status`]: "active",
-        [`events/${eventId}/updatedAtMs`]: 200,
-        "invites/event-match": {
-          eventId,
-          eventOwned: true,
-          hostId: "login-one",
-          guestId: "login-two",
-        },
-        [matchPath]: { fen: "initial", flatMovesString: "", color: "white" },
-        "players/login-two/matches/event-match": {
-          fen: "initial",
-          flatMovesString: "",
-          color: "black",
-        },
-      }),
+      f.client.commitEventPlan(
+        decodeEventUpdates({
+          [`events/${eventId}/status`]: "active",
+          [`events/${eventId}/updatedAtMs`]: 200,
+          "invites/event-match": {
+            eventId,
+            eventOwned: true,
+            hostId: "login-one",
+            guestId: "login-two",
+          },
+          [matchPath]: { fen: "initial", flatMovesString: "", color: "white" },
+          "players/login-two/matches/event-match": {
+            fen: "initial",
+            flatMovesString: "",
+            color: "black",
+          },
+        }),
+      ),
     ).rejects.toThrow("ambiguous-state-commit");
     const stored = f.values.get(matchPath) as Record<string, unknown>;
     const advanced = {
@@ -714,16 +836,18 @@ describe("hybrid event repository", () => {
       markEffectsStarted();
       await gate;
     };
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const update = {
       [`events/${eventId}/status`]: "active",
       "players/login-one/matches/serialized-transition/timer": "gg",
     };
-    const first = f.client.patchRoot(update);
+    const first = f.client.commitEventPlan(decodeEventUpdates(update));
     await started;
-    await expect(f.client.patchRoot(update)).rejects.toThrow(
-      "event-transition-application-busy",
-    );
+    await expect(
+      f.client.commitEventPlan(decodeEventUpdates(update)),
+    ).rejects.toThrow("event-transition-application-busy");
     continueEffects();
     await expect(first).resolves.toBeUndefined();
     expect(f.patches).toHaveLength(1);
@@ -736,9 +860,11 @@ describe("hybrid event repository", () => {
       ["a-stale-transition", eventId],
       ["b-stale-transition", otherEventId],
     ] as const) {
-      await f.client.patchRoot({
-        [`events/${targetEventId}`]: eventRecord("scheduled", targetEventId),
-      });
+      await f.client.commitEventPlan(
+        decodeEventUpdates({
+          [`events/${targetEventId}`]: eventRecord("scheduled", targetEventId),
+        }),
+      );
       await createPendingIntent({
         schemaVersion: 1,
         transitionId,
@@ -785,7 +911,9 @@ describe("hybrid event repository", () => {
 
   it("fails closed on a conflicting D1 transition receipt", async () => {
     const f = eventTransitionFixture(testEnv);
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const intent = await createPendingIntent({
       schemaVersion: 1,
       transitionId: "conflicting-receipt",
@@ -828,9 +956,11 @@ describe("hybrid event repository", () => {
       ["a-failing-transition", eventId],
       ["b-working-transition", otherEventId],
     ] as const) {
-      await f.client.patchRoot({
-        [`events/${targetEventId}`]: eventRecord("scheduled", targetEventId),
-      });
+      await f.client.commitEventPlan(
+        decodeEventUpdates({
+          [`events/${targetEventId}`]: eventRecord("scheduled", targetEventId),
+        }),
+      );
       await createPendingIntent({
         schemaVersion: 1,
         transitionId,
@@ -879,7 +1009,9 @@ describe("hybrid event repository", () => {
       }),
     ]);
     await expect(
-      f.client.patchRoot({ [`events/${eventId}/updatedAtMs`]: 300 }),
+      f.client.commitEventPlan(
+        decodeEventUpdates({ [`events/${eventId}/updatedAtMs`]: 300 }),
+      ),
     ).rejects.toThrow("event-transition-pending");
     expect(await readEventSnapshot(testEnv.EVENT_DB, eventId)).toMatchObject({
       event: { status: "scheduled" },
@@ -889,7 +1021,9 @@ describe("hybrid event repository", () => {
 
   it("holds a durable admission while replaying match effects", async () => {
     const f = eventTransitionFixture(testEnv);
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     await createPendingIntent({
       schemaVersion: 1,
       transitionId: "admitted-recovery",
@@ -939,7 +1073,12 @@ describe("hybrid event repository", () => {
 
   it("publishes mixed progress outboxes and timer effects with a D1 receipt", async () => {
     const f = eventTransitionFixture(testEnv);
-    await f.client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    await testEnv.PROFILE_GAMES_DB.prepare(
+      "INSERT INTO match_timer_starts(player_id,match_id,timer,turn_number,updated_at_ms) VALUES ('match-one','login-one','timer',0,100)",
+    ).run();
+    await f.client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const outbox = {
       schemaVersion: 1,
       eventId,
@@ -949,13 +1088,18 @@ describe("hybrid event repository", () => {
       firstQueuedAtMs: 100,
       lastQueuedAtMs: 100,
     };
-    await f.client.patchRoot({
-      "eventProgressOutbox/progress-mixed": outbox,
-      "matchTimerStarts/login-one/match-one": null,
-    });
-    expect(f.patches).toEqual([
-      { "matchTimerStarts/login-one/match-one": null },
-    ]);
+    await f.client.commitEventPlan(
+      decodeEventUpdates({
+        "eventProgressOutbox/progress-mixed": outbox,
+        "matchTimerStarts/login-one/match-one": null,
+      }),
+    );
+    expect(f.patches).toEqual([]);
+    expect(
+      await testEnv.PROFILE_GAMES_DB.prepare(
+        "SELECT COUNT(*) AS count FROM match_timer_starts WHERE player_id='match-one' AND match_id='login-one'",
+      ).first<number>("count"),
+    ).toBe(0);
     const row = await testEnv.PROFILE_GAMES_DB.prepare(
       "SELECT receipt_json FROM event_transition_receipts",
     ).first<string>("receipt_json");
@@ -972,53 +1116,59 @@ describe("hybrid event repository", () => {
     ).toEqual(outbox);
   });
 
-  it("never delegates retained Firebase receipt paths for reads or mutations", async () => {
-    const getPath = vi.fn(async () => null);
-    const patchRoot = vi.fn(async () => undefined);
-    const transactPath = vi.fn(async () => ({ committed: false, value: null }));
-    const client = createEventStateRepository(testEnv, {
-      getPath,
-      patchRoot,
-      transactPath,
-    });
+  it("has no generic state methods and rejects receipt paths in the compatibility codec", () => {
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => {
+          throw new Error("unexpected-write");
+        },
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
+    expect("getPath" in client).toBe(false);
+    expect("patchRoot" in client).toBe(false);
+    expect("transactPath" in client).toBe(false);
     for (const path of [
       "eventTransitionReceipts",
       "/eventTransitionReceipts/receipt/expectedRevision/",
     ]) {
-      await expect(client.getPath(path)).rejects.toThrow(
-        "event-transition-receipt-path-reserved",
+      expect(() => decodeEventUpdates({ [path]: null })).toThrow(
+        path.startsWith("/") ? "invalid-event-path" : "unsupported-event-path",
       );
-      await expect(client.patchRoot({ [path]: null })).rejects.toThrow(
-        "event-transition-receipt-path-reserved",
+      expect(() =>
+        decodeEventUpdates({
+          [`events/${eventId}`]: eventRecord(),
+          [path]: {},
+        }),
+      ).toThrow(
+        path.startsWith("/") ? "invalid-event-path" : "unsupported-event-path",
       );
-      await expect(
-        client.patchRoot({ [`events/${eventId}`]: eventRecord(), [path]: {} }),
-      ).rejects.toThrow("event-transition-receipt-path-reserved");
-      await expect(
-        client.transactPath(path, () => ({ value: {} })),
-      ).rejects.toThrow("event-transition-receipt-path-reserved");
     }
-    expect(getPath).not.toHaveBeenCalled();
-    expect(patchRoot).not.toHaveBeenCalled();
-    expect(transactPath).not.toHaveBeenCalled();
   });
 
   it("processes event profile-game projections with the shared lease schema", async () => {
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
-    await client.patchRoot({
-      [`events/${eventId}`]: eventRecord(),
-      [`profileGameProjectionOutbox/event/${eventId}`]: {
-        schemaVersion: 1,
-        status: "pending",
-        requestId: "profile-request",
-        lastQueuedAtMs: 100,
-        cleanupOwnerProfileIds: {},
-      },
-    });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
+    await client.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}`]: eventRecord(),
+        [`profileGameProjectionOutbox/event/${eventId}`]: {
+          schemaVersion: 1,
+          status: "pending",
+          requestId: "profile-request",
+          lastQueuedAtMs: 100,
+          cleanupOwnerProfileIds: {},
+        },
+      }),
+    );
     await expect(
       client.listDueEventProfileGameProjectionOutboxes(100, 100),
     ).resolves.toEqual([
@@ -1041,11 +1191,11 @@ describe("hybrid event repository", () => {
           requestId: "profile-request",
         },
         {
-          getStatePath: client.getPath,
-          readInviteMetadata: async () => {
-            throw new Error("unexpected-invite-metadata-read");
-          },
-          transactStatePath: client.transactPath,
+          readEventProfileGameProjectionOutbox:
+            client.readEventProfileGameProjectionOutbox,
+          transactEventProfileGameProjectionOutbox:
+            client.transactEventProfileGameProjectionOutbox,
+          transactEventLease: client.transactEventLease,
         },
         {
           reconcileEventProjection: async () => ({
@@ -1068,11 +1218,14 @@ describe("hybrid event repository", () => {
   });
 
   it("stores domain and projection locks in namespaced D1 leases", async () => {
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
     const lock = {
       lockId: "lock-one",
       ownerUid: "owner-one",
@@ -1081,12 +1234,18 @@ describe("hybrid event repository", () => {
       expiresAtMs: 30_100,
     };
     await expect(
-      client.transactPath(`eventLocks/${eventId}`, () => ({ value: lock })),
+      transactEventRepositoryFixture(client, `eventLocks/${eventId}`, () => ({
+        value: lock,
+      })),
     ).resolves.toMatchObject({ committed: true, value: lock });
     await expect(
-      client.transactPath(`eventTelegramProjectionLocks/${eventId}`, () => ({
-        value: { ...lock, lockId: "telegram-lock" },
-      })),
+      transactEventRepositoryFixture(
+        client,
+        `eventTelegramProjectionLocks/${eventId}`,
+        () => ({
+          value: { ...lock, lockId: "telegram-lock" },
+        }),
+      ),
     ).resolves.toMatchObject({ committed: true });
     expect(
       await readEventOwnedPath(testEnv.EVENT_DB, `eventLocks/${eventId}`),
@@ -1099,43 +1258,30 @@ describe("hybrid event repository", () => {
     ).toMatchObject({ lockId: "telegram-lock" });
   });
 
-  it("restricts the D1 auth recovery store to prize reads and event leases", async () => {
+  it("restricts auth recovery capability to typed prize reads, guarded copies and event leases", async () => {
     const store = createD1AuthRecoveryPrizeStore(testEnv.EVENT_DB);
-    const unsupportedPaths = [
-      "players/login/matches/match",
-      `events/${eventId}`,
-      "profileEventPrizes",
-      `profileEventPrizes/profile-one/${eventId}/prizeId`,
-    ];
-    for (const path of unsupportedPaths) {
-      await expect(store.getPath(path)).rejects.toThrow(
-        "auth-recovery-prize-path-unsupported",
-      );
+    expect(Object.keys(store).sort()).toEqual([
+      "listProfileEventPrizeAssignments",
+      "readProfileEventPrizeAssignment",
+      "transactEventLease",
+      "transactStoredProfileEventPrizeWithEventLease",
+    ]);
+    for (const kind of [
+      "telegram-projection",
+      "profile-game-projection",
+      "transition",
+    ] as const) {
       await expect(
-        store.transactPath(path, () => ({ value: null })),
+        store.transactEventLease({ kind, id: eventId }, () => ({
+          value: null,
+        })),
       ).rejects.toThrow("auth-recovery-prize-path-unsupported");
     }
-    await expect(
-      store.transactPath(`profileEventPrizes/profile-one/${eventId}`, () => ({
-        value: null,
-      })),
-    ).rejects.toThrow("auth-recovery-prize-path-unsupported");
-    await expect(
-      store.getPath("profileEventPrizes/profile-one", { orderBy: "prizeId" }),
-    ).rejects.toThrow("event-d1-query-unsupported");
-    await expect(
-      store.getPath(`profileEventPrizes/profile-one/${eventId}`, {
-        orderBy: "$key",
-      }),
-    ).rejects.toThrow("event-d1-query-unsupported");
     expect(
-      await store.getPath("profileEventPrizes/profile-one", {
-        orderBy: "$key",
-        limitToFirst: 2,
-      }),
+      await store.listProfileEventPrizeAssignments("profile-one", { limit: 2 }),
     ).toEqual({});
     expect(
-      await store.getPath(`profileEventPrizes/profile-one/${eventId}`),
+      await store.readProfileEventPrizeAssignment("profile-one", eventId),
     ).toBeNull();
     expect(
       await testEnv.EVENT_DB.prepare(
@@ -1145,16 +1291,21 @@ describe("hybrid event repository", () => {
   });
 
   it("copies stored retired prizes under an event lease while ordinary writes remain strict", async () => {
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
-    await client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
+    await client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const sourceAssignment = {
       eventId,
       profileId: "profile-one",
-      place: 1,
+      place: 1 as const,
       prizeId: "retired-prize",
       assignedAtMs: 2_000,
       archivedMetadata: { edition: 1 },
@@ -1167,7 +1318,10 @@ describe("hybrid event repository", () => {
       .bind("profile-one", eventId, JSON.stringify(sourceAssignment), 2_000)
       .run();
     expect(
-      await client.getPath(`profileEventPrizes/profile-one/${eventId}`),
+      await readEventRepositoryFixture(
+        client,
+        `profileEventPrizes/profile-one/${eventId}`,
+      ),
     ).toEqual(sourceAssignment);
     const targetPath = `profileEventPrizes/profile-two/${eventId}`;
     const targetAssignment = { ...sourceAssignment, profileId: "profile-two" };
@@ -1179,52 +1333,60 @@ describe("hybrid event repository", () => {
       ownerUid: "copy-owner",
     };
     const nowMs = Date.now();
-    await client.transactPath(`eventLocks/${eventId}`, () => ({
-      value: {
-        lockId: guard.lockId,
-        ownerUid: guard.ownerUid,
-        acquiredAtMs: nowMs,
-        refreshedAtMs: nowMs,
-        expiresAtMs: nowMs + 30_000,
-      },
-    }));
-    await expect(
-      client.patchRoot({ [targetPath]: targetAssignment }),
-    ).rejects.toThrow("invalid-event-prize-assignment");
-    await expect(client.transactPath(targetPath, updater)).rejects.toThrow(
-      "invalid-event-prize-assignment",
+    await transactEventRepositoryFixture(
+      client,
+      `eventLocks/${eventId}`,
+      () => ({
+        value: {
+          lockId: guard.lockId,
+          ownerUid: guard.ownerUid,
+          acquiredAtMs: nowMs,
+          refreshedAtMs: nowMs,
+          expiresAtMs: nowMs + 30_000,
+        },
+      }),
     );
-    for (const path of [
-      "profileEventPrizes/profile-two",
-      `${targetPath}/prizeId`,
-      "profileEventPrizes/profile-two/other-event",
-      `events/${eventId}`,
-    ]) {
-      expect(() =>
-        client.transactStoredProfileEventPrizeWithEventLease(
-          path,
-          updater,
-          guard,
-        ),
-      ).toThrow("event-lock-guard-path-unsupported");
-    }
+    await expect(
+      client.commitEventPlan(
+        decodeEventUpdates({ [targetPath]: targetAssignment }),
+      ),
+    ).rejects.toThrow("invalid-event-prize-assignment");
+    await expect(
+      transactEventRepositoryFixture(client, targetPath, updater),
+    ).rejects.toThrow("invalid-event-prize-assignment");
+    expect(() =>
+      client.transactStoredProfileEventPrizeWithEventLease(
+        "profile-two",
+        "other-event",
+        updater,
+        guard,
+      ),
+    ).toThrow("event-lock-guard-path-unsupported");
     await expect(
       client.transactStoredProfileEventPrizeWithEventLease(
-        targetPath,
+        "profile-two",
+        eventId,
         updater,
         guard,
       ),
     ).resolves.toMatchObject({ committed: true, value: targetAssignment });
-    expect(await client.getPath(targetPath)).toEqual(targetAssignment);
+    expect(await readEventRepositoryFixture(client, targetPath)).toEqual(
+      targetAssignment,
+    );
   });
 
   it("atomically rejects stored prize writes after a D1 event lease is replaced or expired", async () => {
-    const client = createEventStateRepository(testEnv, {
-      getPath: async () => null,
-      patchRoot: async () => undefined,
-      transactPath: async () => ({ committed: false, value: null }),
-    });
-    await client.patchRoot({ [`events/${eventId}`]: eventRecord() });
+    const client = createEventStateRepository(
+      testEnv,
+      eventMatchTestPort({
+        getPath: async () => null,
+        patchRoot: async () => undefined,
+        transactPath: async () => ({ committed: false, value: null }),
+      }),
+    );
+    await client.commitEventPlan(
+      decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+    );
     const lockPath = `eventLocks/${eventId}`;
     const targetPath = `profileEventPrizes/profile-two/${eventId}`;
     const nowMs = Date.now();
@@ -1243,7 +1405,8 @@ describe("hybrid event repository", () => {
     };
     const writePrize = () =>
       client.transactStoredProfileEventPrizeWithEventLease(
-        targetPath,
+        "profile-two",
+        eventId,
         () => ({
           value: {
             eventId,
@@ -1255,14 +1418,16 @@ describe("hybrid event repository", () => {
         }),
         guard,
       );
-    await client.transactPath(lockPath, () => ({ value: originalLock }));
-    await client.transactPath(lockPath, () => ({
+    await transactEventRepositoryFixture(client, lockPath, () => ({
+      value: originalLock,
+    }));
+    await transactEventRepositoryFixture(client, lockPath, () => ({
       value: { ...originalLock, lockId: "successor-lock" },
     }));
     await expect(writePrize()).rejects.toThrow("event-d1-conflict");
     expect(await readEventOwnedPath(testEnv.EVENT_DB, targetPath)).toBeNull();
 
-    await client.transactPath(lockPath, () => ({
+    await transactEventRepositoryFixture(client, lockPath, () => ({
       value: {
         ...originalLock,
         acquiredAtMs: nowMs - 2_000,
@@ -1274,21 +1439,16 @@ describe("hybrid event repository", () => {
     expect(await readEventOwnedPath(testEnv.EVENT_DB, targetPath)).toBeNull();
   });
 
-  it("delegates unrelated state operations even while event storage is frozen", async () => {
-    const calls: string[] = [];
+  it("keeps explicit match reads independent while event writes are frozen", async () => {
+    const readMatchRecord = vi.fn(async () => ({ fen: "initial" }));
+    const port = eventMatchTestPort({
+      getPath: async () => null,
+      patchRoot: async () => undefined,
+      transactPath: async () => ({ committed: false, value: null }),
+    });
     const client = createEventStateRepository(testEnv, {
-      getPath: async (path) => {
-        calls.push(`get:${path}`);
-        return { ok: true };
-      },
-      patchRoot: async (updates) => {
-        calls.push(`patch:${Object.keys(updates).join(",")}`);
-      },
-      transactPath: async (path, updater) => {
-        calls.push(`transact:${path}`);
-        const decision = updater(null) as { value?: unknown };
-        return { committed: true, value: decision.value ?? null };
-      },
+      ...port,
+      readMatchRecord,
     });
     await transitionEventStorageMode(testEnv.EVENT_DB, {
       expected: { storageMode: "d1" },
@@ -1296,23 +1456,25 @@ describe("hybrid event repository", () => {
       nowMs: 10,
     });
     try {
-      await expect(client.getPath(`events/${eventId}`)).resolves.toBeNull();
+      expect(await client.readEvent(eventId)).toBeNull();
       await expect(
-        client.patchRoot({ [`events/${eventId}`]: eventRecord() }),
+        client.commitEventPlan([
+          { kind: "event", eventId, value: eventRecord() },
+        ]),
       ).rejects.toThrow("event-writes-disabled");
-      await expect(client.getPath("invites/invite-one")).resolves.toEqual({
-        ok: true,
+      expect(
+        await client.readMatchRecord({
+          playerId: "login-one",
+          matchId: "match-one",
+        }),
+      ).toEqual({ fen: "initial" });
+      expect(readMatchRecord).toHaveBeenCalledExactlyOnceWith({
+        playerId: "login-one",
+        matchId: "match-one",
       });
-      await client.patchRoot({
-        "players/login-one/matches/match-one/timer": "",
-      });
-      await client.patchRoot({
-        "players/login-one/matches/match-one": { fen: "initial" },
-        "gameplayMutationReceipts/operation-one": { inviteId: "match-one" },
-      });
-      await expect(
-        client.transactPath("automatch/invite-one", () => ({ value: {} })),
-      ).resolves.toMatchObject({ committed: true });
+      expect("getPath" in client).toBe(false);
+      expect("patchRoot" in client).toBe(false);
+      expect("transactPath" in client).toBe(false);
     } finally {
       await transitionEventStorageMode(testEnv.EVENT_DB, {
         expected: { storageMode: "frozen" },
@@ -1320,11 +1482,5 @@ describe("hybrid event repository", () => {
         nowMs: 11,
       });
     }
-    expect(calls).toEqual([
-      "get:invites/invite-one",
-      "patch:players/login-one/matches/match-one/timer",
-      "patch:players/login-one/matches/match-one,gameplayMutationReceipts/operation-one",
-      "transact:automatch/invite-one",
-    ]);
   });
 });

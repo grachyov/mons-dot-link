@@ -1,3 +1,7 @@
+import {
+  attachEventTestPorts,
+  type EventTestSource,
+} from "./eventTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -111,7 +115,9 @@ function sweepRepository(
   onPatch?: (updates: Record<string, unknown>) => void | Promise<void>,
 ) {
   const patches: Record<string, unknown>[] = [];
-  const value: EventProgressSweepRepository = {
+  const value: EventProgressSweepRepository = attachEventTestPorts<
+    EventProgressSweepRepository & EventTestSource
+  >({
     readEvent: async () => null,
     listDueEventProgressOutboxes: async (beforeMs, limit) => {
       assert.equal(beforeMs, Number.MAX_SAFE_INTEGER);
@@ -126,7 +132,7 @@ function sweepRepository(
       await onPatch?.(updates);
       patches.push(updates);
     },
-  };
+  });
   return { patches, value };
 }
 
@@ -154,7 +160,9 @@ test("scheduled-event sweep discovers both announcements and retains their first
   const records = new Map<string, unknown>();
   let creates = 0;
   const recovery = scheduledRecovery({ [eventId]: event });
-  const repository: EventProgressSweepRepository = {
+  const repository: EventProgressSweepRepository = attachEventTestPorts<
+    EventProgressSweepRepository & EventTestSource
+  >({
     readEvent: async (id) => (id === eventId ? event : null),
     listDueEventProgressOutboxes: async () => [],
     getStatePath: async (path) => records.get(path) ?? null,
@@ -162,7 +170,7 @@ test("scheduled-event sweep discovers both announcements and retains their first
       for (const [path, value] of Object.entries(updates))
         records.set(path, value);
     },
-  };
+  });
   const environment = workflowEnvironment({ onCreate: () => creates++ });
   await sweepEventProgress(environment, {
     now: () => nowMs,
@@ -602,7 +610,9 @@ test("both announcements survive slow start dispatch and all three jobs can fail
           : scenario === "failed-start"
             ? "scheduled-start-reconciliation"
             : null;
-    const repository: EventProgressSweepRepository = {
+    const repository: EventProgressSweepRepository = attachEventTestPorts<
+      EventProgressSweepRepository & EventTestSource
+    >({
       readEvent: async (id) => (id === eventId ? event : null),
       listDueEventProgressOutboxes: async () => [],
       getStatePath: async (path) => records.get(path) ?? null,
@@ -610,7 +620,7 @@ test("both announcements survive slow start dispatch and all three jobs can fail
         for (const [path, value] of Object.entries(updates))
           records.set(path, value);
       },
-    };
+    });
     const environment = workflowEnvironment();
     const instance =
       await environment.EVENT_PROGRESS_WORKFLOW.get("test-instance");

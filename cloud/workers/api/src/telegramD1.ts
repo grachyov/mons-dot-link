@@ -1,12 +1,16 @@
 import type { TelegramRepository } from "../../../runtime/telegram/deliveryEngine.js";
-import { createTelegramRepository } from "../../../runtime/telegram/repositoryCore.js";
+import {
+  createTelegramRepository,
+  type TelegramStoredRecord,
+} from "../../../runtime/telegram/repositoryCore.js";
+import type {
+  TransactionDecision,
+  TransactionResult,
+} from "./repositoryContracts.ts";
 import { validateTelegramMessageKey } from "../../../runtime/telegram/desiredStateCore.js";
 import { validateTelegramTransactionDecision } from "./telegramTransaction.ts";
 import type { EventAnnouncementKind } from "./eventAnnouncementKinds.ts";
 
-const TELEGRAM_MESSAGE_PREFIX = "telegramMessages/";
-const TELEGRAM_DELIVERY_CONTROL_ROOT = "telegramDeliveryControl";
-const TELEGRAM_RETRY_NOT_BEFORE_PATH = `${TELEGRAM_DELIVERY_CONTROL_ROOT}/retryNotBeforeMs`;
 const MAX_D1_TRANSACTION_ATTEMPTS = 25;
 
 type JsonRow = {
@@ -131,9 +135,11 @@ async function transactRow(
     keyColumn: "message_key" | "singleton";
     now: () => number;
     table: "telegram_delivery_control" | "telegram_messages";
-    updater: (current: unknown) => unknown;
+    updater: (
+      current: TelegramStoredRecord | null,
+    ) => TransactionDecision<TelegramStoredRecord>;
   },
-): Promise<{ committed: boolean; decision?: string; value: unknown }> {
+): Promise<TransactionResult<TelegramStoredRecord>> {
   for (let attempt = 0; attempt < MAX_D1_TRANSACTION_ATTEMPTS; attempt += 1) {
     const current = await readRow(db, input.table, input.keyColumn, input.key);
     const decision = validateTelegramTransactionDecision(
@@ -186,7 +192,7 @@ async function transactRow(
         return {
           committed: true,
           decision: decision.decision,
-          value: decision.value,
+          value: asRecord(decision.value),
         };
       }
       continue;
@@ -203,7 +209,7 @@ async function transactRow(
       return {
         committed: true,
         decision: decision.decision,
-        value: decision.value,
+        value: asRecord(decision.value),
       };
     }
   }
@@ -214,76 +220,37 @@ export function createD1TelegramRepository(
   db: D1Database,
   { now = Date.now }: { now?: () => number } = {},
 ): TelegramRepository {
-  const readControl = async () =>
-    (await readRow(db, "telegram_delivery_control", "singleton", 1))?.record ??
-    {};
   return createTelegramRepository({
-    async getPath(path) {
-      if (path.startsWith(TELEGRAM_MESSAGE_PREFIX)) {
-        const messageKey = validateTelegramMessageKey(
-          path.slice(TELEGRAM_MESSAGE_PREFIX.length),
-        );
-        return (
-          (await readRow(db, "telegram_messages", "message_key", messageKey))
-            ?.record ?? null
-        );
-      }
-      const control = await readControl();
-      if (path === TELEGRAM_DELIVERY_CONTROL_ROOT) return control;
-      if (path === TELEGRAM_RETRY_NOT_BEFORE_PATH) {
-        return control.retryNotBeforeMs ?? null;
-      }
-      throw new TelegramD1Failure();
+    async readMessage(messageKey) {
+      const key = validateTelegramMessageKey(messageKey);
+      return (
+        (await readRow(db, "telegram_messages", "message_key", key))?.record ??
+        null
+      );
     },
-    async transactPath(path, updater) {
-      if (path.startsWith(TELEGRAM_MESSAGE_PREFIX)) {
-        const messageKey = validateTelegramMessageKey(
-          path.slice(TELEGRAM_MESSAGE_PREFIX.length),
-        );
-        return transactRow(db, {
-          table: "telegram_messages",
-          keyColumn: "message_key",
-          key: messageKey,
-          updater,
-          now,
-        });
-      }
-      if (path === TELEGRAM_DELIVERY_CONTROL_ROOT) {
-        return transactRow(db, {
-          table: "telegram_delivery_control",
-          keyColumn: "singleton",
-          key: 1,
-          updater,
-          now,
-        });
-      }
-      if (path === TELEGRAM_RETRY_NOT_BEFORE_PATH) {
-        const result = await transactRow(db, {
-          table: "telegram_delivery_control",
-          keyColumn: "singleton",
-          key: 1,
-          now,
-          updater(current) {
-            const control = asRecord(current) || {};
-            const decision = validateTelegramTransactionDecision(
-              updater(control.retryNotBeforeMs ?? null),
-            );
-            if (!decision.commit) return decision;
-            return {
-              value: {
-                ...control,
-                retryNotBeforeMs: decision.value,
-              },
-              decision: decision.decision,
-            };
-          },
-        });
-        return {
-          ...result,
-          value: asRecord(result.value)?.retryNotBeforeMs ?? null,
-        };
-      }
-      throw new TelegramD1Failure();
+    transactMessage(messageKey, updater) {
+      return transactRow(db, {
+        table: "telegram_messages",
+        keyColumn: "message_key",
+        key: validateTelegramMessageKey(messageKey),
+        updater,
+        now,
+      });
+    },
+    async readControl() {
+      return (
+        (await readRow(db, "telegram_delivery_control", "singleton", 1))
+          ?.record ?? {}
+      );
+    },
+    transactControl(updater) {
+      return transactRow(db, {
+        table: "telegram_delivery_control",
+        keyColumn: "singleton",
+        key: 1,
+        updater,
+        now,
+      });
     },
   });
 }

@@ -1,3 +1,4 @@
+import { patchEventOwnedPaths } from "./eventD1Fixture.ts";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
@@ -17,7 +18,6 @@ import { handleEventRoute } from "../src/eventRoute.ts";
 import {
   acquireEventWriteAdmission,
   assertEventWritesAllowed,
-  patchEventOwnedPaths,
   releaseEventWriteAdmission,
 } from "../src/eventD1.ts";
 import type { GameplayRepository } from "../src/gameplayRepository.ts";
@@ -49,7 +49,7 @@ function observedEventDatabase(
 function snapshotDependencies() {
   return {
     repository: {
-      getStatePath: async () => null,
+      ...{ getStatePath: async () => null },
       readProfileOwnershipSnapshot: async () => {
         throw new Error("unused");
       },
@@ -62,7 +62,7 @@ function prizeDependencies(canonicalProfileId: string | null = profileId) {
   return {
     ...snapshotDependencies(),
     repository: {
-      getStatePath: async () => null,
+      ...{ getStatePath: async () => null },
       async readProfileOwnershipSnapshot() {
         return {
           loginOwnerByUid: new Map([
@@ -201,7 +201,7 @@ describe("event read route", () => {
       },
       {
         repository: {
-          getStatePath: async () => null,
+          ...{ getStatePath: async () => null },
           readProfileOwnershipSnapshot: async () => {
             throw new Error("unused");
           },
@@ -231,7 +231,7 @@ describe("event read route", () => {
       { waitUntil() {} },
       {
         repository: {
-          getStatePath: async () => null,
+          ...{ getStatePath: async () => null },
           readProfileOwnershipSnapshot: async () => {
             throw new Error("unused");
           },
@@ -426,7 +426,7 @@ describe("event read route", () => {
       { waitUntil() {} },
       {
         repository: {
-          getStatePath: async () => null,
+          ...{ getStatePath: async () => null },
           readProfileOwnershipSnapshot: async () => {
             throw new Error("unused");
           },
@@ -609,8 +609,10 @@ describe("event read route", () => {
       { waitUntil() {} },
       {
         repository: {
-          getStatePath: async () => {
-            throw new Error("storage should not run");
+          ...{
+            getStatePath: async () => {
+              throw new Error("storage should not run");
+            },
           },
           readProfileOwnershipSnapshot: async () => {
             throw new Error("unused");
@@ -623,36 +625,36 @@ describe("event read route", () => {
   });
 
   it("serves only the caller's canonical profile prizes", async () => {
-    const repository: Pick<
-      GameplayRepository,
-      "getStatePath" | "readProfileOwnershipSnapshot"
-    > = {
-      getStatePath: async () => null,
-      async readProfileOwnershipSnapshot() {
-        return {
-          loginOwnerByUid: new Map([["login-one", { profileId, revision: 1 }]]),
-          canonicalProfileIdByProfileId: new Map(),
-          loginUidsByProfileId: new Map([[profileId, ["login-one"]]]),
-          profileById: new Map([
-            [
-              profileId,
-              {
-                revision: 1,
-                profile: {
-                  profileId,
-                  aura: "",
-                  emoji: 1,
-                  eth: "",
-                  rating: 1_500,
-                  sol: "",
-                  username: "ivan",
+    const repository: Pick<GameplayRepository, "readProfileOwnershipSnapshot"> =
+      {
+        ...{ getStatePath: async () => null },
+        async readProfileOwnershipSnapshot() {
+          return {
+            loginOwnerByUid: new Map([
+              ["login-one", { profileId, revision: 1 }],
+            ]),
+            canonicalProfileIdByProfileId: new Map(),
+            loginUidsByProfileId: new Map([[profileId, ["login-one"]]]),
+            profileById: new Map([
+              [
+                profileId,
+                {
+                  revision: 1,
+                  profile: {
+                    profileId,
+                    aura: "",
+                    emoji: 1,
+                    eth: "",
+                    rating: 1_500,
+                    sol: "",
+                    username: "ivan",
+                  },
                 },
-              },
-            ],
-          ]),
-        };
-      },
-    };
+              ],
+            ]),
+          };
+        },
+      };
     const response = await handleEventReadRoute(
       new Request("https://api.mons.link/events/prizes", {
         headers: { Origin: "https://mons.link" },
@@ -683,20 +685,18 @@ describe("event read route", () => {
   });
 
   it("includes a D1 bookmark for callers without a canonical profile", async () => {
-    const repository: Pick<
-      GameplayRepository,
-      "getStatePath" | "readProfileOwnershipSnapshot"
-    > = {
-      getStatePath: async () => null,
-      async readProfileOwnershipSnapshot() {
-        return {
-          loginOwnerByUid: new Map([["anonymous-login", null]]),
-          canonicalProfileIdByProfileId: new Map(),
-          loginUidsByProfileId: new Map(),
-          profileById: new Map(),
-        };
-      },
-    };
+    const repository: Pick<GameplayRepository, "readProfileOwnershipSnapshot"> =
+      {
+        ...{ getStatePath: async () => null },
+        async readProfileOwnershipSnapshot() {
+          return {
+            loginOwnerByUid: new Map([["anonymous-login", null]]),
+            canonicalProfileIdByProfileId: new Map(),
+            loginUidsByProfileId: new Map(),
+            profileById: new Map(),
+          };
+        },
+      };
     const dependencies = {
       repository,
       verifyIdentity: async () => ({ uid: "anonymous-login" }),

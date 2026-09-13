@@ -1,3 +1,4 @@
+const { eventField, mergeEventPlans } = require("./eventCommands");
 const { getDisplayNameFromAddress } = require("./telegramDisplay");
 const { isEventPrizeEvent } = require("@mons/shared/event-prizes");
 const {
@@ -222,26 +223,19 @@ const createEventRuntime = (dependencies) => {
   const tryAcquireEventSyncThrottle = async (eventId, ownerUid) => {
     const nowMs = getNowMs();
     const token = crypto.randomUUID();
-    const result = await state.transaction(
-      `eventSyncThrottles/${eventId}`,
-      (current) => {
-        const lastStartedAtMs =
-          current && typeof current.startedAtMs === "number"
-            ? Math.floor(current.startedAtMs)
-            : 0;
-        if (
-          lastStartedAtMs > 0 &&
-          nowMs - lastStartedAtMs < EVENT_SYNC_THROTTLE_WINDOW_MS
-        ) {
-          return;
-        }
-        return {
-          startedAtMs: nowMs,
-          ownerUid,
-          token,
-        };
-      },
-    );
+    const result = await state.transactEventSyncThrottle(eventId, (current) => {
+      const lastStartedAtMs =
+        current && typeof current.startedAtMs === "number"
+          ? Math.floor(current.startedAtMs)
+          : 0;
+      if (
+        lastStartedAtMs > 0 &&
+        nowMs - lastStartedAtMs < EVENT_SYNC_THROTTLE_WINDOW_MS
+      ) {
+        return { commit: false };
+      }
+      return { value: { startedAtMs: nowMs, ownerUid, token } };
+    });
     if (!result.committed) {
       return null;
     }
@@ -365,10 +359,14 @@ const createEventRuntime = (dependencies) => {
       );
     }
 
-    await state.update("", {
-      [`events/${eventId}`]: event,
-      [`eventProgressOutbox/${progress.outboxId}`]: progress.outbox,
-    });
+    await state.commitEventPlan([
+      { kind: "event", eventId: eventId, value: event },
+      {
+        kind: "progress-outbox",
+        outboxId: progress.outboxId,
+        value: progress.outbox,
+      },
+    ]);
 
     return {
       ok: true,
@@ -494,7 +492,7 @@ const createEventRuntime = (dependencies) => {
               "Event is busy. Please try postponing again.",
             );
           }
-          await state.update("", dueTransition.updates);
+          await state.commitEventPlan(dueTransition.updates);
         }
         throw new HttpsError(
           "failed-precondition",
@@ -540,11 +538,15 @@ const createEventRuntime = (dependencies) => {
 
       event.startAtMs = nextStartAtMs;
       event.updatedAtMs = nowMs;
-      await state.update("", {
-        [`events/${eventId}/startAtMs`]: nextStartAtMs,
-        [`events/${eventId}/updatedAtMs`]: nowMs,
-        [`eventProgressOutbox/${progress.outboxId}`]: progress.outbox,
-      });
+      await state.commitEventPlan([
+        eventField(eventId, "startAtMs", nextStartAtMs),
+        eventField(eventId, "updatedAtMs", nowMs),
+        {
+          kind: "progress-outbox",
+          outboxId: progress.outboxId,
+          value: progress.outbox,
+        },
+      ]);
 
       return {
         ok: true,
@@ -624,7 +626,7 @@ const createEventRuntime = (dependencies) => {
         }
 
         let targetMatch = null;
-        let targetMatchUpdatePath = "";
+        let targetMatchUpdate = null;
         if (isThirdPlaceTarget) {
           const thirdPlaceMatchCandidate = event.thirdPlaceMatch;
           if (
@@ -633,7 +635,12 @@ const createEventRuntime = (dependencies) => {
           ) {
             targetMatch = thirdPlaceMatchCandidate;
             resolvedMatchKey = THIRD_PLACE_MATCH_KEY;
-            targetMatchUpdatePath = `events/${eventId}/thirdPlaceMatch/winnerDisqualified`;
+            targetMatchUpdate = {
+              kind: "event-disqualification",
+              eventId,
+              roundKey: null,
+              matchKey: "third_place",
+            };
           }
         } else {
           const round =
@@ -660,7 +667,12 @@ const createEventRuntime = (dependencies) => {
               [resolvedMatchKey, targetMatch] = fallbackEntry;
             }
           }
-          targetMatchUpdatePath = `events/${eventId}/rounds/${parsedMatchKey.roundIndex}/matches/${resolvedMatchKey}/winnerDisqualified`;
+          targetMatchUpdate = {
+            kind: "event-disqualification",
+            eventId,
+            roundKey: String(parsedMatchKey.roundIndex),
+            matchKey: resolvedMatchKey,
+          };
         }
 
         if (!targetMatch || typeof targetMatch !== "object") {
@@ -698,10 +710,10 @@ const createEventRuntime = (dependencies) => {
               "Event is busy. Please try disqualifying again.",
             );
           }
-          await state.update("", {
-            [targetMatchUpdatePath]: true,
-            [`events/${eventId}/updatedAtMs`]: getNowMs(),
-          });
+          await state.commitEventPlan([
+            { ...targetMatchUpdate, value: true },
+            eventField(eventId, "updatedAtMs", getNowMs()),
+          ]);
         }
       } finally {
         stopLockHeartbeat();
@@ -853,7 +865,7 @@ const createEventRuntime = (dependencies) => {
           });
         }
       }
-      const updates = {};
+      const updates = [];
       let didChange = false;
       let eventPrizeAssignmentsForProjectionCleanup = null;
 
@@ -865,7 +877,7 @@ const createEventRuntime = (dependencies) => {
           ownershipSnapshot,
           prizeSelections,
         });
-        Object.assign(updates, dueTransition.updates);
+        updates.push(...dueTransition.updates);
         didChange = dueTransition.didChange;
       } else if (event.status === "active") {
         const normalizedOriginalCurrentRoundIndex = toFiniteInteger(
@@ -903,7 +915,7 @@ const createEventRuntime = (dependencies) => {
           typeof event.thirdPlaceMatch === "object"
             ? cloneValue(event.thirdPlaceMatch)
             : null;
-        const inviteUpdates = {};
+        const inviteUpdates = [];
         let roundsChanged = false;
         let participantsChanged = false;
         let thirdPlaceMatchChanged = false;
@@ -1020,7 +1032,9 @@ const createEventRuntime = (dependencies) => {
           if (isEventPrizeEvent(eventId)) {
             if (typeof event.prizeSelectionsLockedAtMs !== "number") {
               event.prizeSelectionsLockedAtMs = nowMs;
-              updates[`events/${eventId}/prizeSelectionsLockedAtMs`] = nowMs;
+              updates.push(
+                eventField(eventId, "prizeSelectionsLockedAtMs", nowMs),
+              );
             }
             const prizeAssignmentResult = await resolveEventPrizeAssignments({
               eventId,
@@ -1057,14 +1071,19 @@ const createEventRuntime = (dependencies) => {
             ? Math.floor(event.currentRoundIndex)
             : null;
         if (normalizedCurrentRoundIndex !== originalCurrentRoundIndex) {
-          updates[`events/${eventId}/currentRoundIndex`] =
-            normalizedCurrentRoundIndex;
+          updates.push(
+            eventField(
+              eventId,
+              "currentRoundIndex",
+              normalizedCurrentRoundIndex,
+            ),
+          );
           eventChanged = true;
         }
 
         const normalizedStatus = normalizeString(event.status) || "active";
         if (normalizedStatus !== originalStatus) {
-          updates[`events/${eventId}/status`] = normalizedStatus;
+          updates.push(eventField(eventId, "status", normalizedStatus));
           eventChanged = true;
         }
 
@@ -1073,7 +1092,7 @@ const createEventRuntime = (dependencies) => {
             ? Math.floor(event.endedAtMs)
             : null;
         if (normalizedEndedAtMs !== originalEndedAtMs) {
-          updates[`events/${eventId}/endedAtMs`] = normalizedEndedAtMs;
+          updates.push(eventField(eventId, "endedAtMs", normalizedEndedAtMs));
           eventChanged = true;
         }
 
@@ -1081,8 +1100,9 @@ const createEventRuntime = (dependencies) => {
           event.winnerProfileId,
         );
         if (normalizedWinnerProfileId !== originalWinnerProfileId) {
-          updates[`events/${eventId}/winnerProfileId`] =
-            normalizedWinnerProfileId;
+          updates.push(
+            eventField(eventId, "winnerProfileId", normalizedWinnerProfileId),
+          );
           eventChanged = true;
         }
 
@@ -1090,31 +1110,36 @@ const createEventRuntime = (dependencies) => {
           event.winnerDisplayName,
         );
         if (normalizedWinnerDisplayName !== originalWinnerDisplayName) {
-          updates[`events/${eventId}/winnerDisplayName`] =
-            normalizedWinnerDisplayName;
+          updates.push(
+            eventField(
+              eventId,
+              "winnerDisplayName",
+              normalizedWinnerDisplayName,
+            ),
+          );
           eventChanged = true;
         }
         if (supportsThirdPlaceMatch && thirdPlaceMatchChanged) {
-          updates[`events/${eventId}/thirdPlaceMatch`] = thirdPlaceMatch;
+          updates.push(eventField(eventId, "thirdPlaceMatch", thirdPlaceMatch));
           eventChanged = true;
         }
 
         if (roundsChanged) {
-          updates[`events/${eventId}/rounds`] = rounds;
+          updates.push(eventField(eventId, "rounds", rounds));
         }
         if (participantsChanged) {
-          updates[`events/${eventId}/participants`] = participants;
+          updates.push(eventField(eventId, "participants", participants));
         }
-        if (Object.keys(inviteUpdates).length > 0) {
-          Object.assign(updates, inviteUpdates);
+        if (inviteUpdates.length > 0) {
+          updates.push(...inviteUpdates);
         }
         if (
           roundsChanged ||
           participantsChanged ||
-          Object.keys(inviteUpdates).length > 0 ||
+          inviteUpdates.length > 0 ||
           eventChanged
         ) {
-          updates[`events/${eventId}/updatedAtMs`] = nowMs;
+          updates.push(eventField(eventId, "updatedAtMs", nowMs));
           didChange = true;
         }
       } else if (event.status === "ended") {
@@ -1171,7 +1196,7 @@ const createEventRuntime = (dependencies) => {
               event.participants && typeof event.participants === "object"
                 ? event.participants
                 : {},
-            inviteUpdates: {},
+            inviteUpdates: [],
             thirdPlaceMatch,
             allowInviteCreation: false,
           });
@@ -1183,8 +1208,13 @@ const createEventRuntime = (dependencies) => {
 
         if (isEventPrizeEvent(eventId)) {
           if (typeof event.prizeSelectionsLockedAtMs !== "number") {
-            updates[`events/${eventId}/prizeSelectionsLockedAtMs`] =
-              typeof event.endedAtMs === "number" ? event.endedAtMs : nowMs;
+            updates.push(
+              eventField(
+                eventId,
+                "prizeSelectionsLockedAtMs",
+                typeof event.endedAtMs === "number" ? event.endedAtMs : nowMs,
+              ),
+            );
             prizeStateChanged = true;
           }
           const prizeAssignmentResult = await resolveEventPrizeAssignments({
@@ -1217,13 +1247,15 @@ const createEventRuntime = (dependencies) => {
         }
 
         if (roundsChanged || thirdPlaceMatchChanged) {
-          updates[`events/${eventId}/rounds`] = rounds;
+          updates.push(eventField(eventId, "rounds", rounds));
           if (supportsThirdPlaceMatch) {
-            updates[`events/${eventId}/thirdPlaceMatch`] = thirdPlaceMatch;
+            updates.push(
+              eventField(eventId, "thirdPlaceMatch", thirdPlaceMatch),
+            );
           }
         }
         if (roundsChanged || thirdPlaceMatchChanged || prizeStateChanged) {
-          updates[`events/${eventId}/updatedAtMs`] = nowMs;
+          updates.push(eventField(eventId, "updatedAtMs", nowMs));
           didChange = true;
         }
       }
@@ -1240,7 +1272,7 @@ const createEventRuntime = (dependencies) => {
             event: latestValue,
           });
         }
-        await state.update("", updates);
+        await state.commitEventPlan(mergeEventPlans(updates));
       }
       if (eventPrizeAssignmentsForProjectionCleanup) {
         if (!(await isEventLockStillOwned(lockHandle))) {

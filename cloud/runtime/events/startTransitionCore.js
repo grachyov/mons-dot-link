@@ -1,4 +1,5 @@
 "use strict";
+const { eventField } = require("../eventCommands");
 
 const {
   buildAutoInviteId,
@@ -264,16 +265,20 @@ const createInviteForMatch = async ({
   const gameSeed = await buildRandomGameSeed(random);
   match.inviteId = inviteId;
   match.status = "pending";
-  inviteUpdates[`invites/${inviteId}`] = {
-    version: CONTROLLER_VERSION,
-    hostId: hostLoginUid,
-    hostColor,
-    guestId: guestLoginUid,
-    eventId,
-    eventRoundIndex: roundIndex,
-    eventMatchKey: matchKey,
-    eventOwned: true,
-  };
+  inviteUpdates.push({
+    kind: "invite",
+    inviteId: inviteId,
+    value: {
+      version: CONTROLLER_VERSION,
+      hostId: hostLoginUid,
+      hostColor,
+      guestId: guestLoginUid,
+      eventId,
+      eventRoundIndex: roundIndex,
+      eventMatchKey: matchKey,
+      eventOwned: true,
+    },
+  });
   const createMatchRecord = (color, emojiId, aura) =>
     buildFreshMatchRecord({
       color,
@@ -281,10 +286,18 @@ const createInviteForMatch = async ({
       aura: normalizeString(aura) || null,
       seed: gameSeed,
     });
-  inviteUpdates[`players/${hostLoginUid}/matches/${inviteId}`] =
-    createMatchRecord(hostColor, match.hostEmojiId, match.hostAura);
-  inviteUpdates[`players/${guestLoginUid}/matches/${inviteId}`] =
-    createMatchRecord(guestColor, match.guestEmojiId, match.guestAura);
+  inviteUpdates.push({
+    kind: "match-creation",
+    playerId: hostLoginUid,
+    matchId: inviteId,
+    value: createMatchRecord(hostColor, match.hostEmojiId, match.hostAura),
+  });
+  inviteUpdates.push({
+    kind: "match-creation",
+    playerId: guestLoginUid,
+    matchId: inviteId,
+    value: createMatchRecord(guestColor, match.guestEmojiId, match.guestAura),
+  });
   return true;
 };
 
@@ -656,7 +669,7 @@ const buildFixedBracketState = async ({
   const bracketSize = getEventBracketSize(participantIds.length);
   const roundCount = Math.max(1, Math.round(Math.log2(bracketSize)));
   const seedOrder = buildEventSeedOrder(bracketSize);
-  const inviteUpdates = {};
+  const inviteUpdates = [];
   const rounds = {};
   let thirdPlaceMatch = null;
   const seedToProfileId = buildSeedToProfileId({ participantIds, random });
@@ -766,10 +779,10 @@ const buildScheduledEventDueUpdatesCore = async ({
     throw new TypeError("buildRandomGameSeed is required");
   }
   if (!event || event.status !== "scheduled") {
-    return { didChange: false, updates: {} };
+    return { didChange: false, updates: [] };
   }
   if (typeof event.startAtMs !== "number" || nowMs < event.startAtMs) {
-    return { didChange: false, updates: {} };
+    return { didChange: false, updates: [] };
   }
   const storedParticipantIds = getEventParticipantIds(event);
   if (storedParticipantIds.length < 2) {
@@ -790,16 +803,16 @@ const buildScheduledEventDueUpdatesCore = async ({
     });
     return {
       didChange: true,
-      updates: {
+      updates: [
         ...(shouldClearPrizeSelections
-          ? { [`eventPrizeSelections/${eventId}`]: null }
-          : {}),
-        [`events/${eventId}/status`]: event.status,
-        [`events/${eventId}/endedAtMs`]: event.endedAtMs,
-        [`events/${eventId}/updatedAtMs`]: event.updatedAtMs,
-        [`events/${eventId}/winnerProfileId`]: null,
-        [`events/${eventId}/winnerDisplayName`]: null,
-      },
+          ? [{ kind: "prize-selections", eventId: eventId, value: null }]
+          : []),
+        eventField(eventId, "status", event.status),
+        eventField(eventId, "endedAtMs", event.endedAtMs),
+        eventField(eventId, "updatedAtMs", event.updatedAtMs),
+        eventField(eventId, "winnerProfileId", null),
+        eventField(eventId, "winnerDisplayName", null),
+      ],
     };
   }
   const prizeSelectionResult = isEventPrizeEvent(eventId)
@@ -815,13 +828,17 @@ const buildScheduledEventDueUpdatesCore = async ({
       })()
     : { didChange: false, selectionsByProfileId: {} };
   const prizeSelectionUpdates = prizeSelectionResult.didChange
-    ? {
-        [`eventPrizeSelections/${eventId}`]:
-          Object.keys(prizeSelectionResult.selectionsByProfileId).length > 0
-            ? prizeSelectionResult.selectionsByProfileId
-            : null,
-      }
-    : {};
+    ? [
+        {
+          kind: "prize-selections",
+          eventId: eventId,
+          value:
+            Object.keys(prizeSelectionResult.selectionsByProfileId).length > 0
+              ? prizeSelectionResult.selectionsByProfileId
+              : null,
+        },
+      ]
+    : [];
   if (!ownershipSnapshot) throw profileOwnershipUnavailable();
   const canonicalParticipants = canonicalizeEventParticipants(
     event,
@@ -857,23 +874,23 @@ const buildScheduledEventDueUpdatesCore = async ({
     }
     return {
       didChange: true,
-      updates: {
+      updates: [
         ...bracket.inviteUpdates,
         ...prizeSelectionUpdates,
-        [`events/${eventId}/status`]: event.status,
-        [`events/${eventId}/startedAtMs`]: event.startedAtMs,
-        [`events/${eventId}/updatedAtMs`]: event.updatedAtMs,
-        [`events/${eventId}/currentRoundIndex`]: event.currentRoundIndex,
-        [`events/${eventId}/bracketSize`]: event.bracketSize,
-        [`events/${eventId}/roundCount`]: event.roundCount,
-        [`events/${eventId}/rounds`]: bracket.rounds,
+        eventField(eventId, "status", event.status),
+        eventField(eventId, "startedAtMs", event.startedAtMs),
+        eventField(eventId, "updatedAtMs", event.updatedAtMs),
+        eventField(eventId, "currentRoundIndex", event.currentRoundIndex),
+        eventField(eventId, "bracketSize", event.bracketSize),
+        eventField(eventId, "roundCount", event.roundCount),
+        eventField(eventId, "rounds", bracket.rounds),
         ...(canonicalParticipants.didChange
-          ? { [`events/${eventId}/participants`]: participantsById }
-          : {}),
+          ? [eventField(eventId, "participants", participantsById)]
+          : []),
         ...(supportsThirdPlaceMatch
-          ? { [`events/${eventId}/thirdPlaceMatch`]: bracket.thirdPlaceMatch }
-          : {}),
-      },
+          ? [eventField(eventId, "thirdPlaceMatch", bracket.thirdPlaceMatch)]
+          : []),
+      ],
     };
   }
   throw profileOwnershipUnavailable();

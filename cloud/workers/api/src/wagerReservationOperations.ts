@@ -1,3 +1,4 @@
+import type { WagerKey } from "./wagerStateRepository.ts";
 import {
   applyMaterialDeltas,
   applyMaterialDeltasWithCap,
@@ -335,12 +336,12 @@ export async function releaseUnreferencedWagerReservation(
     mutation: WagerMutationContext;
     playerUid: string;
     reservationOperationId: string;
-    wagerPath: string;
+    wagerKey: WagerKey;
   },
 ): Promise<"missing" | "referenced" | "released"> {
   if (
     wagerReferencesReservationOperation(
-      await repository.getStatePath(input.wagerPath),
+      await repository.wagers.readWager(input.wagerKey),
       input.playerUid,
       input.reservationOperationId,
     )
@@ -363,7 +364,7 @@ export async function recoverUnreferencedWagerReservation(
     mutation: WagerMutationContext;
     playerUid: string;
     reservationOperationId: string;
-    wagerPath: string;
+    wagerKey: WagerKey;
   },
   expectedKind: "accept-reserve" | "send-reserve",
 ): Promise<void> {

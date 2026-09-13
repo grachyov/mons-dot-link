@@ -1,3 +1,6 @@
+import { parseAutomatchPath } from "../test/legacyAutomatchStoreFixture.ts";
+import { createLegacyAutomatchD1Store as createAutomatchD1Store } from "../test/legacyAutomatchStoreFixture.ts";
+import { matchTestPort } from "../test/gameSessionTestPorts.ts";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { applyStrictMatchStateTestMigrations } from "./strictMatchStateTestFixture.ts";
@@ -7,12 +10,9 @@ import {
   startAutomatch,
   type AutomatchDependencies,
 } from "../src/automatch.ts";
-import {
-  createAutomatchD1Store,
-  parseAutomatchPath,
-} from "../src/automatchD1.ts";
+import {} from "../src/automatchD1.ts";
 import { createEventGameplayRepository } from "../src/eventRepository.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import { createGameSessionMutationLockStore } from "../src/gameplayCoordinationD1.ts";
 import { createGameplayRepository } from "../src/gameplayRepository.ts";
 import {
@@ -88,7 +88,7 @@ class MemoryStateRepository implements StateRepository {
 function client(memoryState: MemoryStateRepository, uid: string) {
   const repository = createEventGameplayRepository(
     env,
-    createGameplayRepository(env, { stateClient: memoryState }),
+    createGameplayRepository(env, { stateClient: matchTestPort(memoryState) }),
   );
   const persistence = repository.automatchPersistence!;
   const dependencies: AutomatchDependencies = {

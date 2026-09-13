@@ -99,18 +99,21 @@ function setup({
   );
   const repository = createGameplayRepository(env, {
     stateClient: {
-      getPath: async () => {
+      readMatchRecord: async () => {
         throw new Error("unexpected-source-read");
       },
-      patchRoot: async () => {
+      readMatchPair: async () => {
+        throw new Error("unexpected-source-read");
+      },
+      createMatchRecords: async () => {
         throw new Error("unexpected-write");
       },
-      transactPath: async () => {
+      applyMatchEventEffects: async () => {
         throw new Error("unexpected-write");
       },
     },
   });
-  repository.getStatePath = async () => {
+  repository.readMatchRecord = async () => {
     throw new Error("unexpected-full-state-read");
   };
   repository.readProfileOwnershipSnapshot = async (query) => ({

@@ -1,3 +1,4 @@
+import { gameplayTestPort } from "./gameSessionTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AuthApiFailure } from "../src/authErrors.ts";
@@ -239,6 +240,17 @@ function fixture(route: RouteCase) {
     throw new AuthApiFailure(409, "failed-precondition", effect);
   };
   const repository: GameplayRepository = {
+    ...gameplayTestPort({
+      getPath: unexpected,
+      patchRoot: unexpected,
+      transactPath: unexpected,
+    }),
+    wagers: {
+      readWager: unexpected,
+      readResolutionMarker: unexpected,
+      readInviteWagerState: unexpected,
+      readInviteWagerPresence: unexpected,
+    },
     applyWagerTransferOnce: unexpected,
     deleteNavigationGame: async (profileId, inviteId) => {
       assert.deepEqual([profileId, inviteId], ["profile", "invite"]);
@@ -248,8 +260,6 @@ function fixture(route: RouteCase) {
     getNavigationGame: async () => ({ status: "waiting" }),
     getMiningMaterials: unexpected,
     getMiningSnapshot: unexpected,
-    patchStateRoot: unexpected,
-    transactStatePath: unexpected,
     readInviteMetadata: async (inviteId) => {
       assert.equal(inviteId, "invite");
       if (route.path === "/invites/role/read") effects.push("invite-role");
@@ -288,13 +298,16 @@ function fixture(route: RouteCase) {
         ],
       ]),
     }),
-    getStatePath: async (path, query) => {
-      if (path === "automatch") {
-        assert.equal(query?.equalTo, uid);
-        return failAt("automatch-queues");
-      }
-      if (path === "automatch/invite") return null;
-      assert.equal(path, `gameplayMutationReceipts/${operationId}`);
+    listAutomatchEntriesByLogin: async (loginUid) => {
+      assert.equal(loginUid, uid);
+      return failAt("automatch-queues");
+    },
+    readAutomatchEntry: async (inviteId) => {
+      assert.equal(inviteId, "invite");
+      return null;
+    },
+    readMutationReceipt: async (id) => {
+      assert.equal(id, operationId);
       effects.push(route.effect);
       if (route.path === "/automatch/start") {
         return {
@@ -326,8 +339,9 @@ function fixture(route: RouteCase) {
   };
   const ratingRepository: RatingRepository = {
     ...repository,
-    getStatePath: async (path) => {
-      assert.equal(path, "invites/auto_invite");
+    putEventProgressOutbox: unexpected,
+    readInviteMetadata: async (inviteId) => {
+      assert.equal(inviteId, "auto_invite");
       return { hostId: uid, guestId: "opponent-uid" };
     },
     hasCompletedRatingUpdate: async (inviteId, matchId) => {

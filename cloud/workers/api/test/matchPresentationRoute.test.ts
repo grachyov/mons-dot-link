@@ -78,21 +78,21 @@ function setup(invite: unknown = paired, uid = "host-login") {
       });
   const repository = createGameplayRepository(env, {
     stateClient: {
-      getPath: async (path) => {
-        calls.reads.push(path);
-        if (path.startsWith("players/"))
-          throw new Error("unexpected-source-appearance-read");
-        return records.get(path) ?? null;
+      readMatchRecord: async () => {
+        throw new Error("unexpected-source-read");
       },
-      patchRoot: async () => {
+      readMatchPair: async () => {
+        throw new Error("unexpected-source-read");
+      },
+      createMatchRecords: async () => {
         throw new Error("unexpected-write");
       },
-      transactPath: async () => {
+      applyMatchEventEffects: async () => {
         throw new Error("unexpected-write");
       },
     },
   });
-  repository.getStatePath = async () => {
+  repository.readMatchRecord = async () => {
     throw new Error("unexpected-full-state-read");
   };
   repository.readInviteMetadata = async (inviteId) => {

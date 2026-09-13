@@ -1,3 +1,7 @@
+import {
+  attachEventTestPorts,
+  type EventTestSource,
+} from "./eventTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { LEGACY_CORE_PRIZES_EVENT_ID } from "@mons/shared/event-prizes";
@@ -21,26 +25,18 @@ import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
 const profileId = "creator-profile";
 const identity = { uid: "creator-login" };
 
-type TestGameplayRepository = EventGameplayRepository & {
-  findProfileId(uid: string): Promise<string | null>;
-  getGameplayProfile(
-    uid: string,
-    signal?: AbortSignal,
-  ): Promise<{
-    aura: string;
-    emoji: number | string;
-    eth: string;
-    profileId: string;
-    rating: number;
-    sol: string;
-    username: string;
-  } | null>;
-  getGameplayProfileOwnership(
-    uid: string,
-    signal?: AbortSignal,
-  ): Promise<{
-    loginUids: string[];
-    profile: {
+type TestGameplayRepository = EventGameplayRepository &
+  Required<
+    Pick<
+      EventTestSource,
+      "getStatePath" | "patchStateRoot" | "transactStatePath"
+    >
+  > & {
+    findProfileId(uid: string): Promise<string | null>;
+    getGameplayProfile(
+      uid: string,
+      signal?: AbortSignal,
+    ): Promise<{
       aura: string;
       emoji: number | string;
       eth: string;
@@ -48,14 +44,28 @@ type TestGameplayRepository = EventGameplayRepository & {
       rating: number;
       sol: string;
       username: string;
-    };
-  } | null>;
-  listProfileLoginUids(profileId: string): Promise<string[]>;
-  resolveCanonicalProfileId(profileId: string): Promise<string | null>;
-  resolveCanonicalProfileIds(
-    profileIds: string[],
-  ): Promise<Array<string | null>>;
-};
+    } | null>;
+    getGameplayProfileOwnership(
+      uid: string,
+      signal?: AbortSignal,
+    ): Promise<{
+      loginUids: string[];
+      profile: {
+        aura: string;
+        emoji: number | string;
+        eth: string;
+        profileId: string;
+        rating: number;
+        sol: string;
+        username: string;
+      };
+    } | null>;
+    listProfileLoginUids(profileId: string): Promise<string[]>;
+    resolveCanonicalProfileId(profileId: string): Promise<string | null>;
+    resolveCanonicalProfileIds(
+      profileIds: string[],
+    ): Promise<Array<string | null>>;
+  };
 
 function getPath(root: Record<string, unknown>, path: string): unknown {
   if (!path) {
@@ -103,7 +113,7 @@ function createRepository(initial: Record<string, unknown> = {}) {
   }
   const patches: Record<string, unknown>[] = [];
   let repository: TestGameplayRepository;
-  repository = {
+  repository = attachEventTestPorts<TestGameplayRepository>({
     ...eventReadFixture(async (path) => getPath(values, path)),
     readInviteMetadata: async (inviteId) =>
       getPath(values, `invites/${inviteId}`) as Record<string, unknown> | null,
@@ -272,7 +282,7 @@ function createRepository(initial: Record<string, unknown> = {}) {
         value,
       };
     },
-  };
+  });
   return { patches, repository, values };
 }
 

@@ -1,14 +1,23 @@
-import { STATE_VALUE_FIELD } from "./stateCompatibility.ts";
 import { normalizeHistoricalMatchRecord } from "@mons/shared/game-sessions";
-import type { MatchStateRecord } from "./matchStateTypes.ts";
 import { requireActiveDurableMatchState } from "./matchStateAuthority.ts";
 import {
   createAutomatchD1Store,
   isAutomatchRevisionConflict,
-  parseAutomatchPath,
   type AutomatchRecordMutation,
 } from "./automatchD1.ts";
-import type { StateRepository } from "./stateRepositoryTypes.ts";
+import type { MatchStatePort } from "./repositoryContracts.ts";
+import type { GameSessionChange } from "./gameSessionContracts.ts";
+import {
+  canonical,
+  digest,
+  readField,
+  resolveValue,
+  sessionLayout,
+  decodeSessionMatchCreation,
+  encodeSessionMatchCreations,
+  GameSessionTransitionFailure,
+  type StoredSessionMatchCreation,
+} from "./gameSessionCodec.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import { buildLoginMatchDiscoveryStatements } from "./loginMatchDiscoveryD1.ts";
 import {
@@ -27,9 +36,13 @@ import {
   releaseInviteSourceAdmission,
   type InviteSourceMutation,
 } from "./inviteSourceD1.ts";
+export {
+  GAME_SESSION_CREATION_FIELD,
+  GAME_SESSION_TRANSITION_FIELD,
+  GameSessionTransitionFailure,
+  gameSessionOperationResource,
+} from "./gameSessionCodec.ts";
 
-export const GAME_SESSION_CREATION_FIELD = "sessionCreation";
-export const GAME_SESSION_TRANSITION_FIELD = "sessionTransition";
 export const GAME_SESSION_TRANSITION_SWEEP_LIMIT = 10;
 export const GAME_SESSION_TRANSITION_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_PREPARATION_ATTEMPTS = 3;
@@ -41,11 +54,6 @@ export type GameSessionLeaseProof = {
 };
 
 type JsonRecord = Record<string, unknown>;
-type MatchCreation = {
-  path: string;
-  value: JsonRecord;
-  marker: string;
-};
 type TransitionPayload = {
   version: 2;
   inviteId: string;
@@ -55,7 +63,7 @@ type TransitionPayload = {
   digest: string;
   resources: string[];
   mutations: AutomatchRecordMutation[];
-  creations: MatchCreation[];
+  creations: StoredSessionMatchCreation[];
   createdAtMs: number;
 };
 type TransitionRow = {
@@ -66,11 +74,11 @@ type TransitionRow = {
 };
 type TransitionStore = Pick<
   ReturnType<typeof createAutomatchD1Store>,
-  "preparePatch" | "buildCommitStatements" | "buildRevisionGuardStatements"
+  "prepareChanges" | "buildCommitStatements" | "buildRevisionGuardStatements"
 >;
 type InviteTransitionStore = Pick<
   ReturnType<typeof createInviteSourceD1Store>,
-  "preparePatch" | "buildCommitStatements" | "buildRevisionGuardStatements"
+  "prepareChanges" | "buildCommitStatements" | "buildRevisionGuardStatements"
 >;
 type InviteAdmission = Awaited<ReturnType<typeof acquireInviteSourceAdmission>>;
 type InviteControl = Awaited<ReturnType<typeof readInviteSourceControl>>;
@@ -78,10 +86,7 @@ type InviteOperation = { admission: InviteAdmission; control: InviteControl };
 
 export type GameSessionTransitionsOptions = {
   db: D1Database;
-  state: Pick<
-    StateRepository,
-    "getPath" | "transactPath" | "createMatchRecords"
-  >;
+  state: Pick<MatchStatePort, "createMatchRecords">;
   store?: TransitionStore;
   inviteStore?: InviteTransitionStore;
   inviteAdmission?: InviteAdmission;
@@ -92,100 +97,11 @@ export type GameSessionTransitionsOptions = {
   writeGuards?: () => D1PreparedStatement[] | Promise<D1PreparedStatement[]>;
 };
 
-export class GameSessionTransitionFailure extends Error {
-  constructor(code: string) {
-    super(`game-session-transition-${code}`);
-  }
-}
-
 function fail(code: string): never {
   throw new GameSessionTransitionFailure(code);
 }
-
 function record(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function canonical(value: unknown): string {
-  if (value === null) return "null";
-  if (typeof value === "string" || typeof value === "boolean")
-    return JSON.stringify(value);
-  if (typeof value === "number" && Number.isFinite(value))
-    return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  if (!record(value)) return fail("invalid-json");
-  return `{${Object.keys(value)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
-    .join(",")}}`;
-}
-
-async function digest(value: unknown): Promise<string> {
-  const bytes = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(canonical(value)),
-  );
-  return Array.from(new Uint8Array(bytes), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
-function pathParts(path: string): string[] {
-  const parts = path.split("/");
-  if (parts.some((part) => !isSafeRecordKey(part))) fail("invalid-path");
-  return parts;
-}
-
-function readField(value: unknown, path: string): unknown {
-  let current = value;
-  for (const key of path.split("/")) {
-    if (!record(current) || !Object.hasOwn(current, key)) return null;
-    current = current[key];
-  }
-  return current ?? null;
-}
-
-function resolveValue(
-  value: unknown,
-  current: unknown,
-  nowMs: number,
-): unknown {
-  if (Array.isArray(value))
-    return value.map((entry, index) =>
-      resolveValue(
-        entry,
-        Array.isArray(current) ? current[index] : null,
-        nowMs,
-      ),
-    );
-  if (!record(value)) {
-    canonical(value);
-    return value;
-  }
-  if (Object.hasOwn(value, STATE_VALUE_FIELD)) {
-    if (Object.keys(value).length !== 1) return fail("invalid-server-value");
-    if (value[STATE_VALUE_FIELD] === "timestamp") return nowMs;
-    const server = value[STATE_VALUE_FIELD];
-    if (
-      record(server) &&
-      Object.keys(server).length === 1 &&
-      typeof server.increment === "number" &&
-      Number.isFinite(server.increment)
-    ) {
-      const next =
-        (typeof current === "number" && Number.isFinite(current)
-          ? current
-          : 0) + server.increment;
-      if (Number.isFinite(next)) return next;
-    }
-    return fail("invalid-server-value");
-  }
-  return Object.fromEntries(
-    Object.entries(value).map(([key, child]) => [
-      key,
-      resolveValue(child, record(current) ? current[key] : null, nowMs),
-    ]),
-  );
 }
 
 function validateLease(proof: GameSessionLeaseProof): void {
@@ -197,11 +113,6 @@ function validateLease(proof: GameSessionLeaseProof): void {
     !proof.ownerId
   )
     fail("invalid-lease");
-}
-
-export function gameSessionOperationResource(operationId: string): string {
-  if (!isSafeRecordKey(operationId)) fail("invalid-operation");
-  return `gameplay-operation:${operationId}`;
 }
 
 export function gameSessionResourceGuardStatements(
@@ -232,105 +143,6 @@ function loginResources(mutations: AutomatchRecordMutation[]): string[] {
     }
   }
   return [...uids].map((uid) => `automatch-login:${uid}`);
-}
-
-function splitUpdates(updates: JsonRecord): {
-  inviteId: string;
-  canonicalUpdates: JsonRecord;
-  inviteUpdates: JsonRecord;
-  matchUpdates: { path: string; value: JsonRecord }[];
-  operationResources: string[];
-} {
-  const inviteIds = new Set<string>();
-  const canonicalUpdates: JsonRecord = {};
-  const inviteUpdates: JsonRecord = {};
-  const matchUpdates: { path: string; value: JsonRecord }[] = [];
-  const operationResources: string[] = [];
-  const paths = Object.keys(updates);
-  for (const path of paths) {
-    if (paths.some((other) => other !== path && path.startsWith(`${other}/`)))
-      fail("overlapping-updates");
-    const parts = pathParts(path);
-    const value = updates[path];
-    const owned = parseAutomatchPath(path);
-    if (owned) {
-      canonicalUpdates[path] = value;
-      if (
-        parts[0] === "gameplayMutationReceipts" ||
-        parts[0] === "gameplayMutationReceiptExpirations"
-      ) {
-        operationResources.push(gameSessionOperationResource(parts[1]));
-        if (parts[0] === "gameplayMutationReceipts" && record(value)) {
-          if (typeof value.inviteId === "string") inviteIds.add(value.inviteId);
-          else if (
-            record(value.response) &&
-            typeof value.response.inviteId === "string"
-          )
-            inviteIds.add(value.response.inviteId);
-        }
-      } else if (owned.key) inviteIds.add(owned.key);
-      continue;
-    }
-    if (parts[0] === "invites" && parts.length >= 2) {
-      inviteIds.add(parts[1]);
-      const fields = parts.slice(2);
-      if (!fields.length) {
-        if (!record(value)) fail("invalid-invite-write");
-        for (const [field, child] of Object.entries(value)) {
-          pathParts(field);
-          if (field.includes("/")) fail("invalid-invite-field");
-          inviteUpdates[field] = child;
-        }
-      } else inviteUpdates[fields.join("/")] = value;
-      continue;
-    }
-    if (
-      parts[0] === "players" &&
-      parts[2] === "matches" &&
-      parts.length === 4 &&
-      record(value) &&
-      typeof value.fen === "string" &&
-      value.fen &&
-      !Object.hasOwn(value, GAME_SESSION_CREATION_FIELD)
-    ) {
-      matchUpdates.push({ path, value });
-      continue;
-    }
-    fail("unsupported-effect");
-  }
-  if (inviteIds.size !== 1 || !Object.keys(canonicalUpdates).length)
-    fail("invalid-scope");
-  const inviteId = [...inviteIds][0];
-  if (!isSafeRecordKey(inviteId)) fail("invalid-invite");
-  for (const field of Object.keys(inviteUpdates)) {
-    if (
-      [
-        GAME_SESSION_TRANSITION_FIELD,
-        "wagers",
-        "matchesWagerResolutions",
-        "reactions",
-      ].includes(field.split("/")[0])
-    )
-      fail("reserved-invite-field");
-  }
-  for (const { path } of matchUpdates) {
-    const matchId = path.split("/")[3];
-    if (
-      matchId !== inviteId &&
-      !(
-        matchId.startsWith(inviteId) &&
-        /^[1-9]\d*$/.test(matchId.slice(inviteId.length))
-      )
-    )
-      fail("match-outside-invite");
-  }
-  return {
-    inviteId,
-    canonicalUpdates,
-    inviteUpdates,
-    matchUpdates,
-    operationResources,
-  };
 }
 
 function readPayload(row: TransitionRow): TransitionPayload {
@@ -467,62 +279,24 @@ export function createGameSessionTransitions({
     await assertInviteOperation(operation);
     if (payload.inviteSourceEpoch !== operation.control.epoch)
       fail("invite-source-backend-conflict");
-    if (state.createMatchRecords && payload.creations.length) {
+    if (payload.creations.length) {
       await state.createMatchRecords(
         {
           inviteId: payload.inviteId,
           transitionId: payload.transitionId,
-          records: payload.creations.map((creation) => ({
-            matchId: creation.path.split("/")[3],
-            playerId: creation.path.split("/")[1],
-            value: creation.value as MatchStateRecord,
-            marker: creation.marker,
-          })),
+          records: payload.creations.map(decodeSessionMatchCreation),
         },
         signal,
       );
-    } else
-      for (const creation of payload.creations) {
-        signal?.throwIfAborted();
-        await assertInviteOperation(operation);
-        await state.transactPath(
-          creation.path,
-          (current) => {
-            if (current !== null && current !== undefined) {
-              if (
-                record(current) &&
-                current[GAME_SESSION_CREATION_FIELD] === creation.marker
-              )
-                return { commit: false, decision: "applied" };
-              return fail("match-creation-conflict");
-            }
-            return {
-              value: {
-                ...creation.value,
-                [GAME_SESSION_CREATION_FIELD]: creation.marker,
-              },
-              decision: "created",
-            };
-          },
-          signal,
-        );
-      }
+    }
     signal?.throwIfAborted();
     const presentations = prepareMatchPresentations
       ? await prepareMatchPresentations(
-          payload.creations.map((creation) => {
-            const [root, actorUid, matches, matchId, extra] = pathParts(
-              creation.path,
-            );
+          payload.creations.map((stored) => {
+            const creation = decodeSessionMatchCreation(stored);
+            const { playerId: actorUid, matchId } = creation;
             const match = normalizeHistoricalMatchRecord(creation.value);
-            if (
-              root !== "players" ||
-              matches !== "matches" ||
-              !matchId ||
-              extra ||
-              !match
-            )
-              fail("invalid-match-presentation-creation");
+            if (!match) fail("invalid-match-presentation-creation");
             return {
               inviteId: payload.inviteId,
               matchId,
@@ -587,17 +361,9 @@ export function createGameSessionTransitions({
         ),
         ...buildLoginMatchDiscoveryStatements(
           db,
-          payload.creations.map((creation) => {
-            const [root, loginUid, matches, matchId, extra] = pathParts(
-              creation.path,
-            );
-            if (
-              root !== "players" ||
-              matches !== "matches" ||
-              !matchId ||
-              extra
-            )
-              fail("invalid-match-discovery-path");
+          payload.creations.map((stored) => {
+            const { playerId: loginUid, matchId } =
+              decodeSessionMatchCreation(stored);
             return {
               loginUid,
               matchId,
@@ -676,26 +442,44 @@ export function createGameSessionTransitions({
   }
 
   async function prepareAndCommit(
-    updates: JsonRecord,
+    changes: readonly GameSessionChange[],
     leases: readonly GameSessionLeaseProof[],
     operation: InviteOperation,
     signal?: AbortSignal,
   ): Promise<void> {
     signal?.throwIfAborted();
     leases.forEach(validateLease);
-    const split = splitUpdates(updates);
+    const split = sessionLayout(changes);
     if (!leases.some((proof) => proof.lockId === split.inviteId))
       fail("invite-lease-required");
     if (new Set(leases.map((proof) => proof.lockId)).size !== leases.length)
       fail("duplicate-lease");
-    const invitePatch = Object.keys(split.inviteUpdates).length
-      ? Object.fromEntries(
-          Object.entries(split.inviteUpdates).map(([field, value]) => [
-            `invites/${split.inviteId}/${field}`,
-            value,
-          ]),
-        )
-      : { [`invites/${split.inviteId}`]: {} };
+    const inviteChanges = changes.flatMap((change) => {
+      switch (change.kind) {
+        case "invite-merge":
+        case "invite-fields":
+          return [{ inviteId: change.inviteId, value: change.value }];
+        case "invite-operation":
+          return [
+            {
+              inviteId: change.inviteId,
+              value: {},
+              operationIds: { [change.loginUid]: change.operationId },
+            },
+          ];
+        case "invite-rematches":
+          return [
+            {
+              inviteId: change.inviteId,
+              value: { [`${change.role}Rematches`]: change.value },
+            },
+          ];
+        default:
+          return [];
+      }
+    });
+    if (!inviteChanges.length)
+      inviteChanges.push({ inviteId: split.inviteId, value: {} });
     const createdAtMs = now();
     const transitionId = createId();
     if (
@@ -706,8 +490,8 @@ export function createGameSessionTransitions({
       fail("invalid-intent-id");
     for (let attempt = 0; attempt < MAX_PREPARATION_ATTEMPTS; attempt++) {
       signal?.throwIfAborted();
-      const inviteMutations = await inviteStore.preparePatch(
-        invitePatch,
+      const inviteMutations = await inviteStore.prepareChanges(
+        inviteChanges,
         createdAtMs,
         signal,
       );
@@ -724,8 +508,8 @@ export function createGameSessionTransitions({
       )
         fail("event-owned-invite");
       if (!currentInvite && !split.inviteUpdates.hostId) fail("invite-missing");
-      const mutations = await store.preparePatch(
-        split.canonicalUpdates,
+      const mutations = await store.prepareChanges(
+        changes,
         createdAtMs,
         signal,
       );
@@ -766,12 +550,11 @@ export function createGameSessionTransitions({
         inviteSourceEpoch: operation.control.epoch,
         inviteMutations,
       });
-      const creations = await Promise.all(
-        split.matchUpdates.map(async ({ path, value }) => ({
-          path,
-          value: resolveValue(value, null, createdAtMs) as JsonRecord,
-          marker: await digest({ transitionId, path, digest: contentDigest }),
-        })),
+      const creations = await encodeSessionMatchCreations(
+        split.matchUpdates,
+        transitionId,
+        contentDigest,
+        createdAtMs,
       );
       const payload: TransitionPayload = {
         inviteId: split.inviteId,
@@ -897,12 +680,12 @@ export function createGameSessionTransitions({
   }
 
   const commit = (
-    updates: JsonRecord,
+    changes: readonly GameSessionChange[],
     leases: readonly GameSessionLeaseProof[],
     signal?: AbortSignal,
   ) =>
     withInviteOperation("session-transition-commit", (operation) =>
-      prepareAndCommit(updates, leases, operation, signal),
+      prepareAndCommit(changes, leases, operation, signal),
     );
 
   const sweep = (limit = GAME_SESSION_TRANSITION_SWEEP_LIMIT) =>

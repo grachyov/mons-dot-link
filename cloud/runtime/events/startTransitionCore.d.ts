@@ -1,8 +1,9 @@
+import type { EventCommitPlan } from "../eventCommands.js";
 import type { EventOwnershipSnapshot } from "./ownership.js";
 
 export type ScheduledEventTransitionResult = {
   didChange: boolean;
-  updates: Record<string, unknown>;
+  updates: EventCommitPlan;
 };
 
 export type EventStartTransitionDependencies = {
@@ -27,7 +28,7 @@ export function buildFixedBracketState(input: {
   currentRoundIndex: number;
   rounds: Record<string, unknown>;
   thirdPlaceMatch: unknown;
-  inviteUpdates: Record<string, unknown>;
+  inviteUpdates: EventCommitPlan;
 }>;
 
 export function buildScheduledEventDueUpdatesCore(

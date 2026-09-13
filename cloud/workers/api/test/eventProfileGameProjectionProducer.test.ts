@@ -1,16 +1,21 @@
+import {
+  attachEventTestPorts,
+  type EventTestSource,
+} from "./eventTestPorts.ts";
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createEventProfileGameProjectionRepository } from "../src/eventProfileGameProjectionProducer.ts";
-import { getEventProfileGameProjectionOutboxPath } from "../src/profileGameProjectionOutbox.ts";
+import { getEventProfileGameProjectionOutboxPath } from "../test/legacyProjectionOutboxFixture.ts";
 import type { EventGameplayRepository } from "../src/eventRepository.ts";
 import { eventReadFixture } from "./eventReadFixture.ts";
 import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
 
 function repository(input: {
-  get?: EventGameplayRepository["getStatePath"];
-  patch: EventGameplayRepository["patchStateRoot"];
+  get?: NonNullable<EventTestSource["getStatePath"]>;
+  patch: NonNullable<EventTestSource["patchStateRoot"]>;
 }): EventGameplayRepository {
-  return {
+  return attachEventTestPorts<EventGameplayRepository & EventTestSource>({
     ...eventReadFixture(input.get || (async () => null)),
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
@@ -32,7 +37,7 @@ function repository(input: {
     getStatePath: input.get || (async () => null),
     patchStateRoot: input.patch,
     transactStatePath: async () => ({ committed: false, value: null }),
-  };
+  });
 }
 
 test("event mutations persist cleanup owners before enqueueing", async () => {
@@ -67,10 +72,12 @@ test("event mutations persist cleanup owners before enqueueing", async () => {
     },
   );
 
-  await wrapped.patchStateRoot({
-    "events/event-1/participants/source-profile": null,
-    "events/event-1/updatedAtMs": 123,
-  });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({
+      "events/event-1/participants/source-profile": null,
+      "events/event-1/updatedAtMs": 123,
+    }),
+  );
 
   const outbox = getEventProfileGameProjectionOutboxPath("event-1");
   assert.deepEqual(enqueued, [
@@ -113,7 +120,7 @@ test("event deletion captures every pre-mutation owner", async () => {
       now: () => 456,
     },
   );
-  await wrapped.patchStateRoot({ "events/event-1": null });
+  await wrapped.commitEventPlan(decodeEventUpdates({ "events/event-1": null }));
   const outbox = getEventProfileGameProjectionOutboxPath("event-1");
   assert.equal(
     persisted[`${outbox}/cleanupOwnerProfileIds/owner-profile`],
@@ -140,9 +147,13 @@ test("superseding event writes preserve accumulated cleanup children", async () 
       now: () => patches.length + 1,
     },
   );
-  await wrapped.patchStateRoot({ "events/event-1/status": "active" });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({ "events/event-1/status": "active" }),
+  );
   previousOwner = "owner-b";
-  await wrapped.patchStateRoot({ "events/event-1/status": "ended" });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({ "events/event-1/status": "ended" }),
+  );
   const outbox = getEventProfileGameProjectionOutboxPath("event-1");
   assert.equal(patches[0][`${outbox}/cleanupOwnerProfileIds/owner-a`], true);
   assert.equal(patches[1][`${outbox}/cleanupOwnerProfileIds/owner-b`], true);
@@ -172,7 +183,9 @@ test("enqueue failure leaves the committed event marker recoverable", async () =
       now: () => 789,
     },
   );
-  await wrapped.patchStateRoot({ "events/event-1/status": "active" });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({ "events/event-1/status": "active" }),
+  );
   const outbox = getEventProfileGameProjectionOutboxPath("event-1");
   assert.equal(persisted[`${outbox}/requestId`], "request-1");
   assert.equal(logs.length, 1);
@@ -202,15 +215,17 @@ test("non-event writes pass through and scheduled dispatch is detached", async (
       schedule: (work) => scheduled.push(work),
     },
   );
-  const inviteUpdate = { "invites/invite-1/status": "active" };
-  await wrapped.patchStateRoot(inviteUpdate);
+  const inviteUpdate = { "invites/invite-1": { status: "active" } };
+  await wrapped.commitEventPlan(decodeEventUpdates(inviteUpdate));
   assert.deepEqual(patches, [inviteUpdate]);
   assert.equal(enqueues, 0);
   const irrelevantEventUpdate = { "events/event-1/rounds/0": {} };
-  await wrapped.patchStateRoot(irrelevantEventUpdate);
+  await wrapped.commitEventPlan(decodeEventUpdates(irrelevantEventUpdate));
   assert.deepEqual(patches, [inviteUpdate, irrelevantEventUpdate]);
   assert.equal(enqueues, 0);
-  await wrapped.patchStateRoot({ "events/event-1/status": "active" });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({ "events/event-1/status": "active" }),
+  );
   assert.equal(scheduled.length, 1);
   finishEnqueue?.();
   await scheduled[0];

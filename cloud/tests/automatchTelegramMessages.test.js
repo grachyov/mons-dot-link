@@ -3,8 +3,8 @@ const assert = require("node:assert/strict");
 const {
   TELEGRAM_AUTOMATCH_VERSION,
   buildPendingAutomatchTelegramSource,
-  buildMatchedAutomatchTelegramUpdates,
-  buildAutomatchTelegramLifecycleUpdates,
+  buildMatchedAutomatchTelegramChanges,
+  buildAutomatchTelegramLifecycleChanges,
 } = require("../runtime/telegram/automatchSource");
 const {
   buildAutomatchProjectionGuard,
@@ -61,32 +61,44 @@ test("matched and canceled lifecycle builders only update source state", () => {
   const timestamp = 123;
   const generation = { ".sv": { increment: 1 } };
   assert.deepEqual(
-    buildMatchedAutomatchTelegramUpdates({
+    buildMatchedAutomatchTelegramChanges({
       inviteId,
       matchedText,
       timestamp,
       generation,
     }),
-    {
-      [`telegramAutomatches/${inviteId}/lifecycle`]: "matched",
-      [`telegramAutomatches/${inviteId}/matchedText`]: matchedText,
-      [`telegramAutomatches/${inviteId}/matchedInstanceKey`]: `matched:${inviteId}`,
-      [`telegramAutomatches/${inviteId}/updatedAtMs`]: timestamp,
-      [`telegramAutomatches/${inviteId}/generation`]: generation,
-    },
+    [
+      {
+        kind: "telegram-source-merge",
+        inviteId,
+        value: {
+          lifecycle: "matched",
+          matchedText,
+          matchedInstanceKey: `matched:${inviteId}`,
+          updatedAtMs: timestamp,
+          generation,
+        },
+      },
+    ],
   );
   assert.deepEqual(
-    buildAutomatchTelegramLifecycleUpdates({
+    buildAutomatchTelegramLifecycleChanges({
       inviteId,
       lifecycle: "canceled",
       timestamp,
       generation,
     }),
-    {
-      [`telegramAutomatches/${inviteId}/lifecycle`]: "canceled",
-      [`telegramAutomatches/${inviteId}/updatedAtMs`]: timestamp,
-      [`telegramAutomatches/${inviteId}/generation`]: generation,
-    },
+    [
+      {
+        kind: "telegram-source-merge",
+        inviteId,
+        value: {
+          lifecycle: "canceled",
+          updatedAtMs: timestamp,
+          generation,
+        },
+      },
+    ],
   );
 });
 

@@ -48,7 +48,7 @@ import type {
 import { createMatchTimerStartStore } from "./gameplayCoordinationD1.ts";
 import {
   acquireEventWriteAdmission,
-  patchEventOwnedPaths,
+  commitEventMutations,
   releaseEventWriteAdmission,
 } from "./eventD1.ts";
 import {
@@ -496,9 +496,15 @@ export class InviteReactions
     const admission = await acquireEventWriteAdmission(this.env.EVENT_DB);
     let released = false;
     try {
-      await patchEventOwnedPaths(
+      await commitEventMutations(
         this.env.EVENT_DB,
-        { [`eventProgressOutbox/${plan.outboxId}`]: plan.outbox },
+        [
+          {
+            kind: "progress-outbox",
+            outboxId: plan.outboxId,
+            value: plan.outbox,
+          },
+        ],
         { admission },
       );
     } finally {

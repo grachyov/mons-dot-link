@@ -40,7 +40,8 @@ function fixture({ getMatchEmoji, guestProfile = null }) {
           guestRematches: "x",
         };
       },
-      async getStatePath(path) {
+      async readAutomatchEntry(inviteId) {
+        const path = `automatch/${inviteId}`;
         reads.push(path);
         if (path === `automatch/${inviteId}`) return null;
         if (path === guestMatchPath) return { emojiId: 1, aura: "" };

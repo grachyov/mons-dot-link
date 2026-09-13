@@ -29,7 +29,7 @@ const {
 } = requireRuntimeDependency("@metaplex-foundation/mpl-bubblegum");
 const {
   EVENT_PRIZE_ADMIN_WALLET,
-  buildWithdrawalCompletionUpdates,
+  buildWithdrawalCompletion,
   decodeAdminSecretKey,
   decideWithdrawalClaim,
   filterProjectableEventPrizeAssignments,
@@ -98,23 +98,46 @@ const removeMatchingProfileEventPrizeAssignment = async ({
   return result.committed === true && result.value === null;
 };
 
+const typedWithdrawalRecord = (reference) => ({
+  async transaction(update) {
+    let decision;
+    const result = await reference.transaction((current) => {
+      decision = update(current);
+      return decision.commit === false ? (current ?? null) : decision.value;
+    });
+    return {
+      ...result,
+      committed: result.committed && decision?.commit !== false,
+      decision: decision?.decision,
+    };
+  },
+});
+
 const createProjectionDependencies = ({
   assignments = new Map(),
   mergeTargets = {},
   transactionError = null,
 } = {}) => ({
-  state: {
-    transaction: async (path, update) => {
-      if (transactionError) throw transactionError;
-      const next = update(assignments.get(path) ?? null);
-      if (next === undefined) {
-        return { committed: false, value: assignments.get(path) ?? null };
-      }
-      assignments.set(path, next);
-      return { committed: true, value: next };
-    },
-  },
-  removeMatchingProfileEventPrizeAssignment,
+  removeMatchingProfileEventPrizeAssignment: ({
+    profileId,
+    eventId,
+    prizeId,
+  }) =>
+    removeMatchingProfileEventPrizeAssignment({
+      eventId,
+      prizeId,
+      targetRecord: {
+        transaction: async (update) => {
+          if (transactionError) throw transactionError;
+          const path = `profileEventPrizes/${profileId}/${eventId}`;
+          const next = update(assignments.get(path) ?? null);
+          if (next === undefined)
+            return { committed: false, value: assignments.get(path) ?? null };
+          assignments.set(path, next);
+          return { committed: true, value: next };
+        },
+      },
+    }),
   resolveCanonicalProfilePath: (candidateProfileId) =>
     resolveProfileMergeTargetPath({
       profileId: candidateProfileId,
@@ -464,13 +487,16 @@ test("withdrawal reads the entitlement through its typed profile prize reader", 
         data: { eventId, prizeId, solanaAddress: recipientAddress },
       },
       {
-        state: {
-          read: async (path) => {
-            assert.equal(path, `eventPrizeWithdrawals/${eventId}/${prizeId}`);
-            return null;
+        withdrawals: {
+          record: (candidateEventId, candidatePrizeId) => {
+            assert.equal(candidateEventId, eventId);
+            assert.equal(candidatePrizeId, prizeId);
+            return {
+              read: async () => null,
+              transaction: () =>
+                assert.fail("unassigned prizes must not be claimed"),
+            };
           },
-          transaction: () =>
-            assert.fail("unassigned prizes must not be claimed"),
         },
         readProfileByLoginUid: async () => ({ id: profileId }),
         readProfileEventPrizeAssignment: async (...identity) => {
@@ -958,7 +984,7 @@ test("checks the authoritative claim after a stale local transaction read", asyn
     leaseId: "lease-current",
     leaseExpiresAtMs: Date.now() + 60_000,
   };
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       const optimistic = update(null);
       assert.equal(optimistic.status, "processing");
@@ -969,7 +995,7 @@ test("checks the authoritative claim after a stale local transaction read", asyn
         value: unchanged,
       };
     },
-  };
+  });
   await assert.rejects(
     acquireWithdrawalClaim({
       withdrawalRecord,
@@ -1003,7 +1029,7 @@ test("retries acquisition when a busy lease expires after the transaction", asyn
     leaseExpiresAtMs: Date.now() + 5,
   };
   let transactionCount = 0;
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       transactionCount += 1;
       const next = update(authoritative);
@@ -1019,7 +1045,7 @@ test("retries acquisition when a busy lease expires after the transaction", asyn
         value: next,
       };
     },
-  };
+  });
   const claimResult = await acquireWithdrawalClaim({
     withdrawalRecord,
     eventId,
@@ -1042,7 +1068,7 @@ test("persists a submission after refreshing a stale local transaction cache", a
     leaseId: "lease",
   };
   const inputs = [];
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       inputs.push(null);
       assert.equal(update(null), null);
@@ -1053,7 +1079,7 @@ test("persists a submission after refreshing a stale local transaction cache", a
         value: submitted,
       };
     },
-  };
+  });
   const persisted = await persistSubmittedTransaction({
     withdrawalRecord,
     leaseId: "lease",
@@ -1104,7 +1130,7 @@ test("simulates a signed transfer before persisting its submission", async () =>
     },
   };
   let current = { status: "processing", leaseId: "lease" };
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       calls.push("persist");
       current = update(current);
@@ -1113,7 +1139,7 @@ test("simulates a signed transfer before persisting its submission", async () =>
         value: current,
       };
     },
-  };
+  });
 
   const submitted = await buildSubmittedTransaction({
     umi,
@@ -1139,7 +1165,7 @@ test("does not persist a submission after authoritative lease ownership changes"
     status: "processing",
     leaseId: "another-lease",
   };
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       const unchanged = update(authoritative);
       assert.equal(unchanged, authoritative);
@@ -1148,7 +1174,7 @@ test("does not persist a submission after authoritative lease ownership changes"
         value: unchanged,
       };
     },
-  };
+  });
   await assert.rejects(
     persistSubmittedTransaction({
       withdrawalRecord,
@@ -1168,7 +1194,7 @@ test("discards only the exact definitive submitted transaction", async () => {
     leaseId: "lease",
     transactionSignature: "signature",
   };
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       current = update(current);
       return {
@@ -1176,7 +1202,7 @@ test("discards only the exact definitive submitted transaction", async () => {
         value: current,
       };
     },
-  };
+  });
 
   await discardDefinitiveSubmittedTransaction({
     withdrawalRecord,
@@ -1197,7 +1223,7 @@ test("checks authoritative state before discarding a submission", async () => {
     transactionSignature: "signature",
   };
   const inputs = [];
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       inputs.push(null);
       assert.equal(update(null), null);
@@ -1208,7 +1234,7 @@ test("checks authoritative state before discarding a submission", async () => {
         value: null,
       };
     },
-  };
+  });
 
   await discardDefinitiveSubmittedTransaction({
     withdrawalRecord,
@@ -1224,7 +1250,7 @@ test("does not discard a concurrent successor submission", async () => {
     leaseId: "successor-lease",
     transactionSignature: "successor-signature",
   };
-  const withdrawalRecord = {
+  const withdrawalRecord = typedWithdrawalRecord({
     transaction: async (update) => {
       const next = update(successor);
       assert.equal(next, successor);
@@ -1233,7 +1259,7 @@ test("does not discard a concurrent successor submission", async () => {
         value: successor,
       };
     },
-  };
+  });
 
   await assert.rejects(
     discardDefinitiveSubmittedTransaction({
@@ -2187,7 +2213,7 @@ test("rejects a mismatched persisted signature before reading its status", async
 test("completion records the canonical profile and retains event history", () => {
   const originalProfileId = "profile-before-merge";
   const currentProfileId = "profile-after-merge";
-  const result = buildWithdrawalCompletionUpdates({
+  const result = buildWithdrawalCompletion({
     withdrawal: {
       profileId: originalProfileId,
       entitledProfileId: originalProfileId,
@@ -2204,26 +2230,30 @@ test("completion records the canonical profile and retains event history", () =>
     transactionSignature: "signature",
     completedAtMs: 30,
   });
-  assert.equal(result.completed.status, "completed");
-  assert.equal(result.completed.assetStandard, "core");
-  assert.equal(result.completed.profileId, currentProfileId);
-  assert.equal(result.completed.entitledProfileId, originalProfileId);
   assert.equal(
-    result.updates[`eventPrizeWithdrawals/${eventId}/${prizeId}`],
-    result.completed,
-  );
-  assert.equal(
-    Object.keys(result.updates).some(
-      (path) =>
-        path.startsWith("profileEventPrizes/") ||
-        path.startsWith(`events/${eventId}/prizeAssignments`),
-    ),
-    false,
+    JSON.stringify(result),
+    JSON.stringify({
+      eventId,
+      prizeId,
+      assetAddress,
+      assetStandard: "core",
+      profileId: currentProfileId,
+      entitledProfileId: originalProfileId,
+      place: 1,
+      recipientAddress,
+      requesterUid: "uid",
+      status: "completed",
+      transactionSignature: "signature",
+      startedAtMs: 10,
+      submittedAtMs: 20,
+      completedAtMs: 30,
+      updatedAtMs: 30,
+    }),
   );
 });
 
-test("completion marker updates never delete profile projections directly", () => {
-  const result = buildWithdrawalCompletionUpdates({
+test("completion payload preserves timestamp fallbacks and contains no profile projection mutations", () => {
+  const completed = buildWithdrawalCompletion({
     withdrawal: {
       profileId,
       entitledProfileId: profileId,
@@ -2238,12 +2268,23 @@ test("completion marker updates never delete profile projections directly", () =
     transactionSignature: "signature",
     completedAtMs: 30,
   });
-  assert.equal(
-    Object.keys(result.updates).some((path) =>
-      path.startsWith("profileEventPrizes/"),
-    ),
-    false,
-  );
+  assert.deepEqual(completed, {
+    eventId,
+    prizeId,
+    assetAddress,
+    assetStandard: "core",
+    profileId,
+    entitledProfileId: profileId,
+    place: 1,
+    recipientAddress,
+    requesterUid: "uid",
+    status: "completed",
+    transactionSignature: "signature",
+    startedAtMs: 30,
+    submittedAtMs: 30,
+    completedAtMs: 30,
+    updatedAtMs: 30,
+  });
 });
 
 test("completion reconciliation includes every known profile exactly once", () => {

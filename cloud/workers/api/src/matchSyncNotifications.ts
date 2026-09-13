@@ -8,28 +8,6 @@ type MatchSyncNotificationOptions = InviteRoomNotificationOptions & {
   resolveInvite?: (target: MatchSyncTarget) => Promise<string | null>;
 };
 
-export function changedMatchSyncTargets(
-  updates: Record<string, unknown>,
-): MatchSyncTarget[] {
-  const targets = new Map<string, MatchSyncTarget>();
-  for (const path of Object.keys(updates)) {
-    const parts = path.replace(/^\/+|\/+$/g, "").split("/");
-    if (
-      parts[0] !== "players" ||
-      parts[2] !== "matches" ||
-      parts.length < 4 ||
-      !isCanonicalLoginUid(parts[1]) ||
-      parts[3] !== parts[3].trim() ||
-      parts.slice(3).some((part) => !isSafeRecordKey(part))
-    ) {
-      continue;
-    }
-    const target = { playerId: parts[1], matchId: parts[3] };
-    targets.set(`${target.playerId}/${target.matchId}`, target);
-  }
-  return [...targets.values()];
-}
-
 async function boundedNotification(
   work: (signal: AbortSignal) => Promise<void>,
   {
@@ -59,10 +37,24 @@ async function boundedNotification(
 
 export async function notifyMatchSyncChanged(
   env: Env,
-  updates: Record<string, unknown>,
+  changed: readonly MatchSyncTarget[],
   options: MatchSyncNotificationOptions = {},
 ): Promise<void> {
-  const targets = changedMatchSyncTargets(updates);
+  const targets = [
+    ...new Map(
+      changed
+        .filter(
+          (target) =>
+            isCanonicalLoginUid(target.playerId) &&
+            isSafeRecordKey(target.matchId) &&
+            target.matchId === target.matchId.trim(),
+        )
+        .map((target) => [
+          JSON.stringify([target.playerId, target.matchId]),
+          target,
+        ]),
+    ).values(),
+  ];
   if (!targets.length || !env.INVITE_REACTIONS) return;
   await boundedNotification(async (signal) => {
     const resolved = await Promise.all(

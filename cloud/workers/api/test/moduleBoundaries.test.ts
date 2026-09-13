@@ -42,6 +42,76 @@ test("canonical D1 modules have no direct Firestore runtime dependency", () => {
 const repositoryRoot = resolve(import.meta.dirname, "../../../..");
 const runtimeExtensions = [".ts", ".tsx", ".js", ".mjs", ".cjs"];
 
+test("Worker database execution uses domain methods and isolated compatibility codecs", () => {
+  const codecPaths = new Set([
+    "cloud/workers/api/src/eventCompatibilityCodec.ts",
+    "cloud/workers/api/src/eventTransitionCodec.ts",
+    "cloud/workers/api/src/gameSessionCodec.ts",
+  ]);
+  const retiredMethods = new Set([
+    "getPath",
+    "patchRoot",
+    "transactPath",
+    "getStatePath",
+    "patchStateRoot",
+    "transactStatePath",
+    "replacePaths",
+  ]);
+  const databaseRoot =
+    /^(?:players|invites|automatch|telegramMessages|telegramAutomatches|telegramProjectionOutbox|profileGameProjectionOutbox|eventLocks|eventSyncThrottles|events|eventPrizeSelections|profileEventPrizes|eventPrizeWithdrawals|eventProgressOutbox|eventProgressOutboxDead|eventTelegramProjections|eventTelegramProjectionGenerations|gameplayMutationReceipts|gameplayMutationReceiptExpirations)\//;
+  const violations: string[] = [];
+  for (const path of reachableRuntimeFiles(
+    resolve(import.meta.dirname, "../src/index.ts"),
+  )) {
+    const file = relative(repositoryRoot, path);
+    const codec = codecPaths.has(file);
+    const source = typescript.createSourceFile(
+      path,
+      readFileSync(path, "utf8"),
+      typescript.ScriptTarget.Latest,
+      true,
+    );
+    const report = (node: import("typescript").Node, reason: string) => {
+      violations.push(
+        `${file}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}: ${reason}`,
+      );
+    };
+    const visit = (node: import("typescript").Node): void => {
+      if (typescript.isIdentifier(node) && retiredMethods.has(node.text)) {
+        report(node, `retired ${node.text} API`);
+      }
+      if (
+        typescript.isElementAccessExpression(node) &&
+        typescript.isStringLiteralLike(node.argumentExpression) &&
+        retiredMethods.has(node.argumentExpression.text)
+      ) {
+        report(node, "retired database method lookup");
+      }
+      if (
+        !codec &&
+        typescript.isTemplateExpression(node) &&
+        databaseRoot.test(node.head.text)
+      ) {
+        report(node, "database path constructed outside a compatibility codec");
+      }
+      if (codec && typescript.isCallExpression(node)) {
+        const expression = node.expression;
+        if (
+          (typescript.isIdentifier(expression) &&
+            expression.text === "fetch") ||
+          (typescript.isPropertyAccessExpression(expression) &&
+            ["prepare", "batch", "getByName"].includes(expression.name.text))
+        ) {
+          report(node, "I/O inside a compatibility codec");
+        }
+      }
+      typescript.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  assert.deepEqual(violations, []);
+});
+
 test("invite source readers cannot construct Firebase or Google clients", () => {
   const violations = reachableRuntimeFiles(
     resolve(import.meta.dirname, "../src/inviteSource.ts"),

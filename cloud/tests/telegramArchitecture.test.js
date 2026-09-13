@@ -180,7 +180,7 @@ test("event Telegram projection uses a dedicated lock without changing domain lo
   );
   assert.equal(projectorSource.includes("createEventLockManagerCore"), true);
   assert.equal(
-    projectorSource.includes("EVENT_TELEGRAM_PROJECTION_LOCK_ROOT"),
+    projectorSource.includes('lockKind: "telegram-projection"'),
     true,
   );
   const coreSource = fs.readFileSync(

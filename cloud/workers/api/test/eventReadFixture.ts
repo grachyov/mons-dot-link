@@ -3,7 +3,7 @@ import type {
   EventPrizeAssignmentRecord,
   EventReads,
 } from "../../../runtime/eventReads.js";
-import type { StateQuery } from "../src/stateRepositoryTypes.ts";
+import type { StateQuery } from "../test/stateRepositoryTestTypes.ts";
 import type { EventOutboxReads } from "../src/eventOutboxReadRepository.ts";
 
 export function eventReadFixture(

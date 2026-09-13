@@ -8,7 +8,7 @@ import {
 import {
   StateRepositoryFailure,
   StateRepositoryPermissionDenied,
-} from "../src/stateRepositoryTypes.ts";
+} from "../test/stateRepositoryTestTypes.ts";
 
 test("neutral state operations preserve stored server-value bytes and effect keys", () => {
   assert.equal(STATE_EFFECTS_FIELD, "rtdbEffects");

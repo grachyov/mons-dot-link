@@ -103,7 +103,7 @@ function setup({
     guestMatch: null,
   };
   const repository = createGameplayRepository(env);
-  repository.getStatePath = async () => {
+  repository.readMatchRecord = async () => {
     throw new Error("unexpected-full-state-read");
   };
   repository.readInviteMetadata = async (inviteId) => {

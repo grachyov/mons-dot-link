@@ -177,20 +177,6 @@ const buildTelegramDeleteDesired = ({ destination, sourceRevision }) =>
     sourceRevision: normalizeSourceRevision(sourceRevision),
   });
 
-const buildDesiredUpdates = (messageKey, desired) => ({
-  [`${TELEGRAM_MESSAGE_ROOT}/${validateTelegramMessageKey(messageKey)}/desired`]:
-    desired,
-});
-
-const buildTelegramSendUpdates = ({ messageKey, ...desiredInput }) =>
-  buildDesiredUpdates(messageKey, buildTelegramSendDesired(desiredInput));
-
-const buildTelegramEditUpdates = ({ messageKey, ...desiredInput }) =>
-  buildDesiredUpdates(messageKey, buildTelegramEditDesired(desiredInput));
-
-const buildTelegramDeleteUpdates = ({ messageKey, ...desiredInput }) =>
-  buildDesiredUpdates(messageKey, buildTelegramDeleteDesired(desiredInput));
-
 const resolveTelegramDestination = (destination, environment = process.env) => {
   if (
     destination === TELEGRAM_DESTINATIONS.community ||
@@ -206,11 +192,8 @@ module.exports = {
   TELEGRAM_MESSAGE_ROOT,
   TELEGRAM_SCHEMA_VERSION,
   buildTelegramDeleteDesired,
-  buildTelegramDeleteUpdates,
   buildTelegramEditDesired,
-  buildTelegramEditUpdates,
   buildTelegramSendDesired,
-  buildTelegramSendUpdates,
   resolveTelegramDestination,
   validateTelegramMessageKey,
 };

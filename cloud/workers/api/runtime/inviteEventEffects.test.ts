@@ -1,3 +1,5 @@
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import { eventMatchTestPort } from "./eventRepositoryFixture.ts";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { applyStrictMatchStateTestMigrations } from "./strictMatchStateTestFixture.ts";
@@ -13,8 +15,8 @@ import {
   createEventStateRepository,
   recoverEventTransitionIntents,
 } from "../src/eventRepository.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
-import { createInviteSourceD1Store } from "../src/inviteSourceD1.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
+import { createLegacyInviteSourceD1Store as createInviteSourceD1Store } from "../test/legacyInviteSourceFixture.ts";
 import { prepareInviteEventIntent } from "../src/inviteEventEffects.ts";
 import { applyEventTestMigrations } from "./eventTestMigrations.ts";
 import { resetEventReceiptTestState } from "./eventTransitionTestFixture.ts";
@@ -167,8 +169,8 @@ function fixture(profileGamesDb = testEnv.PROFILE_GAMES_DB) {
     Promise.resolve(appearanceRegistrations(creations));
   const client = createEventStateRepository(
     fixtureEnv,
-    base,
-    raw,
+    eventMatchTestPort(base),
+    eventMatchTestPort(raw),
     prepareMatchPresentations,
   );
   return {
@@ -179,19 +181,24 @@ function fixture(profileGamesDb = testEnv.PROFILE_GAMES_DB) {
     source,
     raw,
     client,
-    create: () => client.patchRoot({ [`events/${eventId}`]: eventRecord() }),
+    create: () =>
+      client.commitEventPlan(
+        decodeEventUpdates({ [`events/${eventId}`]: eventRecord() }),
+      ),
     start: (extra = {}) =>
-      client.patchRoot({
-        [`events/${eventId}/status`]: "active",
-        [`events/${eventId}/updatedAtMs`]: 200,
-        ...matchEffects(),
-        ...extra,
-      }),
+      client.commitEventPlan(
+        decodeEventUpdates({
+          [`events/${eventId}/status`]: "active",
+          [`events/${eventId}/updatedAtMs`]: 200,
+          ...matchEffects(),
+          ...extra,
+        }),
+      ),
     recover: () =>
       recoverEventTransitionIntents(
         fixtureEnv,
         100,
-        raw,
+        eventMatchTestPort(raw),
         prepareMatchPresentations,
       ),
   };
@@ -557,7 +564,13 @@ describe("event transitions with canonical D1 invitation metadata", () => {
     await expect(
       f.start({
         [timerPath]: "gg",
-        [claimPath]: { status: "claimed", claimedAtMs: 100 },
+        [claimPath]: {
+          status: "claimed",
+          claimedAtMs: 100,
+          inviteId,
+          playerId: "host",
+          opponentId: "guest",
+        },
         [startPath]: null,
       }),
     ).rejects.toThrow("event-source-discovery-failed");
@@ -668,7 +681,7 @@ describe("event transitions with canonical D1 invitation metadata", () => {
     }
   });
 
-  it("keeps a partially created event recoverable across an admission freeze", async () => {
+  it("keeps applied matches recoverable across an admission freeze", async () => {
     const f = fixture();
     await f.create();
     f.hooks.afterWrite = async (path) => {
@@ -679,7 +692,7 @@ describe("event transitions with canonical D1 invitation metadata", () => {
       ).run();
     };
     await expect(f.start()).rejects.toThrow();
-    expect(f.writes).toEqual([hostPath]);
+    expect(f.writes).toEqual([hostPath, guestPath]);
     expect(await count("invite_sources")).toBe(0);
     expect(await count("invite_source_write_admissions")).toBe(0);
     await testEnv.PROFILE_GAMES_DB.prepare(
@@ -770,12 +783,20 @@ describe("event transitions with canonical D1 invitation metadata", () => {
   it("preserves specific timer cleanup effects and fences source freezes", async () => {
     const f = fixture();
     await f.create();
-    f.values.set("matchTimerStarts/host/timer-match", { pending: true });
-    await f.client.patchRoot({
-      [`events/${eventId}/updatedAtMs`]: 200,
-      "matchTimerStarts/host/timer-match": null,
-    });
-    expect(f.values.has("matchTimerStarts/host/timer-match")).toBe(false);
+    await testEnv.PROFILE_GAMES_DB.prepare(
+      "INSERT INTO match_timer_starts(player_id,match_id,timer,turn_number,updated_at_ms) VALUES('timer-match','host','pending',0,1)",
+    ).run();
+    await f.client.commitEventPlan(
+      decodeEventUpdates({
+        [`events/${eventId}/updatedAtMs`]: 200,
+        "matchTimerStarts/host/timer-match": null,
+      }),
+    );
+    expect(
+      await testEnv.PROFILE_GAMES_DB.prepare(
+        "SELECT COUNT(*) AS count FROM match_timer_starts WHERE player_id='timer-match' AND match_id='host'",
+      ).first<number>("count"),
+    ).toBe(0);
     expect(await count("invite_event_effect_receipts")).toBe(1);
     await testEnv.PROFILE_GAMES_DB.prepare(
       "UPDATE invite_source_control SET state = 'frozen', freeze_generation = freeze_generation + 1 WHERE singleton = 1",

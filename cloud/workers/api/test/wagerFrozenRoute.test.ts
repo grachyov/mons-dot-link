@@ -35,7 +35,7 @@ function fixture(owners: Record<string, string | null> = {}) {
   const repository = createGameplayRepository(environment);
   let reads = 0;
   let snapshots = 0;
-  repository.getStatePath = async () => {
+  repository.readInviteMetadata = async () => {
     throw new Error("unexpected-source-read");
   };
   repository.readProfileOwnershipSnapshot = async (query) => {
@@ -273,7 +273,7 @@ test("rechecks client storage version after activation races admission dispatch"
   let versionChecks = 0;
   let admissions = 0;
   let domainReads = 0;
-  value.repository.getStatePath = async () => {
+  value.repository.readInviteMetadata = async () => {
     domainReads++;
     throw new Error("unexpected-domain-work");
   };

@@ -1,4 +1,7 @@
-const EVENT_PRIZE_WITHDRAWAL_ROOT = "eventPrizeWithdrawals";
+import type {
+  TransactionDecision,
+  TransactionResult,
+} from "./repositoryContracts.ts";
 const MAX_TRANSACTION_ATTEMPTS = 12;
 
 type JsonRow = {
@@ -9,21 +12,27 @@ type JsonRow = {
 export type EventPrizeWithdrawalStorageMode = "d1" | "frozen";
 
 export type EventPrizeWithdrawalRecord = {
-  read(): Promise<unknown>;
-  transaction(updater: (current: unknown) => unknown): Promise<{
-    committed: boolean;
-    value: unknown;
-  }>;
-  update(updates: Record<string, unknown>): Promise<void>;
+  read(): Promise<Record<string, unknown> | null>;
+  transaction(
+    updater: (
+      current: Record<string, unknown> | null,
+    ) => TransactionDecision<Record<string, unknown>>,
+  ): Promise<TransactionResult<Record<string, unknown>>>;
 };
-
+export type EventPrizeWithdrawalReplacement = {
+  eventId: string;
+  prizeId: string;
+  value: Record<string, unknown> | null;
+};
 export type EventPrizeWithdrawalStore = {
   get(
     eventId: string,
     prizeId: string,
   ): Promise<Record<string, unknown> | null>;
   record(eventId: string, prizeId: string): EventPrizeWithdrawalRecord;
-  replacePaths(updates: Record<string, unknown>): Promise<void>;
+  replaceRecords(
+    records: readonly EventPrizeWithdrawalReplacement[],
+  ): Promise<void>;
 };
 
 export type EventPrizeWithdrawalStorageControl = {
@@ -125,18 +134,6 @@ function updatedAtMs(
   return candidate;
 }
 
-export function parseEventPrizeWithdrawalPath(
-  path: string,
-): { eventId: string; prizeId: string } | null {
-  const parts = path.split("/");
-  if (parts.length !== 3 || parts[0] !== EVENT_PRIZE_WITHDRAWAL_ROOT) {
-    return null;
-  }
-  const eventId = cleanKey(parts[1]);
-  const prizeId = cleanKey(parts[2]);
-  return eventId && prizeId ? { eventId, prizeId } : null;
-}
-
 async function readRow(
   db: D1Database,
   eventId: string,
@@ -167,17 +164,24 @@ async function transactRow(
   db: D1Database,
   eventId: string,
   prizeId: string,
-  updater: (current: unknown) => unknown,
+  updater: (
+    current: Record<string, unknown> | null,
+  ) => TransactionDecision<Record<string, unknown>>,
   now: () => number,
-): Promise<{ committed: boolean; value: unknown }> {
+): Promise<TransactionResult<Record<string, unknown>>> {
   for (let attempt = 0; attempt < MAX_TRANSACTION_ATTEMPTS; attempt += 1) {
     const current = await readRow(db, eventId, prizeId);
-    const next = updater(current?.record ?? null);
-    if (next === undefined) {
-      return { committed: false, value: current?.record ?? null };
-    }
+    const decision = updater(current?.record ?? null);
+    if ("commit" in decision)
+      return {
+        committed: false,
+        decision: decision.decision,
+        value: current?.record ?? null,
+      };
+    const next = decision.value;
     if (next === null) {
-      if (!current) return { committed: true, value: null };
+      if (!current)
+        return { committed: true, decision: decision.decision, value: null };
       const deleted = await db
         .prepare(
           `DELETE FROM event_prize_withdrawals
@@ -186,7 +190,7 @@ async function transactRow(
         .bind(eventId, prizeId, current.version)
         .run();
       if (deleted.meta.changes > 0) {
-        return { committed: true, value: null };
+        return { committed: true, decision: decision.decision, value: null };
       }
       continue;
     }
@@ -204,7 +208,11 @@ async function transactRow(
         .bind(eventId, prizeId, encoded, timestamp)
         .run();
       if (inserted.meta.changes > 0) {
-        return { committed: true, value: normalized };
+        return {
+          committed: true,
+          decision: decision.decision,
+          value: normalized,
+        };
       }
       continue;
     }
@@ -217,7 +225,11 @@ async function transactRow(
       .bind(encoded, timestamp, eventId, prizeId, current.version)
       .run();
     if (updated.meta.changes > 0) {
-      return { committed: true, value: normalized };
+      return {
+        committed: true,
+        decision: decision.decision,
+        value: normalized,
+      };
     }
   }
   throw new EventPrizeWithdrawalD1Failure("event-prize-withdrawal-d1-conflict");
@@ -307,12 +319,17 @@ export function createD1EventPrizeWithdrawalStore(
   db: D1Database,
   { now = Date.now }: { now?: () => number } = {},
 ): EventPrizeWithdrawalStore {
-  const replacePaths = async (updates: Record<string, unknown>) => {
-    const statements = Object.entries(updates).map(([path, value]) => {
-      const identity = parseEventPrizeWithdrawalPath(path);
-      if (!identity) {
+  const replaceRecords = async (
+    records: readonly EventPrizeWithdrawalReplacement[],
+  ) => {
+    const statements = records.map(({ eventId, prizeId, value }) => {
+      const identity = {
+        eventId: cleanKey(eventId),
+        prizeId: cleanKey(prizeId),
+      };
+      if (!identity.eventId || !identity.prizeId) {
         throw new EventPrizeWithdrawalD1Failure(
-          "invalid-event-prize-withdrawal-path",
+          "invalid-event-prize-withdrawal-identity",
         );
       }
       if (value === null) {
@@ -376,32 +393,19 @@ export function createD1EventPrizeWithdrawalStore(
             normalizedPrizeId,
           );
         },
-        async transaction(updater) {
-          const result = await transactRow(
+        transaction(updater) {
+          return transactRow(
             db,
             normalizedEventId,
             normalizedPrizeId,
             updater,
             now,
           );
-          return {
-            committed: result.committed,
-            value: result.value,
-          };
-        },
-        async update(updates) {
-          await transactRow(
-            db,
-            normalizedEventId,
-            normalizedPrizeId,
-            (current) => ({ ...(record(current) || {}), ...updates }),
-            now,
-          );
         },
       };
     },
-    replacePaths,
+    replaceRecords,
   };
 }
 
-export { EVENT_PRIZE_WITHDRAWAL_ROOT, MAX_TRANSACTION_ATTEMPTS };
+export { MAX_TRANSACTION_ATTEMPTS };

@@ -4,26 +4,16 @@ const EVENT_LOCK_ROOT = "eventLocks";
 const EVENT_LOCK_TTL_MS = 30 * 1000;
 const EVENT_LOCK_REFRESH_INTERVAL_MS = 10 * 1000;
 
-const resolveLockRoot = (value) => {
-  if (value === undefined) {
-    return EVENT_LOCK_ROOT;
-  }
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new TypeError("lockRoot must be a non-empty string");
-  }
-  const normalized = value.trim();
-  const segments = normalized.split("/");
-  if (
-    normalized.startsWith("/") ||
-    normalized.endsWith("/") ||
-    segments.some(
-      (segment) =>
-        segment === "" || /[.#$\[\]\u0000-\u001f\u007f]/.test(segment),
-    )
-  ) {
-    throw new TypeError("lockRoot must be a valid state path");
-  }
-  return normalized;
+const LOCK_ROOTS = {
+  event: "eventLocks",
+  "telegram-projection": "eventTelegramProjectionLocks",
+  "profile-game-projection": "profileGameProjectionLocks/event",
+  transition: "eventLocks",
+};
+const resolveLockKind = (value = "event") => {
+  if (!Object.hasOwn(LOCK_ROOTS, value))
+    throw new TypeError("invalid event lease kind");
+  return value;
 };
 
 const toFiniteInteger = (value, fallback = 0) => {
@@ -50,12 +40,14 @@ const getOwnershipDecision = (current, lockHandle, nowMs) => {
 };
 
 const createEventLockManagerCore = (dependencies) => {
-  if (!dependencies || typeof dependencies.transactPath !== "function") {
-    throw new TypeError("transactPath is required");
+  if (!dependencies || typeof dependencies.transactEventLease !== "function") {
+    throw new TypeError("transactEventLease is required");
   }
-  const lockRoot = resolveLockRoot(dependencies.lockRoot);
-  const transactPath = dependencies.transactPath;
-  const releaseTransactPath = dependencies.releaseTransactPath || transactPath;
+  const lockKind = resolveLockKind(dependencies.lockKind);
+  const lockRoot = LOCK_ROOTS[lockKind];
+  const transactLease = dependencies.transactEventLease;
+  const releaseTransactLease =
+    dependencies.releaseTransactEventLease || transactLease;
   const now = dependencies.now || Date.now;
   const createLockId = dependencies.createLockId;
   if (typeof createLockId !== "function") {
@@ -68,9 +60,9 @@ const createEventLockManagerCore = (dependencies) => {
   const includeLegacyOwnerId = dependencies.includeLegacyOwnerId === true;
 
   const acquireEventLock = async (eventId, ownerUid) => {
-    const path = `${lockRoot}/${eventId}`;
+    const key = { kind: lockKind, id: eventId };
     const lockId = createLockId();
-    const result = await transactPath(path, (current) => {
+    const result = await transactLease(key, (current) => {
       const nowMs = now();
       if (
         current &&
@@ -102,7 +94,7 @@ const createEventLockManagerCore = (dependencies) => {
     ) {
       return null;
     }
-    return { eventId, path, lockId, ownerUid, lockRoot };
+    return { eventId, key, lockId, ownerUid, lockRoot };
   };
 
   const getEventLockGuard = (lockHandle) => {
@@ -145,7 +137,7 @@ const createEventLockManagerCore = (dependencies) => {
     if (!lockHandle) {
       return false;
     }
-    const result = await transactPath(lockHandle.path, (current) => {
+    const result = await transactLease(lockHandle.key, (current) => {
       const refreshedAtMs = now();
       const ownership = getOwnershipDecision(
         current,
@@ -205,7 +197,7 @@ const createEventLockManagerCore = (dependencies) => {
       return false;
     }
     try {
-      const result = await releaseTransactPath(lockHandle.path, (current) => {
+      const result = await releaseTransactLease(lockHandle.key, (current) => {
         if (!current || typeof current !== "object") {
           return { commit: false, decision: "missing" };
         }
@@ -246,5 +238,5 @@ module.exports = {
   EVENT_LOCK_TTL_MS,
   createEventLockManagerCore,
   getOwnershipDecision,
-  resolveLockRoot,
+  resolveLockKind,
 };

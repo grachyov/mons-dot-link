@@ -45,10 +45,7 @@ export const EVENT_SNAPSHOT_PATH = "/events/snapshot";
 export const PROFILE_EVENT_PRIZES_PATH = "/events/prizes";
 
 type ReadDependencies = {
-  repository?: Pick<
-    GameplayRepository,
-    "getStatePath" | "readProfileOwnershipSnapshot"
-  >;
+  repository?: Pick<GameplayRepository, "readProfileOwnershipSnapshot">;
   verifyIdentity?: (
     request: Request,
     env: Env,

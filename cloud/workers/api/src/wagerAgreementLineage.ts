@@ -1,3 +1,5 @@
+import { requireWagerWriter, type WagerKey } from "./wagerStateRepository.ts";
+import { lineageFingerprint } from "./wagerStateCommands.ts";
 import type { MiningMaterialName } from "@mons/shared/mining";
 import { isWagerAgreement, type WagerAgreement } from "@mons/shared/wagers";
 import { isSafeRecordKey } from "./recordKeys.ts";
@@ -60,20 +62,6 @@ function validOperationId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
-function withoutReady(value: unknown): Record<string, unknown> {
-  const operation = toRecord(value);
-  const { reservationLineageReady: _ready, ...rest } = operation || {};
-  return rest;
-}
-
-function lineageFingerprint(value: unknown): string {
-  const wager = toRecord(value);
-  return JSON.stringify([
-    wager?.agreed,
-    withoutReady(wager?.agreementOperation),
-  ]);
-}
-
 function sameLineageReady(
   value: unknown,
   operationId: string,
@@ -89,16 +77,17 @@ function sameLineageReady(
 }
 
 async function createLineageContext(
-  wagerPath: string,
+  wagerKey: WagerKey,
   agreement: WagerAgreement | null,
   agreementOperation: Record<string, unknown>,
 ): Promise<LineageContext | null> {
   const operationId = agreementOperation.id;
   const proposerReservedCount = agreementOperation.proposerReservedCount;
-  const path = /^invites\/([^/]+)\/wagers\/([^/]+)$/.exec(wagerPath);
+  const { inviteId, matchId } = wagerKey;
   if (
     !agreement ||
-    !path ||
+    !isSafeRecordKey(inviteId) ||
+    !isSafeRecordKey(matchId) ||
     !validOperationId(operationId) ||
     typeof proposerReservedCount !== "number" ||
     !Number.isSafeInteger(proposerReservedCount) ||
@@ -110,7 +99,6 @@ async function createLineageContext(
   ) {
     return null;
   }
-  const [, inviteId, matchId] = path;
   return {
     agreement,
     agreementOperation,
@@ -359,12 +347,12 @@ function validateStoredAdjustments(
 
 async function expectedReservationAdjustments(
   repository: GameplayRepository,
-  wagerPath: string,
+  wagerKey: WagerKey,
   agreement: WagerAgreement | null,
   agreementOperation: Record<string, unknown>,
 ): Promise<ReservationAdjustment[] | null> {
   const context = await createLineageContext(
-    wagerPath,
+    wagerKey,
     agreement,
     agreementOperation,
   );
@@ -396,40 +384,19 @@ async function expectedReservationAdjustments(
 
 async function markWagerAgreementLineageReady(
   repository: GameplayRepository,
-  wagerPath: string,
+  wagerKey: WagerKey,
   operationId: string,
   fingerprint: string,
 ): Promise<void> {
   let value: unknown;
   try {
-    const result = await repository.transactStatePath(wagerPath, (current) => {
-      const wager = toRecord(current);
-      const agreementOperation = toRecord(wager?.agreementOperation);
-      if (
-        !wager ||
-        !wager.agreed ||
-        agreementOperation?.id !== operationId ||
-        agreementOperation.reservationLineageVersion !== 1 ||
-        lineageFingerprint(wager) !== fingerprint
-      ) {
-        return { commit: false, decision: "agreement-missing" };
-      }
-      if (agreementOperation.reservationLineageReady === true) {
-        return { commit: false, decision: "agreement-ready" };
-      }
-      return {
-        value: {
-          ...wager,
-          agreementOperation: {
-            ...agreementOperation,
-            reservationLineageReady: true,
-          },
-        },
-      };
-    });
+    const result = await requireWagerWriter(repository).markLineageReady(
+      wagerKey,
+      { operationId, fingerprint },
+    );
     value = result.value;
   } catch {
-    value = await repository.getStatePath(wagerPath);
+    value = await repository.wagers.readWager(wagerKey);
   }
   if (!sameLineageReady(value, operationId, fingerprint)) {
     throw new Error("wager-agreement-lineage-unavailable");
@@ -438,11 +405,11 @@ async function markWagerAgreementLineageReady(
 
 export async function ensureWagerAgreementLineageReady(
   repository: GameplayRepository,
-  wagerPath: string,
+  wagerKey: WagerKey,
   now: () => number,
   assertMutationAllowed?: () => Promise<void>,
 ): Promise<void> {
-  const wager = toRecord(await repository.getStatePath(wagerPath));
+  const wager = toRecord(await repository.wagers.readWager(wagerKey));
   const agreementOperation = toRecord(wager?.agreementOperation);
   if (
     !agreementOperation ||
@@ -455,12 +422,12 @@ export async function ensureWagerAgreementLineageReady(
   const fingerprint = lineageFingerprint(wager);
   const adjustments = await expectedReservationAdjustments(
     repository,
-    wagerPath,
+    wagerKey,
     isWagerAgreement(wager?.agreed) ? wager.agreed : null,
     agreementOperation,
   );
   if (!adjustments) {
-    const current = await repository.getStatePath(wagerPath);
+    const current = await repository.wagers.readWager(wagerKey);
     if (sameLineageReady(current, operationId, fingerprint)) {
       return;
     }
@@ -480,7 +447,7 @@ export async function ensureWagerAgreementLineageReady(
   await assertMutationAllowed?.();
   await markWagerAgreementLineageReady(
     repository,
-    wagerPath,
+    wagerKey,
     operationId,
     fingerprint,
   );

@@ -550,9 +550,7 @@ async function repairRatingSideEffects(
     : null;
   if (progress) {
     await assertMutationAllowed?.();
-    await repository.patchStateRoot({
-      [`eventProgressOutbox/${progress.outboxId}`]: progress.outbox,
-    });
+    await repository.putEventProgressOutbox(progress.outboxId, progress.outbox);
   }
   await assertMutationAllowed?.();
   await timerStarts.deletePair(
@@ -613,7 +611,7 @@ export async function updateRatings(
   );
   const operationId = `${request.inviteId}__${request.matchId}`;
   const [inviteValue, completed] = await Promise.all([
-    repository.getStatePath(`invites/${request.inviteId}`),
+    repository.readInviteMetadata(request.inviteId),
     repository.hasCompletedRatingUpdate(request.inviteId, request.matchId),
   ]);
   const invite = toRecord(inviteValue);

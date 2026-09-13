@@ -1,3 +1,4 @@
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import { env } from "cloudflare:workers";
 import type { D1Migration } from "cloudflare:test";
 import { applyStrictMatchStateTestMigrations } from "./strictMatchStateTestFixture.ts";
@@ -9,7 +10,7 @@ import {
   type EventProgressPlan,
   type EventProgressSweepRepository,
 } from "../src/eventProgress.ts";
-import { readEventOwnedPath } from "../src/eventD1.ts";
+import { readEventOwnedPath } from "./eventD1Fixture.ts";
 import { createEventStateRepository } from "../src/eventRepository.ts";
 import { applyEventTestMigrations } from "./eventTestMigrations.ts";
 
@@ -90,29 +91,31 @@ async function seedOutbox(): Promise<{
     100,
   );
   const client = createEventStateRepository(testEnv);
-  await client.patchRoot({
-    [`events/${eventId}`]: {
-      schemaVersion: 2,
-      eventId,
-      status: "active",
-      createdAtMs: 100,
-      updatedAtMs: 100,
-      startAtMs: 100,
-      createdByProfileId: "profile-one",
-      createdByLoginUid: "host",
-      createdByUsername: "ivan",
-      participants: {},
-      rounds: {},
-    },
-    [`eventProgressOutbox/${plan.outboxId}`]: plan.outbox,
-  });
+  await client.commitEventPlan(
+    decodeEventUpdates({
+      [`events/${eventId}`]: {
+        schemaVersion: 2,
+        eventId,
+        status: "active",
+        createdAtMs: 100,
+        updatedAtMs: 100,
+        startAtMs: 100,
+        createdByProfileId: "profile-one",
+        createdByLoginUid: "host",
+        createdByUsername: "ivan",
+        participants: {},
+        rounds: {},
+      },
+      [`eventProgressOutbox/${plan.outboxId}`]: plan.outbox,
+    }),
+  );
   return {
     plan,
     repository: {
       readEvent: client.readEvent,
       listDueEventProgressOutboxes: client.listDueEventProgressOutboxes,
-      getStatePath: client.getPath,
-      patchStateRoot: client.patchRoot,
+      readEventProgressOutbox: client.readEventProgressOutbox,
+      commitEventPlan: client.commitEventPlan,
     },
   };
 }
@@ -223,9 +226,9 @@ describe("event-progress Workflow dispatch admissions", () => {
       await sweepEventProgress(f.value, {
         repository: {
           ...repository,
-          async patchStateRoot(updates) {
+          async commitEventPlan(updates) {
             await assertBlocked("before-outbox");
-            await repository.patchStateRoot(updates);
+            await repository.commitEventPlan(updates);
             await assertBlocked("after-outbox");
           },
         },

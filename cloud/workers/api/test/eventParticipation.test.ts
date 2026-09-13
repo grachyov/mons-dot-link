@@ -1,3 +1,8 @@
+import {
+  attachEventTestPorts,
+  type EventTestSource,
+} from "./eventTestPorts.ts";
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { EventSnapshot } from "../../../runtime/eventReads.js";
@@ -16,21 +21,27 @@ import type { ProfileOwnershipSnapshot } from "../src/profileOwnership.ts";
 const profileId = "creator-profile";
 const identity = { uid: "creator-login" };
 
-type TestEventParticipationRepository = EventParticipationRepository & {
-  getGameplayProfile(
-    uid: string,
-    signal?: AbortSignal,
-  ): Promise<GameplayProfile | null>;
-  getGameplayProfileOwnership(
-    uid: string,
-    signal?: AbortSignal,
-  ): Promise<{ loginUids: string[]; profile: GameplayProfile } | null>;
-  listProfileLoginUids(profileId: string): Promise<string[]>;
-  resolveCanonicalProfileId(profileId: string): Promise<string | null>;
-  resolveCanonicalProfileIds(
-    profileIds: string[],
-  ): Promise<Array<string | null>>;
-};
+type TestEventParticipationRepository = EventParticipationRepository &
+  Required<
+    Pick<
+      EventTestSource,
+      "getStatePath" | "patchStateRoot" | "transactStatePath"
+    >
+  > & {
+    getGameplayProfile(
+      uid: string,
+      signal?: AbortSignal,
+    ): Promise<GameplayProfile | null>;
+    getGameplayProfileOwnership(
+      uid: string,
+      signal?: AbortSignal,
+    ): Promise<{ loginUids: string[]; profile: GameplayProfile } | null>;
+    listProfileLoginUids(profileId: string): Promise<string[]>;
+    resolveCanonicalProfileId(profileId: string): Promise<string | null>;
+    resolveCanonicalProfileIds(
+      profileIds: string[],
+    ): Promise<Array<string | null>>;
+  };
 
 const creatorProfile: GameplayProfile = {
   profileId,
@@ -137,7 +148,7 @@ function createRepository({
     return selections;
   };
   let repository: TestEventParticipationRepository;
-  repository = {
+  repository = attachEventTestPorts<TestEventParticipationRepository>({
     getGameplayProfile: async (uid) =>
       Object.hasOwn(profilesByUid, uid)
         ? profilesByUid[uid] || null
@@ -296,7 +307,7 @@ function createRepository({
       }
     },
     transactStatePath: async () => ({ committed: false, value: null }),
-  };
+  });
   return { patches, repository };
 }
 
@@ -315,7 +326,7 @@ function createLockManager({
   let stopped = 0;
   const handle = {
     eventId: "event-1",
-    path: "eventLocks/event-1",
+    key: { kind: "event" as const, id: "event-1" },
     lockId: "lock-1",
     ownerUid: identity.uid,
     lockRoot: "eventLocks",
@@ -355,7 +366,10 @@ function createLockManager({
   };
 }
 
-const noDueTransition = async () => ({ didChange: false, updates: {} });
+const noDueTransition = async () => ({
+  didChange: false,
+  updates: decodeEventUpdates({}),
+});
 
 async function expectFailure(
   promise: Promise<unknown>,
@@ -744,10 +758,10 @@ test("persists an overdue transition before rejecting a late join", async () => 
       now: () => 100,
       buildDueUpdates: async () => ({
         didChange: true,
-        updates: {
+        updates: decodeEventUpdates({
           "events/event-1/status": "active",
           "events/event-1/updatedAtMs": 100,
-        },
+        }),
       }),
     }),
     409,
@@ -896,10 +910,10 @@ test("uses one locked prize snapshot when a join crosses the start deadline", as
         assert.deepEqual(input.prizeSelections, selections);
         return {
           didChange: true,
-          updates: {
+          updates: decodeEventUpdates({
             [`events/${eventId}/status`]: "active",
             [`events/${eventId}/updatedAtMs`]: 101,
-          },
+          }),
         };
       },
     },
@@ -1076,10 +1090,10 @@ test("does not persist an overdue transition after losing the lock", async () =>
       now: () => 100,
       buildDueUpdates: async () => ({
         didChange: true,
-        updates: {
+        updates: decodeEventUpdates({
           "events/event-1/status": "active",
           "events/event-1/updatedAtMs": 100,
-        },
+        }),
       }),
     }),
     503,
@@ -1171,7 +1185,7 @@ test("requires an ambiguous join to include its due transition", async () => {
       now: () => 100,
       buildDueUpdates: async () => ({
         didChange: true,
-        updates: { "events/event-1/status": "active" },
+        updates: decodeEventUpdates({ "events/event-1/status": "active" }),
       }),
     }),
     (error) => error === patchError,
@@ -1195,7 +1209,7 @@ test("reconciles an ambiguous join with its committed due transition", async () 
       now: () => 100,
       buildDueUpdates: async () => ({
         didChange: true,
-        updates: { "events/event-1/status": "active" },
+        updates: decodeEventUpdates({ "events/event-1/status": "active" }),
       }),
     }),
     { ok: true, eventId: "event-1", participant: stored },
@@ -1812,10 +1826,10 @@ test("rejects missing participants and rechecks the start boundary", async () =>
         now: () => times.shift() || 101,
         buildDueUpdates: async () => ({
           didChange: true,
-          updates: {
+          updates: decodeEventUpdates({
             "events/event-1/status": "active",
             "events/event-1/updatedAtMs": 101,
-          },
+          }),
         }),
       },
     ),

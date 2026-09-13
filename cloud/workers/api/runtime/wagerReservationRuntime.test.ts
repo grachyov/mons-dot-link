@@ -33,9 +33,8 @@ describe("D1 wager reservation runtime", () => {
       throw new Error("unexpected-source-reservation-access");
     };
     const repository = {
-      getStatePath: unexpectedSource,
-      transactStatePath: unexpectedSource,
-      patchStateRoot: unexpectedSource,
+      readInviteMetadata: unexpectedSource,
+      wagers: { readWager: unexpectedSource },
     } as unknown as GameplayRepository;
     const runtime = createWagerReservationRuntime(env, repository, {
       now: () => 2_000_000,
@@ -94,7 +93,7 @@ describe("D1 wager reservation runtime", () => {
   it("fails unavailable D1 control closed without querying gameplay storage", async () => {
     let sourceAccesses = 0;
     const repository = {
-      getStatePath: async () => {
+      readInviteMetadata: async () => {
         sourceAccesses++;
         return null;
       },

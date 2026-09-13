@@ -1,3 +1,8 @@
+import {
+  AUTOMATCH_ROOTS,
+  parseAutomatchPath,
+} from "../test/legacyAutomatchStoreFixture.ts";
+import { createLegacyAutomatchD1Store as createAutomatchD1Store } from "../test/legacyAutomatchStoreFixture.ts";
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -5,10 +10,7 @@ import {
   acquireAutomatchWriteAdmission,
   assertAutomatchWriteAdmission,
   AUTOMATCH_RECORD_TABLES,
-  AUTOMATCH_ROOTS,
   automatchAdmissionGuardStatements,
-  createAutomatchD1Store,
-  parseAutomatchPath,
   readAutomatchRuntimeControl,
   releaseAutomatchWriteAdmission,
   type AutomatchRoot,
@@ -315,6 +317,61 @@ describe("D1 automatch state", () => {
     ).rejects.toThrow("overlapping");
   });
 
+  it("prepares typed changes with one timestamp and preserves historical siblings", async () => {
+    const { store } = await writableStore();
+    await store.patchRoot({
+      "telegramAutomatches/invite": { generation: 2, lifecycle: "pending" },
+      "profileGameProjectionOutbox/automatch/invite": {
+        requestId: "old",
+        historicalMatches: { first: { finalizedAtMs: 1 } },
+      },
+    });
+    const prepared = await store.prepareChanges(
+      [
+        {
+          kind: "telegram-source-merge",
+          inviteId: "invite",
+          value: {
+            generation: { ".sv": { increment: 1 } },
+            updatedAtMs: { ".sv": "timestamp" },
+          },
+        },
+        {
+          kind: "profile-outbox-merge",
+          inviteId: "invite",
+          value: {
+            schemaVersion: 1,
+            status: "pending",
+            requestId: "next",
+            reason: "joined",
+            sourceUpdatedAtMs: { ".sv": "timestamp" },
+            lastQueuedAtMs: { ".sv": "timestamp" },
+          },
+          historicalMatches: { second: { finalizedAtMs: 2 } },
+        },
+      ],
+      500,
+    );
+    expect(await store.commit(prepared)).toBe(true);
+    expect(await store.readAutomatchTelegramSource("invite")).toEqual({
+      generation: 3,
+      lifecycle: "pending",
+      updatedAtMs: 500,
+    });
+    expect(await store.readAutomatchProfileOutbox("invite")).toEqual({
+      schemaVersion: 1,
+      status: "pending",
+      requestId: "next",
+      reason: "joined",
+      sourceUpdatedAtMs: 500,
+      lastQueuedAtMs: 500,
+      historicalMatches: {
+        first: { finalizedAtMs: 1 },
+        second: { finalizedAtMs: 2 },
+      },
+    });
+  });
+
   it("retries a conflicted transaction and fences stale queue settlement", async () => {
     const { store } = await writableStore();
     const path = "telegramProjectionOutbox/automatch/invite";
@@ -351,11 +408,14 @@ describe("D1 automatch state", () => {
       writeGuards: () => automatchAdmissionGuardStatements(db, admission),
     });
     let calls = 0;
-    const pending = blocked.transactPath(path, (current) => {
-      calls++;
-      const input = current as { count: number; requestId: string };
-      return { value: { ...input, count: input.count + 1 } };
-    });
+    const pending = blocked.transactAutomatchTelegramOutbox(
+      "invite",
+      (current) => {
+        calls++;
+        const input = current as { count: number; requestId: string };
+        return { value: { ...input, count: input.count + 1 } };
+      },
+    );
     await paused;
     await store.patchRoot({ [path]: { requestId: "second", count: 5 } });
     releaseFirst();
@@ -365,7 +425,7 @@ describe("D1 automatch state", () => {
     });
     expect(calls).toBe(2);
     await expect(
-      store.transactPath(path, (current) =>
+      store.transactAutomatchTelegramOutbox("invite", (current) =>
         (current as { requestId: string }).requestId === "first"
           ? { value: null }
           : { commit: false, decision: "stale" },

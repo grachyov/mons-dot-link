@@ -7,13 +7,8 @@ import {
 } from "../../../runtime/telegram/sundayMonsReminder.js";
 import { readEventRuntimeControl } from "./eventD1.ts";
 import { createEventGameplayRepository } from "./eventRepository.ts";
-import {
-  buildEventTelegramProjectionOutbox,
-  getEventTelegramProjectionGenerationPath,
-  getEventTelegramProjectionOutboxPath,
-} from "./eventTelegramProjectionProducer.ts";
+import { buildEventTelegramProjectionOutbox } from "./eventTelegramProjectionProducer.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
-import { stateIncrement } from "./stateRepositoryTypes.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import { profileBackgroundMutationsEnabled } from "./profileCanonicalActivation.ts";
 import {
@@ -35,7 +30,7 @@ export type SundayMonsReminderRefreshDependencies = {
   controlsEnabled?: (env: Env) => Promise<boolean>;
   eventRepository?: Pick<
     EventGameplayRepository,
-    "readEvent" | "patchStateRoot"
+    "readEvent" | "commitEventPlan"
   >;
   announcementRepository?: Pick<TelegramAnnouncementRepository, "get">;
   enqueue?: (task: EventTelegramProjectionTask) => Promise<unknown>;
@@ -183,11 +178,14 @@ export async function refreshSundayMonsReminder(
     eventId,
     requestId,
   };
-  await repository.patchStateRoot({
-    [getEventTelegramProjectionOutboxPath(eventId)]:
-      buildEventTelegramProjectionOutbox(requestId, nowMs),
-    [getEventTelegramProjectionGenerationPath(eventId)]: stateIncrement(1),
-  });
+  await repository.commitEventPlan([
+    {
+      kind: "telegram-outbox",
+      eventId,
+      value: buildEventTelegramProjectionOutbox(requestId, nowMs),
+    },
+    { kind: "telegram-generation", eventId, value: 1, increment: true },
+  ]);
   let reason: string | undefined;
   try {
     await (

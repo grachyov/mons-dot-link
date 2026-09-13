@@ -1,16 +1,17 @@
+import * as eventD1 from "./eventD1.ts";
+import { isEventMutation } from "../../../runtime/eventCommands.js";
+import type { EventCommand } from "../../../runtime/eventCommands.js";
+import type { EventLeaseKey } from "../../../runtime/eventLeases.js";
+import type { EventStore } from "./eventStoreContracts.ts";
+import type { MatchStatePort } from "./repositoryContracts.ts";
+import {
+  encodeEventUpdates,
+  decodeEventUpdates,
+  decodeCanonicalEventUpdates,
+} from "./eventCompatibilityCodec.ts";
 import { STATE_EFFECTS_FIELD } from "./stateCompatibility.ts";
-import type { EventReads } from "../../../runtime/eventReads.js";
 import { createEventReadRepository } from "./eventReadRepository.ts";
-import {
-  createEventOutboxReadRepository,
-  type EventOutboxReads,
-} from "./eventOutboxReadRepository.ts";
-import { createAutomatchPersistence } from "./automatchPersistence.ts";
-import {
-  type StateRepository,
-  type StateQuery,
-  type StateTransactionResult,
-} from "./stateRepositoryTypes.ts";
+import { createEventOutboxReadRepository } from "./eventOutboxReadRepository.ts";
 import { createMatchStateSource } from "./matchStateSource.ts";
 import {
   EventD1Conflict,
@@ -18,17 +19,13 @@ import {
   acquireEventWriteAdmission,
   createEventTransitionIntent,
   listPendingEventTransitionIntents,
-  listEventAggregates,
-  patchEventOwnedPaths,
-  readEventOwnedPath,
+  commitEventMutations,
   readEventRuntimeControl,
   readEventSnapshot,
   readEventTransitionIntent,
   recordEventTransitionAttempt,
   releaseEventWriteAdmission,
-  transactEventOwnedPath,
-  transactEventCoordinationPath,
-  transactStoredProfileEventPrizePath,
+  transactEventLease,
   type EventTransitionIntent,
   type EventWriteAdmission,
 } from "./eventD1.ts";
@@ -36,11 +33,6 @@ import {
   createGameplayRepository,
   type GameplayRepository,
 } from "./gameplayRepository.ts";
-import { parseAutomatchPath } from "./automatchD1.ts";
-import {
-  eventMatchCreationInviteIds,
-  isPlayerMatchPath,
-} from "./eventLoginMatchDiscovery.ts";
 import {
   applyInviteEventEffects,
   prepareInviteEventIntent,
@@ -62,82 +54,21 @@ import {
   type PrepareMatchPresentations,
 } from "./matchPresentationRegistry.ts";
 
-const EVENT_OWNED_ROOTS = new Set([
-  "events",
-  "eventPrizeSelections",
-  "profileEventPrizes",
-  "eventProgressOutbox",
-  "eventProgressOutboxDead",
-  "eventLocks",
-  "eventSyncThrottles",
-  "eventTelegramProjectionLocks",
-  "eventTelegramProjectionGenerations",
-  "eventTelegramProjections",
-]);
 const EVENT_TRANSITION_APPLICATION_LOCK_TTL_MS = 5 * 60 * 1_000;
 const EVENT_TRANSITION_APPLICATION_LOCK_OWNER = "event-transition-applier";
 export const EVENT_TRANSITION_RECEIPT_ROOT = "eventTransitionReceipts";
-type EventStateBackend = Pick<
-  StateRepository,
-  | "getPath"
-  | "patchRoot"
-  | "transactPath"
-  | "readMatchPair"
-  | "createMatchRecords"
-  | "applyMatchEventEffects"
->;
-type EventTransitionBackend = Pick<EventStateBackend, "getPath" | "patchRoot">;
-type EventLockGuard = {
-  eventId: string;
-  lockId: string;
-  lockRoot: string;
-  ownerUid: string;
-};
-export type EventGameplayRepository = GameplayRepository &
-  EventReads &
-  EventOutboxReads;
-
-export type EventStateRepository = StateRepository &
-  EventReads &
-  EventOutboxReads & {
-    transactStoredProfileEventPrizeWithEventLease(
-      path: string,
-      updater: (current: unknown) => unknown,
-      guard: EventLockGuard,
-      signal?: AbortSignal,
-    ): Promise<StateTransactionResult>;
-  };
+export type EventGameplayRepository = GameplayRepository & EventStore;
+export type EventStateRepository = MatchStatePort & EventStore;
 export type AuthRecoveryPrizeStore = Pick<
-  EventStateRepository,
-  | "getPath"
+  EventStore,
   | "readProfileEventPrizeAssignment"
   | "listProfileEventPrizeAssignments"
-  | "transactPath"
+  | "transactEventLease"
   | "transactStoredProfileEventPrizeWithEventLease"
 >;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function transactionDecision(
-  next: unknown,
-):
-  { commit: false; decision?: string } | { value: unknown; decision?: string } {
-  if (next === undefined) return { commit: false };
-  if (isRecord(next) && next.commit === false) {
-    return {
-      commit: false,
-      decision: typeof next.decision === "string" ? next.decision : undefined,
-    };
-  }
-  if (isRecord(next) && Object.hasOwn(next, "value")) {
-    return {
-      value: next.value,
-      decision: typeof next.decision === "string" ? next.decision : undefined,
-    };
-  }
-  return { value: next };
 }
 
 async function withEventWriteAdmission<T>(
@@ -172,75 +103,6 @@ async function withEventWriteAdmission<T>(
   }
 }
 
-function normalizedPath(path: string): string {
-  return path.replace(/^\/+|\/+$/g, "");
-}
-
-function d1EventPath(path: string): string {
-  const clean = normalizedPath(path);
-  const parts = clean.split("/");
-  if (parts[0] === "eventTelegramProjectionLocks" && parts[1]) {
-    return `eventLocks/telegram:${parts[1]}`;
-  }
-  if (
-    parts[0] === "profileGameProjectionLocks" &&
-    parts[1] === "event" &&
-    parts[2]
-  ) {
-    return `eventLocks/profile-game:${parts[2]}`;
-  }
-  return clean;
-}
-
-export function isEventOwnedPath(path: string): boolean {
-  const parts = normalizedPath(path).split("/");
-  if (EVENT_OWNED_ROOTS.has(parts[0])) return true;
-  return (
-    (parts[0] === "profileGameProjectionOutbox" ||
-      parts[0] === "profileGameProjectionLocks" ||
-      parts[0] === "telegramProjectionOutbox") &&
-    parts[1] === "event"
-  );
-}
-
-function splitUpdates(updates: Record<string, unknown>): {
-  canonicalUpdates: Record<string, unknown>;
-  [STATE_EFFECTS_FIELD]: Record<string, unknown>;
-} {
-  const canonicalUpdates: Record<string, unknown> = {};
-  const stateEffects: Record<string, unknown> = {};
-  for (const [path, value] of Object.entries(updates)) {
-    (isEventOwnedPath(path) ? canonicalUpdates : stateEffects)[path] = value;
-  }
-  return { canonicalUpdates, [STATE_EFFECTS_FIELD]: stateEffects };
-}
-
-function eventIdsFromUpdates(updates: Record<string, unknown>): string[] {
-  const ids = new Set<string>();
-  for (const path of Object.keys(updates)) {
-    const [root, eventId] = normalizedPath(path).split("/");
-    if (
-      (root === "events" ||
-        root === "eventPrizeSelections" ||
-        root === "profileEventPrizes") &&
-      eventId
-    ) {
-      if (root === "profileEventPrizes") {
-        const parts = normalizedPath(path).split("/");
-        if (parts[2]) ids.add(parts[2]);
-      } else {
-        ids.add(eventId);
-      }
-    } else if (root === "eventProgressOutbox" && isRecord(updates[path])) {
-      const progressEventId = updates[path].eventId;
-      if (typeof progressEventId === "string" && progressEventId) {
-        ids.add(progressEventId);
-      }
-    }
-  }
-  return [...ids];
-}
-
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map(canonicalJson).join(",")}]`;
@@ -272,10 +134,6 @@ async function transitionId(
     ),
   );
   return `et_${bytesToHex(digest)}`;
-}
-
-function isTransitionReceiptPath(path: string): boolean {
-  return normalizedPath(path).split("/")[0] === EVENT_TRANSITION_RECEIPT_ROOT;
 }
 
 function sameTransitionIntent(
@@ -322,15 +180,15 @@ async function withInviteEffectsAdmission<T>(
   }
 }
 
-function transitionApplicationLockPath(transitionId: string): string {
-  return `eventLocks/transition:${transitionId}`;
+function transitionApplicationLockKey(transitionId: string): string {
+  return `transition:${transitionId}`;
 }
 
 async function acquireTransitionApplicationLock(
   db: D1Database,
   intent: EventTransitionIntent,
   admission: EventWriteAdmission,
-): Promise<Record<string, unknown>> {
+): Promise<eventD1.EventLeaseRecord> {
   const nowMs = Date.now();
   const lock = {
     lockId: crypto.randomUUID(),
@@ -339,9 +197,9 @@ async function acquireTransitionApplicationLock(
     refreshedAtMs: nowMs,
     expiresAtMs: nowMs + EVENT_TRANSITION_APPLICATION_LOCK_TTL_MS,
   };
-  const result = await transactEventCoordinationPath(
+  const result = await transactEventLease(
     db,
-    transitionApplicationLockPath(intent.transitionId),
+    transitionApplicationLockKey(intent.transitionId),
     (current) => {
       const existing = isRecord(current) ? current : null;
       if (
@@ -365,12 +223,12 @@ async function releaseTransitionApplicationLock(
   db: D1Database,
   intent: EventTransitionIntent,
   admission: EventWriteAdmission,
-  lock: Record<string, unknown>,
+  lock: eventD1.EventLeaseRecord,
 ): Promise<void> {
   try {
-    await transactEventCoordinationPath(
+    await transactEventLease(
       db,
-      transitionApplicationLockPath(intent.transitionId),
+      transitionApplicationLockKey(intent.transitionId),
       (current) => {
         const existing = isRecord(current) ? current : null;
         return existing !== null &&
@@ -397,12 +255,12 @@ async function applyIntent(
   discoveryDb: D1Database,
   intent: EventTransitionIntent,
   admission: EventWriteAdmission,
-  raw: StateRepository,
+  raw: MatchStatePort,
   onCommitted: (intent: EventTransitionIntent) => Promise<void>,
   prepareMatchPresentations: PrepareMatchPresentations,
   signal?: AbortSignal,
 ): Promise<void> {
-  let lock: Record<string, unknown> | null = null;
+  let lock: eventD1.EventLeaseRecord | null = null;
   try {
     lock = await acquireTransitionApplicationLock(db, intent, admission);
     const currentIntent = await readEventTransitionIntent(
@@ -416,6 +274,9 @@ async function applyIntent(
     if (currentIntent.schemaVersion !== 2) {
       throw new Error("event-transition-legacy-source-disabled");
     }
+    const canonicalChanges = decodeCanonicalEventUpdates(
+      currentIntent.canonicalUpdates,
+    );
     await withInviteEffectsAdmission(discoveryDb, async () => {
       await applyInviteEventEffects(
         discoveryDb,
@@ -426,7 +287,7 @@ async function applyIntent(
       );
     });
     await onCommitted(currentIntent);
-    await patchEventOwnedPaths(db, currentIntent.canonicalUpdates, {
+    await commitEventMutations(db, canonicalChanges, {
       admission,
       expectedEventRevisions: {
         [currentIntent.eventId]: currentIntent.expectedRevision,
@@ -450,53 +311,48 @@ async function applyIntent(
   }
 }
 
-async function patchD1EventState(
+async function commitD1EventPlan(
   db: D1Database,
   discoveryDb: D1Database,
-  base: EventTransitionBackend,
-  updates: Record<string, unknown>,
+  plan: readonly EventCommand[],
   admission: EventWriteAdmission,
-  raw: StateRepository,
+  raw: MatchStatePort,
   onCommitted: (intent: EventTransitionIntent) => Promise<void>,
   prepareMatchPresentations: PrepareMatchPresentations,
   signal?: AbortSignal,
 ): Promise<void> {
-  const { canonicalUpdates, [STATE_EFFECTS_FIELD]: stateEffects } =
-    splitUpdates(updates);
-  if (Object.keys(canonicalUpdates).length === 0) {
-    if (eventMatchCreationInviteIds(stateEffects).length) {
-      throw new Error("event-match-creation-requires-transition");
-    }
-    await base.patchRoot(stateEffects, signal);
+  const canonical = plan.filter(isEventMutation);
+  const effects = plan.filter((command) => !isEventMutation(command));
+  if (
+    canonical.length === 0 &&
+    effects.some((command) => command.kind === "match-creation")
+  )
+    throw new Error("event-match-creation-requires-transition");
+  if (!effects.length) {
+    await commitEventMutations(db, canonical, { admission });
     return;
   }
-  if (Object.keys(stateEffects).length === 0) {
-    await patchEventOwnedPaths(db, canonicalUpdates, { admission });
-    return;
-  }
-  if (Object.keys(stateEffects).some(isTransitionReceiptPath)) {
-    throw new Error("event-transition-receipt-path-reserved");
-  }
+  const eventIds = [
+    ...new Set(
+      canonical.flatMap((change) =>
+        "eventId" in change
+          ? [change.eventId]
+          : change.kind === "progress-outbox" &&
+              typeof change.value?.eventId === "string"
+            ? [change.value.eventId]
+            : [],
+      ),
+    ),
+  ];
+  if (eventIds.length !== 1)
+    throw new Error("event-transition-must-target-one-event");
   await withInviteEffectsAdmission(discoveryDb, async () => {
-    const eventIds = eventIdsFromUpdates(canonicalUpdates);
-    if (eventIds.length !== 1) {
-      throw new Error("event-transition-must-target-one-event");
-    }
     const eventId = eventIds[0];
     const revision = (await readEventSnapshot(db, eventId)).revision;
-    if (revision < 1) {
-      if (
-        eventMatchCreationInviteIds(stateEffects).length ||
-        Object.keys(stateEffects).some((path) =>
-          normalizedPath(path).startsWith("invites/"),
-        )
-      ) {
-        throw new Error("event-match-creation-requires-transition");
-      }
-      await patchEventOwnedPaths(db, canonicalUpdates, { admission });
-      await base.patchRoot(stateEffects, signal);
-      return;
-    }
+    if (revision < 1)
+      throw new Error("event-match-creation-requires-transition");
+    const canonicalUpdates = encodeEventUpdates(canonical);
+    const stateEffects = encodeEventUpdates(effects);
     const id = await transitionId(eventId, revision, stateEffects);
     const nowMs = Date.now();
     const intent: Extract<EventTransitionIntent, { schemaVersion: 1 }> = {
@@ -519,14 +375,12 @@ async function patchD1EventState(
             canonicalJson(stateEffects)) ||
         existing.eventId !== eventId ||
         existing.expectedRevision !== revision)
-    ) {
+    )
       throw new Error("event-transition-identity-conflict");
-    }
     const activeIntent =
       existing || (await prepareInviteEventIntent(discoveryDb, intent, signal));
-    if (!existing) {
+    if (!existing)
       await createEventTransitionIntent(db, activeIntent, { admission });
-    }
     await applyIntent(
       db,
       discoveryDb,
@@ -540,7 +394,7 @@ async function patchD1EventState(
   });
 }
 
-function createEventRawClient(env: Env): StateRepository {
+function createEventRawClient(env: Env): MatchStatePort {
   return createMatchStateSource(env);
 }
 
@@ -550,28 +404,34 @@ async function notifyEventInviteEffects(
 ): Promise<void> {
   if (intent.schemaVersion !== 2) return;
   await Promise.all([
-    notifyInviteSourceChanged(
-      env,
-      Object.fromEntries(
-        intent.inviteMutations.map(({ current, value }) => [
-          `invites/${current.inviteId}`,
-          value,
-        ]),
+    notifyInviteSourceChanged(env, {
+      metadataInviteIds: intent.inviteMutations.map(
+        ({ current }) => current.inviteId,
       ),
-      true,
-    ),
+      wagerInviteIds: intent.inviteMutations.map(
+        ({ current }) => current.inviteId,
+      ),
+    }),
     notifyMatchSyncInvites(
       env,
       intent.inviteMutations.map(({ current }) => current.inviteId),
     ),
-    notifyMatchSyncChanged(env, intent[STATE_EFFECTS_FIELD]),
+    notifyMatchSyncChanged(
+      env,
+      decodeEventUpdates(intent[STATE_EFFECTS_FIELD]).flatMap((command) =>
+        command.kind === "match-creation" ||
+        command.kind === "match-terminal-timer"
+          ? [{ playerId: command.playerId, matchId: command.matchId }]
+          : [],
+      ),
+    ),
   ]);
 }
 
 export async function recoverEventTransitionIntents(
   env: Env,
   limit = 100,
-  raw: StateRepository = createEventRawClient(env),
+  raw: MatchStatePort = createEventRawClient(env),
   prepareMatchPresentations: PrepareMatchPresentations = (creations) =>
     prepareCreatedMatchPresentations(env, creations),
 ): Promise<number> {
@@ -615,273 +475,177 @@ export function createEventGameplayRepository(
   env: Env,
   base: GameplayRepository = createGameplayRepository(env),
 ): EventGameplayRepository {
-  const eventClient = createEventStateRepository(env, {
-    getPath: base.getStatePath,
-    patchRoot: base.patchStateRoot,
-    transactPath: base.transactStatePath,
-    readMatchPair: base.readMatchPair,
-  });
-  return {
-    ...base,
-    ...createEventReadRepository(env.EVENT_DB),
-    ...createEventOutboxReadRepository(env.EVENT_DB),
-    getStatePath: eventClient.getPath,
-    patchStateRoot: eventClient.patchRoot,
-    transactStatePath: eventClient.transactPath,
-  };
+  return { ...base, ...createEventStateRepository(env, base) };
 }
-
-function transactD1EventPath(
-  db: D1Database,
-  path: string,
-  updater: (current: unknown) => unknown,
-  signal?: AbortSignal,
-  guard?: EventLockGuard,
-  allowStoredProfilePrizeAssignment = false,
-): Promise<StateTransactionResult> {
-  return withEventWriteAdmission(
-    db,
-    "event-path-transaction",
-    async (admission) => {
-      const storagePath = d1EventPath(path);
-      if (
-        storagePath.startsWith("eventLocks/") ||
-        storagePath.startsWith("eventSyncThrottles/")
-      ) {
-        if (guard || allowStoredProfilePrizeAssignment) {
-          throw new Error("event-lock-guard-path-unsupported");
-        }
-        return transactEventCoordinationPath(
-          db,
-          storagePath,
-          (current) => transactionDecision(updater(current)),
-          { admission },
-        );
-      }
-      const eventLease = guard
-        ? {
-            eventId: guard.eventId,
-            lockId: guard.lockId,
-            ownerUid: guard.ownerUid,
-          }
-        : null;
-      const applyUpdate = (current: unknown) =>
-        transactionDecision(updater(current));
-      if (allowStoredProfilePrizeAssignment) {
-        if (!eventLease) {
-          throw new Error("event-lock-guard-path-unsupported");
-        }
-        return transactStoredProfileEventPrizePath(
-          db,
-          storagePath,
-          applyUpdate,
-          {
-            admission,
-            eventLease,
-            signal,
-          },
-        );
-      }
-      return transactEventOwnedPath(db, storagePath, applyUpdate, {
-        admission,
-        ...(eventLease ? { eventLease } : {}),
-        signal,
-      });
-    },
-  );
-}
-
-async function readProfileEventPrizePage(
-  db: D1Database,
-  path: string,
-  query: StateQuery,
-): Promise<Record<string, unknown>> {
-  const prizes = (await readEventOwnedPath(db, path)) as Record<
-    string,
-    unknown
-  >;
-  const startAt = typeof query.startAt === "string" ? query.startAt : "";
-  const entries = Object.entries(prizes || {})
-    .filter(([eventId]) => !startAt || eventId >= startAt)
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .slice(0, query.limitToFirst || 100);
-  return Object.fromEntries(entries);
-}
-
-function transactStoredProfileEventPrizeWithEventLease(
-  db: D1Database,
-  path: string,
-  updater: (current: unknown) => unknown,
-  guard: EventLockGuard,
-  signal?: AbortSignal,
-): Promise<StateTransactionResult> {
-  const [root, profileId, eventId, ...nested] = normalizedPath(path).split("/");
-  if (
-    guard.lockRoot !== "eventLocks" ||
-    root !== "profileEventPrizes" ||
-    !profileId ||
-    eventId !== guard.eventId ||
-    nested.length > 0
-  ) {
-    throw new Error("event-lock-guard-path-unsupported");
+function leaseStorageKey(key: EventLeaseKey): string {
+  switch (key.kind) {
+    case "event":
+      return key.id;
+    case "telegram-projection":
+      return `telegram:${key.id}`;
+    case "profile-game-projection":
+      return `profile-game:${key.id}`;
+    case "transition":
+      return `transition:${key.id}`;
   }
-  return transactD1EventPath(db, path, updater, signal, guard, true);
 }
-
-export function createD1AuthRecoveryPrizeStore(
+function createEventStore(
   db: D1Database,
-): AuthRecoveryPrizeStore {
-  const reads = createEventReadRepository(db);
+  commit: (
+    changes: readonly EventCommand[],
+    signal?: AbortSignal,
+  ) => Promise<void>,
+): EventStore {
+  const admit = <T>(work: (admission: EventWriteAdmission) => Promise<T>) =>
+    withEventWriteAdmission(db, "event-path-transaction", work);
+  const read = <T>(work: () => Promise<T>, signal?: AbortSignal) => {
+    signal?.throwIfAborted();
+    return work();
+  };
   return {
-    readProfileEventPrizeAssignment: reads.readProfileEventPrizeAssignment,
-    listProfileEventPrizeAssignments: reads.listProfileEventPrizeAssignments,
-    async getPath(path, query) {
-      const cleanPath = normalizedPath(path);
-      if (!/^profileEventPrizes\/[^/]+(?:\/[^/]+)?$/.test(cleanPath)) {
-        throw new Error("auth-recovery-prize-path-unsupported");
-      }
-      if (query?.orderBy === "$key" && cleanPath.split("/").length === 2) {
-        return readProfileEventPrizePage(db, cleanPath, query);
-      }
-      if (query && Object.keys(query).length > 0) {
-        throw new Error("event-d1-query-unsupported");
-      }
-      return readEventOwnedPath(db, cleanPath);
+    ...createEventReadRepository(db),
+    ...createEventOutboxReadRepository(db),
+    commitEventPlan: commit,
+    putEventProgressOutbox: (outboxId, record, signal) =>
+      commit([{ kind: "progress-outbox", outboxId, value: record }], signal),
+    transactEventLease: (key, updater, signal) => {
+      signal?.throwIfAborted();
+      return admit((admission) =>
+        eventD1.transactEventLease(db, leaseStorageKey(key), updater, {
+          admission,
+        }),
+      );
     },
-    async transactPath(path, updater, signal) {
-      if (!/^eventLocks\/[^/]+$/.test(normalizedPath(path))) {
-        throw new Error("auth-recovery-prize-path-unsupported");
-      }
-      return transactD1EventPath(db, path, updater, signal);
+    transactEventSyncThrottle: (eventId, updater, signal) => {
+      signal?.throwIfAborted();
+      return admit((admission) =>
+        eventD1.transactEventSyncThrottle(db, eventId, updater, { admission }),
+      );
     },
-    transactStoredProfileEventPrizeWithEventLease(
-      path,
+    transactEventPrizeSelection: (eventId, profileId, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactEventPrizeSelection(db, eventId, profileId, updater, {
+          admission,
+          signal,
+        }),
+      ),
+    transactProfileEventPrize: (profileId, eventId, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactProfileEventPrize(db, profileId, eventId, updater, {
+          admission,
+          signal,
+        }),
+      ),
+    transactStoredProfileEventPrizeWithEventLease: (
+      profileId,
+      eventId,
       updater,
       guard,
       signal,
-    ) {
-      return transactStoredProfileEventPrizeWithEventLease(
-        db,
-        path,
-        updater,
-        guard,
-        signal,
+    ) => {
+      if (guard.lockRoot !== "eventLocks" || guard.eventId !== eventId)
+        throw new Error("event-lock-guard-path-unsupported");
+      return admit((admission) =>
+        eventD1.transactStoredProfileEventPrize(
+          db,
+          profileId,
+          eventId,
+          updater,
+          {
+            admission,
+            signal,
+            eventLease: guard,
+          },
+        ),
       );
     },
+    readEventProgressOutbox: (id, signal) =>
+      read(() => eventD1.readEventProgressOutbox(db, id), signal),
+    readEventProfileGameProjectionOutbox: (id, signal) =>
+      read(() => eventD1.readEventProfileGameProjectionOutbox(db, id), signal),
+    readEventTelegramProjectionOutbox: (id, signal) =>
+      read(() => eventD1.readEventTelegramProjectionOutbox(db, id), signal),
+    readEventTelegramProjectionState: (id, signal) =>
+      read(() => eventD1.readEventTelegramProjectionState(db, id), signal),
+    transactEventProgressOutbox: (id, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactEventProgressOutbox(db, id, updater, {
+          admission,
+          signal,
+        }),
+      ),
+    transactEventProgressDeadOutbox: (id, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactEventProgressDeadOutbox(db, id, updater, {
+          admission,
+          signal,
+        }),
+      ),
+    transactEventProfileGameProjectionOutbox: (id, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactEventProfileGameProjectionOutbox(db, id, updater, {
+          admission,
+          signal,
+        }),
+      ),
+    transactEventTelegramProjectionOutbox: (id, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactEventTelegramProjectionOutbox(db, id, updater, {
+          admission,
+          signal,
+        }),
+      ),
+    transactEventTelegramProjectionState: (id, updater, signal) =>
+      admit((admission) =>
+        eventD1.transactEventTelegramProjectionState(db, id, updater, {
+          admission,
+          signal,
+        }),
+      ),
   };
 }
-
+export function createD1AuthRecoveryPrizeStore(
+  db: D1Database,
+): AuthRecoveryPrizeStore {
+  const store = createEventStore(db, async () => {
+    throw new Error("auth-recovery-prize-path-unsupported");
+  });
+  return {
+    readProfileEventPrizeAssignment: store.readProfileEventPrizeAssignment,
+    listProfileEventPrizeAssignments: store.listProfileEventPrizeAssignments,
+    transactEventLease: (key, updater, signal) => {
+      if (key.kind !== "event")
+        return Promise.reject(
+          new Error("auth-recovery-prize-path-unsupported"),
+        );
+      return store.transactEventLease(key, updater, signal);
+    },
+    transactStoredProfileEventPrizeWithEventLease:
+      store.transactStoredProfileEventPrizeWithEventLease,
+  };
+}
 export function createEventStateRepository(
   env: Env,
-  base: EventStateBackend = createAutomatchPersistence(
-    env.PROFILE_GAMES_DB,
-    createEventRawClient(env),
-    {
-      prepareMatchPresentations: (creations) =>
-        prepareCreatedMatchPresentations(env, creations),
-    },
-  ).client,
-  raw: StateRepository = createEventRawClient(env),
+  base: MatchStatePort = createEventRawClient(env),
+  raw: MatchStatePort = base,
   prepareMatchPresentations: PrepareMatchPresentations = (creations) =>
     prepareCreatedMatchPresentations(env, creations),
 ): EventStateRepository {
   return {
     ...base,
-    ...createEventReadRepository(env.EVENT_DB),
-    ...createEventOutboxReadRepository(env.EVENT_DB),
-    async getPath(path, query, signal) {
-      if (isTransitionReceiptPath(path)) {
-        throw new Error("event-transition-receipt-path-reserved");
-      }
-      if (!isEventOwnedPath(path)) {
-        return base.getPath(path, query, signal);
-      }
-      const cleanPath = normalizedPath(path);
-      if (cleanPath === "events") {
-        const status = query?.equalTo;
-        if (
-          query?.orderBy !== "status" ||
-          (status !== "scheduled" &&
-            status !== "active" &&
-            status !== "ended" &&
-            status !== "dismissed")
-        ) {
-          throw new Error("event-d1-query-unsupported");
-        }
-        return listEventAggregates(env.EVENT_DB, {
-          status,
-          limit: query.limitToFirst || 1_000,
-        });
-      }
-      if (
-        cleanPath.startsWith("profileEventPrizes/") &&
-        query?.orderBy === "$key"
-      ) {
-        return readProfileEventPrizePage(env.EVENT_DB, cleanPath, query);
-      }
-      if (query && Object.keys(query).length > 0) {
-        throw new Error("event-d1-query-unsupported");
-      }
-      return readEventOwnedPath(env.EVENT_DB, d1EventPath(cleanPath));
-    },
-    async patchRoot(updates, signal) {
-      const paths = Object.keys(updates);
-      if (paths.some(isTransitionReceiptPath)) {
-        throw new Error("event-transition-receipt-path-reserved");
-      }
-      if (!paths.some(isEventOwnedPath)) {
-        if (
-          eventMatchCreationInviteIds(updates).length &&
-          !paths.some((path) => parseAutomatchPath(path) !== null)
-        ) {
-          throw new Error("event-match-creation-requires-transition");
-        }
-        await base.patchRoot(updates, signal);
-        return;
-      }
-      await withEventWriteAdmission(
-        env.EVENT_DB,
-        "event-root-patch",
-        async (admission) => {
-          await patchD1EventState(
-            env.EVENT_DB,
-            env.PROFILE_GAMES_DB,
-            base,
-            updates,
-            admission,
-            raw,
-            (committed) => notifyEventInviteEffects(env, committed),
-            prepareMatchPresentations,
-            signal,
-          );
-        },
-      );
-    },
-    async transactPath(path, updater, signal) {
-      if (isTransitionReceiptPath(path)) {
-        throw new Error("event-transition-receipt-path-reserved");
-      }
-      if (!isEventOwnedPath(path)) {
-        if (isPlayerMatchPath(path)) {
-          throw new Error("event-match-creation-requires-transition");
-        }
-        return base.transactPath(path, updater, signal);
-      }
-      return transactD1EventPath(env.EVENT_DB, path, updater, signal);
-    },
-    transactStoredProfileEventPrizeWithEventLease(
-      path,
-      updater,
-      guard,
-      signal,
-    ) {
-      return transactStoredProfileEventPrizeWithEventLease(
-        env.EVENT_DB,
-        path,
-        updater,
-        guard,
-        signal,
-      );
-    },
+    ...createEventStore(env.EVENT_DB, (plan, signal) =>
+      withEventWriteAdmission(env.EVENT_DB, "event-root-patch", (admission) =>
+        commitD1EventPlan(
+          env.EVENT_DB,
+          env.PROFILE_GAMES_DB,
+          plan,
+          admission,
+          raw,
+          (intent) => notifyEventInviteEffects(env, intent),
+          prepareMatchPresentations,
+          signal,
+        ),
+      ),
+    ),
   };
 }

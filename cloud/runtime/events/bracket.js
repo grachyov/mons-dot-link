@@ -1,8 +1,7 @@
 "use strict";
+const { eventField } = require("../eventCommands");
 
-const {
-  batchReadWithRetry: defaultBatchReadWithRetry,
-} = require("../batchRead");
+const {} = require("../batchRead");
 const {
   resolveMatchWinner: defaultResolveMatchWinner,
 } = require("../matchOutcome");
@@ -47,8 +46,6 @@ const {
 
 const createEventBracketRuntime = (dependencies = {}) => {
   const state = dependencies.state;
-  const batchReadWithRetry =
-    dependencies.batchReadWithRetry || defaultBatchReadWithRetry;
   const resolveMatchWinner =
     dependencies.resolveMatchWinner || defaultResolveMatchWinner;
   const buildRandomGameSeed =
@@ -491,7 +488,7 @@ const createEventBracketRuntime = (dependencies = {}) => {
     includeEventAssignments,
   }) => {
     if (includeEventAssignments) {
-      updates[`events/${eventId}/prizeAssignments`] = assignments;
+      updates.push(eventField(eventId, "prizeAssignments", assignments));
     }
   };
 
@@ -509,14 +506,15 @@ const createEventBracketRuntime = (dependencies = {}) => {
     });
     const transactions = await Promise.all(
       Object.values(projectableAssignments).map(async (assignment) => {
-        return state.transaction(
-          `profileEventPrizes/${assignment.profileId}/${eventId}`,
+        return state.transactProfileEventPrize(
+          assignment.profileId,
+          eventId,
           (current) => {
             if (current === null || current === undefined) {
-              return assignment;
+              return { value: assignment };
             }
             if (assignmentsMatch(current, assignment)) {
-              return undefined;
+              return { commit: false };
             }
             throw new Error("profile-event-prize-conflict");
           },
@@ -563,16 +561,17 @@ const createEventBracketRuntime = (dependencies = {}) => {
         );
         await Promise.all(
           profileIds.map((profileId) =>
-            state.transaction(
-              `profileEventPrizes/${profileId}/${eventId}`,
+            state.transactProfileEventPrize(
+              profileId,
+              eventId,
               (currentAssignment) =>
                 isMatchingProfileEventPrizeAssignment(
                   currentAssignment,
                   eventId,
                   assignment.prizeId,
                 )
-                  ? null
-                  : undefined,
+                  ? { value: null }
+                  : { commit: false },
             ),
           ),
         );
@@ -672,17 +671,12 @@ const createEventBracketRuntime = (dependencies = {}) => {
       return null;
     }
 
-    const [hostMatch, guestMatch] = dependencies.readMatchPair
-      ? await dependencies.readMatchPair({
-          inviteId,
-          matchId: inviteId,
-          playerId: hostLoginUid,
-          opponentId: guestLoginUid,
-        })
-      : await batchReadWithRetry([
-          () => state.read(`players/${hostLoginUid}/matches/${inviteId}`),
-          () => state.read(`players/${guestLoginUid}/matches/${inviteId}`),
-        ]);
+    const [hostMatch, guestMatch] = await dependencies.readMatchPair({
+      inviteId,
+      matchId: inviteId,
+      playerId: hostLoginUid,
+      opponentId: guestLoginUid,
+    });
     const outcome = await resolveMatchWinner(hostMatch, guestMatch);
     if (outcome.winner === "player") {
       return {

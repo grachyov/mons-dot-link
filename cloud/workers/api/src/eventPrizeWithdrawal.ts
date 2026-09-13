@@ -12,7 +12,6 @@ import {
 import { resolveProfileMergeTargetPath } from "../../../runtime/profileMergeTargets.js";
 import {
   EVENT_PRIZE_ADMIN_WALLET,
-  getEventPrizeWithdrawalPath,
   isCompletedEventPrizeWithdrawal,
   isMatchingProfileEventPrizeAssignment,
   isWithdrawalRecordForPrize,
@@ -53,7 +52,6 @@ import {
 import { readBoundedJson } from "./http.ts";
 import {
   createD1EventPrizeWithdrawalStore,
-  parseEventPrizeWithdrawalPath,
   readEventPrizeWithdrawalStorageMode,
   type EventPrizeWithdrawalStore,
 } from "./eventPrizeWithdrawalD1.ts";
@@ -106,30 +104,8 @@ export type EventPrizeWithdrawalWorkflowOutput =
   | EventPrizeWithdrawalWorkflowFailure
   | { ok: true; status: "ready" };
 
-type StateRecord = {
-  read(): Promise<unknown>;
-  transaction(updater: (current: unknown) => unknown): Promise<{
-    committed: boolean;
-    value: unknown;
-  }>;
-};
-
-type EventPrizeState = {
-  read(path: string): Promise<unknown>;
-  set(path: string, value: unknown): Promise<void>;
-  remove(path: string): Promise<void>;
-  update(path: string, updates: Record<string, unknown>): Promise<void>;
-  transaction(
-    path: string,
-    updater: (current: unknown) => unknown,
-  ): Promise<{
-    committed: boolean;
-    value: unknown;
-  }>;
-};
-
 type EventPrizeRuntimeDependencies = {
-  state: EventPrizeState;
+  withdrawals: EventPrizeWithdrawalStore;
   readProfileEventPrizeAssignment: EventGameplayRepository["readProfileEventPrizeAssignment"];
   createEventPrizeUmi(standard: "compressed" | "core"): unknown;
   now(): number;
@@ -140,7 +116,7 @@ type EventPrizeRuntimeDependencies = {
   readProfileByLoginUid(uid: string): Promise<{ id: string } | null>;
   readProfileOwnershipSnapshot: ProfileOwnershipReader["readProfileOwnershipSnapshot"];
   removeMatchingProfileEventPrizeAssignment(input: {
-    targetRecord: StateRecord;
+    profileId: string;
     eventId: string;
     prizeId: string;
   }): Promise<boolean>;
@@ -150,11 +126,9 @@ type EventPrizeRuntimeDependencies = {
 
 type EventPrizeGameplayRepository = Pick<
   EventGameplayRepository,
-  | "getStatePath"
-  | "patchStateRoot"
   | "readProfileOwnershipSnapshot"
   | "readProfileEventPrizeAssignment"
-  | "transactStatePath"
+  | "transactProfileEventPrize"
 >;
 
 type RouteDependencies = {
@@ -184,78 +158,6 @@ function toRecord(value: unknown): Record<string, unknown> | null {
 
 function cleanString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function stateRecord(state: EventPrizeState, path: string): StateRecord {
-  return {
-    read: () => state.read(path),
-    transaction: (updater) => state.transaction(path, updater),
-  };
-}
-
-function createEventPrizeState(
-  repository: EventPrizeGameplayRepository,
-  withdrawalStore: EventPrizeWithdrawalStore,
-): EventPrizeState {
-  const readRecord = (path: string): StateRecord => {
-    const identity = parseEventPrizeWithdrawalPath(path);
-    if (identity)
-      return withdrawalStore.record(identity.eventId, identity.prizeId);
-    return {
-      read: () => repository.getStatePath(path),
-      async transaction(updater) {
-        const result = await repository.transactStatePath(path, (current) => {
-          const value = updater(current);
-          return value === undefined ? { commit: false } : { value };
-        });
-        return { committed: result.committed, value: result.value };
-      },
-    };
-  };
-  const update = async (path: string, updates: Record<string, unknown>) => {
-    const identity = parseEventPrizeWithdrawalPath(path);
-    if (identity) {
-      await withdrawalStore
-        .record(identity.eventId, identity.prizeId)
-        .update(updates);
-      return;
-    }
-    if (path) {
-      await repository.patchStateRoot(
-        Object.fromEntries(
-          Object.entries(updates).map(([key, value]) => [
-            `${path}/${key}`,
-            value,
-          ]),
-        ),
-      );
-      return;
-    }
-    const withdrawalUpdates: Record<string, unknown> = {};
-    const stateUpdates: Record<string, unknown> = {};
-    for (const [updatePath, value] of Object.entries(updates)) {
-      if (parseEventPrizeWithdrawalPath(updatePath))
-        withdrawalUpdates[updatePath] = value;
-      else stateUpdates[updatePath] = value;
-    }
-    if (
-      Object.keys(withdrawalUpdates).length > 0 &&
-      Object.keys(stateUpdates).length > 0
-    )
-      throw new TypeError("cross-storage-root-update");
-    if (Object.keys(withdrawalUpdates).length > 0) {
-      await withdrawalStore.replacePaths(withdrawalUpdates);
-      return;
-    }
-    await repository.patchStateRoot(stateUpdates);
-  };
-  return {
-    read: (path) => readRecord(path).read(),
-    transaction: (path, updater) => readRecord(path).transaction(updater),
-    set: (path, value) => update("", { [path]: value }),
-    remove: (path) => update("", { [path]: null }),
-    update,
-  };
 }
 
 export async function createEventPrizeRuntimeDependencies(
@@ -308,7 +210,7 @@ export async function createEventPrizeRuntimeDependencies(
     }
   };
   return {
-    state: createEventPrizeState(repository, withdrawalStore),
+    withdrawals: withdrawalStore,
     readProfileEventPrizeAssignment: (profileId, eventId, signal) =>
       repository.readProfileEventPrizeAssignment(profileId, eventId, signal),
     createEventPrizeUmi: (standard) =>
@@ -321,18 +223,21 @@ export async function createEventPrizeRuntimeDependencies(
     readProfileByLoginUid,
     readProfileOwnershipSnapshot: repository.readProfileOwnershipSnapshot,
     async removeMatchingProfileEventPrizeAssignment({
-      targetRecord,
+      profileId,
       eventId,
       prizeId,
     }) {
-      const result = await targetRecord.transaction((currentAssignment) =>
-        isMatchingProfileEventPrizeAssignment(
-          currentAssignment,
-          eventId,
-          prizeId,
-        )
-          ? null
-          : (currentAssignment ?? null),
+      const result = await repository.transactProfileEventPrize(
+        profileId,
+        eventId,
+        (currentAssignment) =>
+          isMatchingProfileEventPrizeAssignment(
+            currentAssignment,
+            eventId,
+            prizeId,
+          )
+            ? { value: null }
+            : { value: currentAssignment ?? null },
       );
       return result.committed && result.value === null;
     },
@@ -538,19 +443,16 @@ function workflowCreateOptions(
 async function ensureAdmittedWithdrawalWorkflow(
   workflow: Workflow<EventPrizeWithdrawalWorkflowInput>,
   admission: PendingWithdrawalAdmission,
-  runtime: Pick<EventPrizeRuntimeDependencies, "state">,
+  runtime: Pick<EventPrizeRuntimeDependencies, "withdrawals">,
 ): Promise<void> {
   try {
     await ensureWorkflow(workflow, admission.params);
   } catch (error) {
     if (admission.releaseLeaseOnFailure) {
       await releaseProcessingClaim({
-        withdrawalRecord: stateRecord(
-          runtime.state,
-          getEventPrizeWithdrawalPath(
-            admission.params.eventId,
-            admission.params.prizeId,
-          ),
+        withdrawalRecord: runtime.withdrawals.record(
+          admission.params.eventId,
+          admission.params.prizeId,
         ),
         leaseId: admission.leaseId,
       }).catch(() => undefined);
@@ -750,9 +652,9 @@ async function admitWithdrawal(
     };
   }
   const claim = await acquireWithdrawalClaim({
-    withdrawalRecord: stateRecord(
-      runtime.state,
-      getEventPrizeWithdrawalPath(request.eventId, request.prizeId),
+    withdrawalRecord: runtime.withdrawals.record(
+      request.eventId,
+      request.prizeId,
     ),
     eventId: request.eventId,
     prizeId: request.prizeId,

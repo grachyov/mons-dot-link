@@ -8,7 +8,6 @@ import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
 import { requireActiveDurableMatchState } from "./matchStateAuthority.ts";
 import {
   createRatingRepository,
-  type GameplayRepository,
   type RatingEventProgressRepository,
 } from "./gameplayRepository.ts";
 import { createD1EventPrizeWithdrawalReader } from "./eventPrizeWithdrawalD1.ts";
@@ -80,8 +79,8 @@ export type EventProgressWorkflowDependencies = {
 
 export type EventProgressSweepRepository = Pick<
   EventGameplayRepository,
-  | "getStatePath"
-  | "patchStateRoot"
+  | "readEventProgressOutbox"
+  | "commitEventPlan"
   | "readEvent"
   | "listDueEventProgressOutboxes"
 >;
@@ -117,56 +116,21 @@ function toRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function createEventStateAdapter(
-  repository: Pick<
-    EventGameplayRepository,
-    | "getStatePath"
-    | "patchStateRoot"
-    | "transactStatePath"
-    | "readEvent"
-    | "readEventPrizeSelections"
-    | "readEventSnapshot"
-  >,
+export function createEventRuntimeStore(
+  repository: EventGameplayRepository,
   signal?: AbortSignal,
-) {
-  const normalizePath = (path: string) => path.replace(/^\/+|\/+$/g, "");
+): import("../../../runtime/eventCommands.js").EventRuntimeStore {
   return {
-    readEvent: (eventId: string) => repository.readEvent(eventId, signal),
-    readEventPrizeSelections: (eventId: string) =>
-      repository.readEventPrizeSelections(eventId, signal),
-    readEventSnapshot: (eventId: string) =>
-      repository.readEventSnapshot(eventId, signal),
-    read: (path: string) =>
-      repository.getStatePath(normalizePath(path), undefined, signal),
-    set: (path: string, value: unknown) =>
-      repository.patchStateRoot({ [normalizePath(path)]: value }, signal),
-    remove: (path: string) =>
-      repository.patchStateRoot({ [normalizePath(path)]: null }, signal),
-    update(path: string, updates: Record<string, unknown>) {
-      const normalizedPath = normalizePath(path);
-      return repository.patchStateRoot(
-        normalizedPath
-          ? Object.fromEntries(
-              Object.entries(updates).map(([key, value]) => [
-                `${normalizedPath}/${key}`,
-                value,
-              ]),
-            )
-          : updates,
-        signal,
-      );
-    },
-    async transaction(path: string, updater: (current: unknown) => unknown) {
-      const result = await repository.transactStatePath(
-        normalizePath(path),
-        (current) => {
-          const value = updater(current);
-          return value === undefined ? { commit: false } : { value };
-        },
-        signal,
-      );
-      return { committed: result.committed, value: result.value };
-    },
+    ...repository,
+    readEvent: (id) => repository.readEvent(id, signal),
+    readEventPrizeSelections: (id) =>
+      repository.readEventPrizeSelections(id, signal),
+    readEventSnapshot: (id) => repository.readEventSnapshot(id, signal),
+    commitEventPlan: (plan) => repository.commitEventPlan(plan, signal),
+    transactEventSyncThrottle: (id, updater) =>
+      repository.transactEventSyncThrottle(id, updater, signal),
+    transactProfileEventPrize: (profileId, eventId, updater) =>
+      repository.transactProfileEventPrize(profileId, eventId, updater, signal),
   };
 }
 
@@ -367,28 +331,32 @@ export async function ensureEventProgressWorkflow(
 }
 
 async function removeOutbox(
-  repository: Pick<GameplayRepository, "patchStateRoot">,
+  repository: Pick<EventGameplayRepository, "commitEventPlan">,
   outboxId: string,
 ): Promise<void> {
-  await repository.patchStateRoot({
-    [`${EVENT_PROGRESS_OUTBOX_ROOT}/${outboxId}`]: null,
-  });
+  await repository.commitEventPlan([
+    { kind: "progress-outbox", outboxId, value: null },
+  ]);
 }
 
 async function deadLetterOutbox(
-  repository: Pick<GameplayRepository, "patchStateRoot">,
+  repository: Pick<EventGameplayRepository, "commitEventPlan">,
   outboxId: string,
   originalRecord: unknown,
   nowMs: number,
 ): Promise<void> {
-  await repository.patchStateRoot({
-    [`${EVENT_PROGRESS_OUTBOX_DEAD_ROOT}/${outboxId}`]: {
-      deadAtMs: nowMs,
-      originalRecord: originalRecord === undefined ? null : originalRecord,
-      reason: "invalid-event-progress-outbox",
+  await repository.commitEventPlan([
+    {
+      kind: "progress-dead",
+      outboxId,
+      value: {
+        deadAtMs: nowMs,
+        originalRecord: originalRecord === undefined ? null : originalRecord,
+        reason: "invalid-event-progress-outbox",
+      },
     },
-    [`${EVENT_PROGRESS_OUTBOX_ROOT}/${outboxId}`]: null,
-  });
+    { kind: "progress-outbox", outboxId, value: null },
+  ]);
 }
 
 async function dispatchOutboxPlan(
@@ -412,9 +380,9 @@ async function dispatchOutboxPlan(
     await removeOutbox(repository, plan.outboxId);
     return;
   }
-  await repository.patchStateRoot({
-    [`${EVENT_PROGRESS_OUTBOX_ROOT}/${plan.outboxId}/lastQueuedAtMs`]: now(),
-  });
+  await repository.commitEventPlan([
+    { kind: "progress-dispatched", outboxId: plan.outboxId, value: now() },
+  ]);
 }
 
 async function forEachConcurrent<T>(
@@ -484,13 +452,17 @@ async function reconcileScheduledEvents(
           },
           discoveredAtMs,
         );
-        const existing = await repository.getStatePath(
-          `${EVENT_PROGRESS_OUTBOX_ROOT}/${plan.outboxId}`,
+        const existing = await repository.readEventProgressOutbox(
+          plan.outboxId,
         );
         if (existing === null) {
-          await repository.patchStateRoot({
-            [`${EVENT_PROGRESS_OUTBOX_ROOT}/${plan.outboxId}`]: plan.outbox,
-          });
+          await repository.commitEventPlan([
+            {
+              kind: "progress-outbox",
+              outboxId: plan.outboxId,
+              value: plan.outbox,
+            },
+          ]);
         }
         await dispatchOutboxPlan(env, repository, plan, now);
       })(),
@@ -596,9 +568,13 @@ async function recoverRatingEventProgress(
         },
         nowMs,
       );
-      await repository.patchStateRoot({
-        [`${EVENT_PROGRESS_OUTBOX_ROOT}/${plan.outboxId}`]: plan.outbox,
-      });
+      await repository.commitEventPlan([
+        {
+          kind: "progress-outbox",
+          outboxId: plan.outboxId,
+          value: plan.outbox,
+        },
+      ]);
       await dispatchOutboxPlan(env, repository, plan, now);
       await ratingRepository.markRatingEventProgress(
         record.operationId,
@@ -759,10 +735,10 @@ export function createWorkflowEventRuntime(
   const repository = createEventMutationRepository(env, { eventRepository });
   const lockManager = createEventLockManagerCore({
     createLockId: () => crypto.randomUUID(),
-    transactPath: (path, updater) =>
-      repository.transactStatePath(path, updater, signal),
-    releaseTransactPath: (path, updater) =>
-      repository.transactStatePath(path, updater),
+    transactEventLease: (key, updater) =>
+      repository.transactEventLease(key, updater, signal),
+    releaseTransactEventLease: (key, updater) =>
+      repository.transactEventLease(key, updater),
     sleep: (milliseconds) => scheduler.wait(milliseconds, { signal }),
     logger: {
       error: (_message, error) => {
@@ -781,7 +757,7 @@ export function createWorkflowEventRuntime(
   return {
     repository,
     runtime: createEventRuntime({
-      state: createEventStateAdapter(repository, signal),
+      state: createEventRuntimeStore(repository, signal),
       readMatchPair: (input) =>
         readGameplayMatchPair(repository, input, signal),
       enqueueEventProgressTask: async () => {

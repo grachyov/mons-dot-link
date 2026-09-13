@@ -7,8 +7,16 @@ const {
   LEGACY_CORE_PRIZES_EVENT_ID,
 } = require("../runtime/shared/event-prizes");
 const {
-  buildScheduledEventDueUpdatesCore,
+  buildScheduledEventDueUpdatesCore: buildTypedScheduledEventDueUpdatesCore,
 } = require("../runtime/events/startTransitionCore");
+
+const {
+  encodeEventUpdates,
+} = require("../workers/api/src/eventCompatibilityCodec.ts");
+const buildScheduledEventDueUpdatesCore = async (input) => {
+  const result = await buildTypedScheduledEventDueUpdatesCore(input);
+  return { ...result, updates: encodeEventUpdates(result.updates) };
+};
 
 const createParticipant = (index) => ({
   profileId: `profile-${index}`,

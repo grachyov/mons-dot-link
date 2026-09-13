@@ -13,8 +13,8 @@ const {
   getSundayMonsReminderLeadMs,
 } = require("./sundayMonsReminder");
 const {
-  buildTelegramEditUpdates,
-  buildTelegramSendUpdates,
+  buildTelegramEditDesired,
+  buildTelegramSendDesired,
 } = require("./desiredStateCore");
 const { getEventPrizePlacements } = require("../events/bracket");
 const {
@@ -758,23 +758,17 @@ const buildEventTelegramProjection = ({
   };
 };
 
-const buildEventTelegramProjectionUpdates = ({ eventId, projection }) => {
+const buildEventTelegramProjectionChanges = ({ eventId, projection }) => {
   const normalizedEventId = normalizeString(eventId);
   if (
     !normalizedEventId ||
     !projection ||
     projection.action !== "project" ||
     !projection.state
-  ) {
-    return {};
-  }
-  const updates = {
-    [`${EVENT_TELEGRAM_PROJECTION_ROOT}/${normalizedEventId}`]:
-      projection.state,
-  };
-  for (const operation of projection.operations) {
+  )
+    return null;
+  const desired = projection.operations.map((operation) => {
     const common = {
-      messageKey: operation.messageKey,
       destination: "community",
       instanceKey: operation.instanceKey,
       text: operation.text,
@@ -782,22 +776,22 @@ const buildEventTelegramProjectionUpdates = ({ eventId, projection }) => {
       silent: false,
       sourceRevision: operation.sourceRevision,
     };
-    const desiredUpdates =
-      operation.operation === "send"
-        ? buildTelegramSendUpdates(common)
-        : buildTelegramEditUpdates({
-            ...common,
-            ifMissing: operation.ifMissing,
-          });
-    Object.assign(updates, desiredUpdates);
-  }
-  return updates;
+    return {
+      messageKey: operation.messageKey,
+      value:
+        operation.operation === "send"
+          ? buildTelegramSendDesired(common)
+          : buildTelegramEditDesired({
+              ...common,
+              ifMissing: operation.ifMissing,
+            }),
+    };
+  });
+  return { eventId: normalizedEventId, state: projection.state, desired };
 };
 
-const addEventTelegramProjectionGuard = ({ updates, guard }) => {
-  if (!guard) {
-    return updates;
-  }
+const addEventTelegramProjectionGuard = ({ changes, guard }) => {
+  if (!guard) return changes;
   if (
     guard.lockRoot !== EVENT_TELEGRAM_PROJECTION_LOCK_ROOT ||
     !normalizeString(guard.eventId) ||
@@ -806,61 +800,29 @@ const addEventTelegramProjectionGuard = ({ updates, guard }) => {
   ) {
     throw new TypeError("invalid event Telegram projection lock guard");
   }
-  const guardedUpdates = {};
-  for (const [path, value] of Object.entries(updates)) {
-    const messagePathPrefix = "telegramMessages/";
-    const desiredPathSuffix = "/desired";
-    const messageKey =
-      path.startsWith(messagePathPrefix) && path.endsWith(desiredPathSuffix)
-        ? path.slice(messagePathPrefix.length, -desiredPathSuffix.length)
-        : "";
-    guardedUpdates[path] = {
-      ...value,
-      [EVENT_TELEGRAM_PROJECTION_GUARD_FIELD]: {
-        ...guard,
-        ...(messageKey ? { messageKey } : {}),
-      },
-    };
-  }
-  return guardedUpdates;
-};
-
-const splitEventTelegramProjectionUpdates = ({ eventId, updates }) => {
-  const statePath = `${EVENT_TELEGRAM_PROJECTION_ROOT}/${eventId}`;
-  const desiredUpdates = {};
-  const stateUpdates = {};
-  for (const [path, value] of Object.entries(updates)) {
-    if (path === statePath) {
-      stateUpdates[path] = value;
-    } else {
-      desiredUpdates[path] = value;
-    }
-  }
-  if (Object.keys(stateUpdates).length !== 1) {
-    throw new TypeError("event Telegram projection state update is required");
-  }
-  return { desiredUpdates, stateUpdates };
-};
-
-const buildEventTelegramDispatches = ({ eventId, desiredUpdates }) => {
-  const messagePathPrefix = "telegramMessages/";
-  const desiredPathSuffix = "/desired";
-  return Object.entries(desiredUpdates).map(([path, desired]) => {
-    const messageKey =
-      path.startsWith(messagePathPrefix) && path.endsWith(desiredPathSuffix)
-        ? path.slice(messagePathPrefix.length, -desiredPathSuffix.length)
-        : "";
-    const revision = normalizeString(desired && desired.revision);
-    if (!messageKey || !revision) {
-      throw new TypeError("invalid event Telegram desired update");
-    }
-    return {
+  return {
+    ...changes,
+    state: {
+      ...changes.state,
+      [EVENT_TELEGRAM_PROJECTION_GUARD_FIELD]: { ...guard },
+    },
+    desired: changes.desired.map(({ messageKey, value }) => ({
       messageKey,
-      revision,
-      generation: `event:${eventId}:${revision}`,
-    };
-  });
+      value: {
+        ...value,
+        [EVENT_TELEGRAM_PROJECTION_GUARD_FIELD]: { ...guard, messageKey },
+      },
+    })),
+  };
 };
+
+const buildEventTelegramDispatches = ({ eventId, desiredChanges }) =>
+  desiredChanges.map(({ messageKey, value }) => {
+    const revision = normalizeString(value && value.revision);
+    if (!messageKey || !revision)
+      throw new TypeError("invalid event Telegram desired update");
+    return { messageKey, revision, generation: `event:${eventId}:${revision}` };
+  });
 
 module.exports = {
   EVENT_TELEGRAM_DELIVERY_VERSION,
@@ -872,7 +834,7 @@ module.exports = {
   buildEventSignature,
   buildEventTelegramDispatches,
   buildEventTelegramProjection,
-  buildEventTelegramProjectionUpdates,
+  buildEventTelegramProjectionChanges,
   buildStartedState,
   formatPtEtUtcLine,
   isV2TelegramEvent,
@@ -881,5 +843,4 @@ module.exports = {
   renderEndedMessage,
   renderStartedMessage,
   renderUpcomingMessage,
-  splitEventTelegramProjectionUpdates,
 };

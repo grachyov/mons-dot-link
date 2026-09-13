@@ -13,14 +13,10 @@ import {
   type RatingProfileGameProjectionRepository,
 } from "./gameplayRepository.ts";
 import { createEventGameplayRepository } from "./eventRepository.ts";
+import type { EventStore } from "./eventStoreContracts.ts";
 import type { EventOutboxReads } from "./eventOutboxReadRepository.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import {
-  AUTOMATCH_PROFILE_GAME_PROJECTION_OUTBOX_ROOT,
-  EVENT_PROFILE_GAME_PROJECTION_LOCK_ROOT,
-  EVENT_PROFILE_GAME_PROJECTION_OUTBOX_ROOT,
-  getAutomatchProfileGameProjectionOutboxPath,
-  getEventProfileGameProjectionOutboxPath,
   parseAutomatchProfileGameProjectionOutbox,
   parseEventProfileGameProjectionOutbox,
   salvageHistoricalMatchDescriptors,
@@ -112,8 +108,8 @@ async function settleHistoricalDescriptor(
   descriptor: HistoricalMatchDescriptor,
   state: ProfileGameProjectionState,
 ): Promise<boolean> {
-  const result = await state.transactStatePath(
-    getAutomatchProfileGameProjectionOutboxPath(task.inviteId),
+  const result = await state.transactAutomatchProfileOutbox(
+    task.inviteId,
     (current) => {
       const record = toRecord(current);
       const outbox = parseAutomatchProfileGameProjectionOutbox(current);
@@ -146,7 +142,21 @@ type ProfileLinkProjectionResult = Pick<
 >;
 type ProfileGameProjectionState = Pick<
   GameplayRepository,
-  "getStatePath" | "readInviteMetadata" | "transactStatePath" | "readMatchPair"
+  | "readInviteMetadata"
+  | "readAutomatchEntry"
+  | "readMatchPair"
+  | "readMatchRecord"
+  | "readAutomatchProfileOutbox"
+  | "transactAutomatchProfileOutbox"
+  | "listDueAutomatchProfileOutboxes"
+  | "listMalformedAutomatchProfileOutboxes"
+>;
+
+type EventProfileProjectionState = Pick<
+  EventStore,
+  | "readEventProfileGameProjectionOutbox"
+  | "transactEventProfileGameProjectionOutbox"
+  | "transactEventLease"
 >;
 
 type ProfileLinkProjectionJobs = Pick<
@@ -162,6 +172,7 @@ export type ProfileGameProjectionDependencies = {
   createStateRepository?: (
     env: Env,
   ) => ProfileGameProjectionState &
+    EventProfileProjectionState &
     Pick<EventOutboxReads, "listDueEventProfileGameProjectionOutboxes">;
   createRequestId?: () => string;
   createRuntime?: (env: Env) => ProfileGameProjectionRuntime;
@@ -243,8 +254,8 @@ export async function settleAutomatchProfileGameProjectionOutbox(
   task: AutomatchProfileGameProjectionTask,
   state: ProfileGameProjectionState,
 ): Promise<boolean> {
-  const result = await state.transactStatePath(
-    getAutomatchProfileGameProjectionOutboxPath(task.inviteId),
+  const result = await state.transactAutomatchProfileOutbox(
+    task.inviteId,
     (current) => {
       const outbox = parseAutomatchProfileGameProjectionOutbox(current);
       if (!outbox || outbox.requestId !== task.requestId) {
@@ -273,9 +284,7 @@ export async function processAutomatchProfileGameProjection(
   await locks.acquire(lock, ownerId, now());
   try {
     const outbox = parseAutomatchProfileGameProjectionOutbox(
-      await state.getStatePath(
-        getAutomatchProfileGameProjectionOutboxPath(task.inviteId),
-      ),
+      await state.readAutomatchProfileOutbox(task.inviteId),
     );
     if (!outbox || outbox.requestId !== task.requestId) {
       return "stale";
@@ -332,10 +341,10 @@ export async function processAutomatchProfileGameProjection(
 
 export async function settleEventProfileGameProjectionOutbox(
   task: EventProfileGameProjectionTask,
-  state: ProfileGameProjectionState,
+  state: EventProfileProjectionState,
 ): Promise<boolean> {
-  const result = await state.transactStatePath(
-    getEventProfileGameProjectionOutboxPath(task.eventId),
+  const result = await state.transactEventProfileGameProjectionOutbox(
+    task.eventId,
     (current) => {
       const outbox = parseEventProfileGameProjectionOutbox(current);
       if (!outbox || outbox.requestId !== task.requestId) {
@@ -349,24 +358,22 @@ export async function settleEventProfileGameProjectionOutbox(
 
 export async function processEventProfileGameProjection(
   task: EventProfileGameProjectionTask,
-  state: ProfileGameProjectionState,
+  state: EventProfileProjectionState,
   runtime: EventProfileGameProjectionRuntime,
   ownerId: string = crypto.randomUUID(),
   now: () => number = Date.now,
 ): Promise<"missing" | "projected" | "stale" | "superseded"> {
   const initialOutbox = parseEventProfileGameProjectionOutbox(
-    await state.getStatePath(
-      getEventProfileGameProjectionOutboxPath(task.eventId),
-    ),
+    await state.readEventProfileGameProjectionOutbox(task.eventId),
   );
   if (!initialOutbox || initialOutbox.requestId !== task.requestId) {
     return "stale";
   }
   const lockManager = createEventLockManagerCore({
-    lockRoot: EVENT_PROFILE_GAME_PROJECTION_LOCK_ROOT,
+    lockKind: "profile-game-projection",
     createLockId: () => crypto.randomUUID(),
     includeLegacyOwnerId: true,
-    transactPath: state.transactStatePath,
+    transactEventLease: state.transactEventLease,
     now,
   });
   const lock = await lockManager.acquireEventLock(task.eventId, ownerId);
@@ -374,9 +381,7 @@ export async function processEventProfileGameProjection(
   const stopHeartbeat = lockManager.startEventLockHeartbeat(lock);
   try {
     const outbox = parseEventProfileGameProjectionOutbox(
-      await state.getStatePath(
-        getEventProfileGameProjectionOutboxPath(task.eventId),
-      ),
+      await state.readEventProfileGameProjectionOutbox(task.eventId),
     );
     if (!outbox || outbox.requestId !== task.requestId) {
       return "stale";
@@ -529,8 +534,8 @@ async function claimAutomatchSweepCandidate(
   candidate: AutomatchSweepCandidate,
   nowMs: number,
 ): Promise<boolean> {
-  const result = await state.transactStatePath(
-    getAutomatchProfileGameProjectionOutboxPath(candidate.task.inviteId),
+  const result = await state.transactAutomatchProfileOutbox(
+    candidate.task.inviteId,
     (current) => {
       const outbox = parseAutomatchProfileGameProjectionOutbox(current);
       if (
@@ -551,12 +556,12 @@ async function claimAutomatchSweepCandidate(
 }
 
 async function claimEventSweepCandidate(
-  state: ProfileGameProjectionState,
+  state: EventProfileProjectionState,
   candidate: EventSweepCandidate,
   nowMs: number,
 ): Promise<boolean> {
-  const result = await state.transactStatePath(
-    getEventProfileGameProjectionOutboxPath(candidate.task.eventId),
+  const result = await state.transactEventProfileGameProjectionOutbox(
+    candidate.task.eventId,
     (current) => {
       const outbox = parseEventProfileGameProjectionOutbox(current);
       if (
@@ -594,15 +599,15 @@ function salvageEventCleanupOwnerProfileIds(value: unknown): string[] {
 }
 
 async function repairInvalidEventSweepEntry(
-  state: ProfileGameProjectionState,
+  state: EventProfileProjectionState,
   eventId: string,
   nowMs: number,
   createRequestId: () => string,
 ): Promise<InvalidEventSweepResult> {
   const safeEventId = isSafeRecordKey(eventId);
   const requestId = safeEventId ? createRequestId() : "";
-  const result = await state.transactStatePath(
-    `${EVENT_PROFILE_GAME_PROJECTION_OUTBOX_ROOT}/${eventId}`,
+  const result = await state.transactEventProfileGameProjectionOutbox(
+    eventId,
     (current) => {
       if (
         current === null ||
@@ -659,8 +664,8 @@ async function repairInvalidAutomatchSweepEntry(
 ): Promise<InvalidAutomatchSweepResult> {
   const safeInviteId = isSafeRecordKey(inviteId);
   const requestId = safeInviteId ? createRequestId() : "";
-  const result = await state.transactStatePath(
-    getAutomatchProfileGameProjectionOutboxPath(inviteId),
+  const result = await state.transactAutomatchProfileOutbox(
+    inviteId,
     (current) => {
       const record = toRecord(current);
       if (
@@ -1084,16 +1089,13 @@ export async function sweepAutomatchProfileGameProjections(
     ((workerEnv: Env) => createGameplayRepository(workerEnv))
   )(env);
   const [dueValue, malformedValue] = await Promise.all([
-    state.getStatePath(AUTOMATCH_PROFILE_GAME_PROJECTION_OUTBOX_ROOT, {
-      orderBy: "lastQueuedAtMs",
-      endAt: dueBeforeMs,
-      limitToFirst: PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
-    }),
-    state.getStatePath(AUTOMATCH_PROFILE_GAME_PROJECTION_OUTBOX_ROOT, {
-      orderBy: "lastQueuedAtMs",
-      startAt: "",
-      limitToFirst: PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
-    }),
+    state.listDueAutomatchProfileOutboxes(
+      dueBeforeMs,
+      PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
+    ),
+    state.listMalformedAutomatchProfileOutboxes(
+      PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
+    ),
   ]);
   const entries = [
     ...automatchSweepEntries(dueValue),

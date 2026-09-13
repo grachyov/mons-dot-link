@@ -57,15 +57,19 @@ describe("event prize withdrawal D1 repository", () => {
       { now: () => 100 },
     );
     const reference = store.record(eventId, prizeId);
-    const created = await reference.transaction(() => processing(100));
+    const created = await reference.transaction(() => ({
+      value: processing(100),
+    }));
     expect(created.committed).toBe(true);
     expect(await store.get(eventId, prizeId)).toEqual(processing(100));
 
-    const aborted = await reference.transaction(() => undefined);
+    const aborted = await reference.transaction(() => ({ commit: false }));
     expect(aborted.committed).toBe(false);
     expect(aborted.value).toEqual(processing(100));
 
-    await reference.update({ status: "blocked", updatedAtMs: 200 });
+    await reference.transaction((current) => ({
+      value: { ...current, status: "blocked", updatedAtMs: 200 },
+    }));
     expect(await store.get(eventId, prizeId)).toMatchObject({
       status: "blocked",
       updatedAtMs: 200,
@@ -81,12 +85,16 @@ describe("event prize withdrawal D1 repository", () => {
     await Promise.all(
       stores.map((store) =>
         store.record(eventId, prizeId).transaction((current) => ({
-          ...(current && typeof current === "object" ? current : processing(1)),
-          attempts:
-            typeof (current as { attempts?: unknown } | null)?.attempts ===
-            "number"
-              ? Number((current as { attempts: number }).attempts) + 1
-              : 1,
+          value: {
+            ...(current && typeof current === "object"
+              ? current
+              : processing(1)),
+            attempts:
+              typeof (current as { attempts?: unknown } | null)?.attempts ===
+              "number"
+                ? Number((current as { attempts: number }).attempts) + 1
+                : 1,
+          },
         })),
       ),
     );
@@ -100,15 +108,19 @@ describe("event prize withdrawal D1 repository", () => {
       testEnv.EVENT_PRIZE_WITHDRAWALS_DB,
       { now: () => 300 },
     );
-    await store.replacePaths({
-      [`eventPrizeWithdrawals/${eventId}/${prizeId}`]: {
+    await store.replaceRecords([
+      {
         eventId,
         prizeId,
-        status: "completed",
-        transactionSignature: "signature",
-        updatedAtMs: 300,
+        value: {
+          eventId,
+          prizeId,
+          status: "completed",
+          transactionSignature: "signature",
+          updatedAtMs: 300,
+        },
       },
-    });
+    ]);
     expect(await store.get(eventId, prizeId)).toMatchObject({
       status: "completed",
       transactionSignature: "signature",
@@ -133,7 +145,7 @@ describe("event prize withdrawal D1 repository", () => {
     );
     const existing = store.record(eventId, prizeId);
     const latePrizeId = "1111";
-    await existing.transaction(() => processing(100));
+    await existing.transaction(() => ({ value: processing(100) }));
     await expect(store.get(eventId, latePrizeId)).resolves.toBeNull();
     const observedExisting = await testEnv.EVENT_PRIZE_WITHDRAWALS_DB.prepare(
       `SELECT version FROM event_prize_withdrawals
@@ -187,46 +199,61 @@ describe("event prize withdrawal D1 repository", () => {
     ).rejects.toThrow("event prize withdrawal storage is frozen");
 
     await expect(
-      store.replacePaths({
-        [`eventPrizeWithdrawals/${eventId}/${prizeId}`]: processing(550),
-      }),
+      store.replaceRecords([{ eventId, prizeId, value: processing(550) }]),
     ).resolves.toBeUndefined();
     await expect(
       existing.transaction((current) => ({
-        ...(current as Record<string, unknown>),
-        status: "submitted",
-        transactionSignature: "signature",
-        updatedAtMs: 600,
+        value: {
+          ...(current as Record<string, unknown>),
+          status: "submitted",
+          transactionSignature: "signature",
+          updatedAtMs: 600,
+        },
       })),
     ).resolves.toMatchObject({ committed: true });
     await expect(
       existing.transaction((current) => ({
-        ...(current as Record<string, unknown>),
-        leaseId: "submitted-replacement-lease",
-        updatedAtMs: 650,
+        value: {
+          ...(current as Record<string, unknown>),
+          leaseId: "submitted-replacement-lease",
+          updatedAtMs: 650,
+        },
       })),
     ).rejects.toThrow("event prize withdrawal storage is frozen");
     await expect(
-      existing.update({ updatedAtMs: 675 }),
-    ).resolves.toBeUndefined();
+      existing.transaction((current) => ({
+        value: { ...current, updatedAtMs: 675 },
+      })),
+    ).resolves.toMatchObject({
+      committed: true,
+      value: {
+        status: "submitted",
+        transactionSignature: "signature",
+        updatedAtMs: 675,
+      },
+    });
     await expect(
-      store.replacePaths({
-        [`eventPrizeWithdrawals/${eventId}/${prizeId}`]: {
+      store.replaceRecords([
+        {
           eventId,
           prizeId,
-          status: "completed",
-          transactionSignature: "signature",
-          updatedAtMs: 700,
+          value: {
+            eventId,
+            prizeId,
+            status: "completed",
+            transactionSignature: "signature",
+            updatedAtMs: 700,
+          },
         },
-      }),
+      ]),
     ).resolves.toBeUndefined();
     await expect(store.get(eventId, prizeId)).resolves.toMatchObject({
       status: "completed",
       transactionSignature: "signature",
     });
-    await expect(existing.transaction(() => processing(800))).rejects.toThrow(
-      "event prize withdrawal storage is frozen",
-    );
+    await expect(
+      existing.transaction(() => ({ value: processing(800) })),
+    ).rejects.toThrow("event prize withdrawal storage is frozen");
 
     await testEnv.EVENT_PRIZE_WITHDRAWALS_DB.prepare(
       `UPDATE event_prize_withdrawal_runtime_control
@@ -235,14 +262,18 @@ describe("event prize withdrawal D1 repository", () => {
     ).run();
     const resumed = store.record(eventId, latePrizeId);
     await expect(
-      resumed.transaction(() => ({ ...processing(900), prizeId: latePrizeId })),
+      resumed.transaction(() => ({
+        value: { ...processing(900), prizeId: latePrizeId },
+      })),
     ).resolves.toMatchObject({ committed: true });
     await testEnv.EVENT_PRIZE_WITHDRAWALS_DB.prepare(
       `UPDATE event_prize_withdrawal_runtime_control
        SET storage_mode = 'frozen', previous_storage_mode = 'd1'
        WHERE singleton = 1`,
     ).run();
-    await expect(resumed.transaction(() => null)).resolves.toMatchObject({
+    await expect(
+      resumed.transaction(() => ({ value: null })),
+    ).resolves.toMatchObject({
       committed: true,
     });
     await expect(store.get(eventId, latePrizeId)).resolves.toBeNull();
@@ -261,9 +292,7 @@ describe("event prize withdrawal D1 repository", () => {
     const current = { ...processing(300), leaseId: "canonical-lease" };
     await createD1EventPrizeWithdrawalStore(
       testEnv.EVENT_PRIZE_WITHDRAWALS_DB,
-    ).replacePaths({
-      [`eventPrizeWithdrawals/${eventId}/${prizeId}`]: current,
-    });
+    ).replaceRecords([{ eventId, prizeId, value: current }]);
     const readEvent = createD1EventPrizeWithdrawalReader(
       testEnv.EVENT_PRIZE_WITHDRAWALS_DB,
     );
@@ -287,44 +316,17 @@ describe("event prize withdrawal D1 repository", () => {
       readProfileEventPrizeAssignment: async () => {
         throw new Error("unexpected-profile-prize-read");
       },
-      getStatePath: async (candidatePath: string) =>
-        sourceValues.get(candidatePath) ?? null,
-      patchStateRoot: async (updates: Record<string, unknown>) => {
-        sourceWrites += 1;
-        for (const [candidatePath, value] of Object.entries(updates)) {
-          if (value === null) sourceValues.delete(candidatePath);
-          else sourceValues.set(candidatePath, value);
-        }
-      },
-      transactStatePath: async (
-        candidatePath: string,
-        updater: (current: unknown) => unknown,
-      ) => {
-        const current = sourceValues.get(candidatePath) ?? null;
-        const decision = updater(current) as {
-          commit?: false;
-          decision?: string;
-          value?: unknown;
-        };
-        if (decision.commit === false) {
-          return {
-            committed: false,
-            decision: decision.decision,
-            value: current,
-          };
-        }
-        sourceValues.set(candidatePath, decision.value);
-        return {
-          committed: true,
-          decision: decision.decision,
-          value: decision.value,
-        };
+      transactProfileEventPrize: async () => {
+        sourceWrites++;
+        throw new Error("unexpected-profile-prize-transaction");
       },
     };
     const runtime = await createEventPrizeRuntimeDependencies(testEnv, {
       repository,
     });
-    await runtime.state.transaction(path, () => processing(500));
+    await runtime.withdrawals
+      .record(eventId, prizeId)
+      .transaction(() => ({ value: processing(500) }));
     expect(await runtime.readWithdrawal(eventId, prizeId)).toEqual(
       processing(500),
     );
@@ -334,20 +336,26 @@ describe("event prize withdrawal D1 repository", () => {
       processing(500),
     );
     await expect(
-      runtime.state.transaction(path, (current) => ({
-        ...(current as Record<string, unknown>),
-        updatedAtMs: 550,
+      runtime.withdrawals.record(eventId, prizeId).transaction((current) => ({
+        value: {
+          ...(current as Record<string, unknown>),
+          updatedAtMs: 550,
+        },
       })),
     ).resolves.toMatchObject({ committed: true });
     expect(sourceWrites).toBe(0);
-    await runtime.state.update("", {
-      [path]: {
+    await runtime.withdrawals.replaceRecords([
+      {
         eventId,
         prizeId,
-        status: "completed",
-        updatedAtMs: 600,
+        value: {
+          eventId,
+          prizeId,
+          status: "completed",
+          updatedAtMs: 600,
+        },
       },
-    });
+    ]);
     expect(await runtime.readWithdrawal(eventId, prizeId)).toMatchObject({
       status: "completed",
     });

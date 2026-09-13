@@ -1,3 +1,4 @@
+import { gameplayTestPort } from "../test/gameSessionTestPorts.ts";
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -22,7 +23,7 @@ import {
 } from "../src/matchPresentationRegistry.ts";
 import { createGameplayRepository } from "../src/gameplayRepository.ts";
 import { resolveInviteRole } from "../src/gameSessionMutations.ts";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import { applyRetiredProfileMigrations } from "./profileTestMigrations.ts";
 import { activateDurableMatchPresentationTestState } from "./matchPresentationTestFixture.ts";
 
@@ -322,7 +323,8 @@ describe("D1-authoritative profile game projection ownership", () => {
           expect(candidateInviteId).toBe(inviteId);
           return { hostId: loginUid };
         },
-        async getStatePath(path) {
+        async readAutomatchEntry(id) {
+          const path = `automatch/${id}`;
           reads.push(path);
           if (/^players\/.+\/profile$/.test(path)) {
             throw new Error("unexpected-source-profile-owner-read");
@@ -386,7 +388,8 @@ describe("D1-authoritative profile game projection ownership", () => {
             guestRematches: "1x",
           };
         },
-        async getStatePath(path) {
+        async readAutomatchEntry(id) {
+          const path = `automatch/${id}`;
           if (path === `automatch/${inviteId}`) return null;
           throw new Error(`unexpected-source-read:${path}`);
         },
@@ -461,7 +464,8 @@ describe("D1-authoritative profile game projection ownership", () => {
             guestRematches: "x",
           };
         },
-        async getStatePath(path) {
+        async readAutomatchEntry(id) {
+          const path = `automatch/${id}`;
           reads.push(path);
           if (path === `automatch/${inviteId}`) return null;
           throw new Error(`unexpected-source-read:${path}`);
@@ -533,7 +537,8 @@ describe("D1-authoritative profile game projection ownership", () => {
                 : { matchesRatingUpdates: { [entry.inviteId]: true } }),
             };
           },
-          async getStatePath(path) {
+          async readAutomatchEntry(id) {
+            const path = `automatch/${id}`;
             if (path === `automatch/${entry.inviteId}`) return null;
             throw new Error(`unexpected-source-read:${path}`);
           },
@@ -584,7 +589,8 @@ describe("D1-authoritative profile game projection ownership", () => {
         async readInviteMetadata(inviteId) {
           throw new Error(`unexpected-invite-metadata-read:${inviteId}`);
         },
-        async getStatePath(path) {
+        async readAutomatchEntry(id) {
+          const path = `automatch/${id}`;
           throw new Error(`unexpected-source-read:${path}`);
         },
       },
@@ -759,8 +765,8 @@ describe("D1-authoritative profile game projection ownership", () => {
           }
           throw new Error(`unexpected-invite-metadata-read:${inviteId}`);
         },
-        async getStatePath(path, query) {
-          expect(query?.shallow).not.toBe(true);
+        async readAutomatchEntry(id) {
+          const path = `automatch/${id}`;
           if (inviteIds.some((inviteId) => path === `automatch/${inviteId}`)) {
             return null;
           }
@@ -835,7 +841,9 @@ describe("D1-authoritative profile game projection ownership", () => {
         throw new Error("unexpected-source-write");
       },
     };
-    const repository = createGameplayRepository(testEnv, { stateClient });
+    const repository = createGameplayRepository(testEnv, {
+      stateClient: gameplayTestPort(stateClient),
+    });
 
     await expect(
       resolveInviteRole({ uid: alternateUid }, { inviteId }, repository),
@@ -853,7 +861,7 @@ describe("D1-authoritative profile game projection ownership", () => {
         async readInviteMetadata() {
           throw new Error("unexpected-invite-metadata-read");
         },
-        async getStatePath() {
+        async readMatchRecord() {
           throw new Error("unexpected-generic-state-read");
         },
         async readEvent(candidateEventId) {

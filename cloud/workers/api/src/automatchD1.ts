@@ -1,11 +1,21 @@
+import type { GameSessionChange } from "./gameSessionContracts.ts";
+import type {
+  TransactionDecision,
+  TransactionResult,
+} from "./repositoryContracts.ts";
 import { RETIRED_STATE_BACKEND } from "./stateCompatibility.ts";
 import { STATE_VALUE_FIELD } from "./stateCompatibility.ts";
-import type {
-  StateQuery,
-  StateTransactionResult,
-} from "./stateRepositoryTypes.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
 import { validateTelegramTransactionDecision } from "./telegramTransaction.ts";
+
+type AutomatchCollectionQuery = {
+  orderBy?: "$key" | "uid" | "updatedAtMs" | "lastQueuedAtMs";
+  equalTo?: string | number | boolean | null;
+  startAt?: string | number | boolean | null;
+  endAt?: string | number | boolean | null;
+  limitToFirst?: number;
+  shallow?: boolean;
+};
 
 export const AUTOMATCH_RECORD_TABLES = {
   automatch: {
@@ -41,16 +51,6 @@ export const AUTOMATCH_RECORD_TABLES = {
 } as const;
 
 export type AutomatchRoot = keyof typeof AUTOMATCH_RECORD_TABLES;
-export const AUTOMATCH_ROOTS = Object.freeze(
-  Object.keys(AUTOMATCH_RECORD_TABLES) as AutomatchRoot[],
-);
-
-export type AutomatchOwnedPath = {
-  root: AutomatchRoot;
-  key: string | null;
-  nested: string[];
-};
-
 export type AutomatchRecordSnapshot = {
   root: AutomatchRoot;
   key: string;
@@ -143,21 +143,6 @@ function requireKey(key: string): void {
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export function parseAutomatchPath(path: string): AutomatchOwnedPath | null {
-  const normalized = path.replace(/^\/+|\/+$/g, "");
-  const root = AUTOMATCH_ROOTS.find(
-    (candidate) =>
-      normalized === candidate || normalized.startsWith(`${candidate}/`),
-  );
-  if (!root) return null;
-  const parts = normalized.slice(root.length).replace(/^\//, "").split("/");
-  if (parts.length === 1 && parts[0] === "") {
-    return { root, key: null, nested: [] };
-  }
-  parts.forEach(requireKey);
-  return { root, key: parts[0], nested: parts.slice(1) };
 }
 
 function nullableTimestamp(value: number | null): number | null {
@@ -479,7 +464,7 @@ const ORDER_FIELDS = new Set([
   "completedAtMs",
 ]);
 
-function validateQuery(query: StateQuery): void {
+function validateQuery(query: AutomatchCollectionQuery): void {
   if (Object.keys(query).some((field) => !QUERY_FIELDS.has(field))) {
     throw new TypeError("unsupported-automatch-query");
   }
@@ -556,7 +541,7 @@ function queryBound(value: string | number | boolean | null | undefined): {
 
 function querySql(
   column: string,
-  query: StateQuery,
+  query: AutomatchCollectionQuery,
 ): { where: string; order: string; values: Array<string | number> } {
   validateQuery(query);
   const field = query.orderBy || "$key";
@@ -660,7 +645,7 @@ export function createAutomatchD1Store(
 
   async function list(
     root: AutomatchRoot,
-    query: StateQuery = {},
+    query: AutomatchCollectionQuery = {},
     signal?: AbortSignal,
   ): Promise<AutomatchRecordSnapshot[]> {
     const { table, valueColumn, revisionColumn } = requireRoot(root);
@@ -720,39 +705,6 @@ export function createAutomatchD1Store(
       .all<RecordRow>();
     signal?.throwIfAborted();
     return rows.results.map((row) => decodeSnapshot("automatch", row));
-  }
-
-  async function getPath(
-    path: string,
-    query: StateQuery = {},
-    signal?: AbortSignal,
-  ): Promise<unknown> {
-    const owned = parseAutomatchPath(path);
-    if (!owned) throw new TypeError("not-an-automatch-path");
-    if (owned.key === null) {
-      const rows = await list(owned.root, query, signal);
-      return rows.length
-        ? Object.fromEntries(
-            rows.map((entry) => [
-              entry.key,
-              query.shallow === true ? true : entry.value,
-            ]),
-          )
-        : null;
-    }
-    validateQuery(query);
-    if (Object.keys(query).some((field) => field !== "shallow")) {
-      throw new TypeError("unsupported-automatch-record-query");
-    }
-    const result = nestedValue(
-      (await read(owned.root, owned.key, signal)).value,
-      owned.nested,
-    );
-    return query.shallow === true &&
-      result !== null &&
-      typeof result === "object"
-      ? Object.fromEntries(Object.keys(result).map((key) => [key, true]))
-      : result;
   }
 
   function buildRevisionGuardStatements(
@@ -822,100 +774,149 @@ export function createAutomatchD1Store(
     }
   }
 
-  async function preparePatch(
-    updates: Record<string, unknown>,
+  async function prepareChanges(
+    changes: readonly GameSessionChange[],
     nowMs = now(),
     signal?: AbortSignal,
   ): Promise<AutomatchRecordMutation[]> {
     timestamp(nowMs);
-    const entries = Object.entries(updates).map(([path, value]) => {
-      const owned = parseAutomatchPath(path);
-      if (!owned?.key)
-        throw new TypeError("automatch-patch-must-target-record");
-      return {
-        path: [owned.root, owned.key, ...owned.nested].join("/"),
-        owned,
-        value,
-      };
-    });
-    const paths = entries.map(({ path }) => path).sort();
-    for (let index = 1; index < paths.length; index++) {
-      if (
-        paths[index] === paths[index - 1] ||
-        paths[index].startsWith(`${paths[index - 1]}/`)
-      ) {
-        throw new TypeError("overlapping-automatch-patch");
+    const groups = new Map<
+      string,
+      { root: AutomatchRoot; key: string; changes: GameSessionChange[] }
+    >();
+    const add = (
+      root: AutomatchRoot,
+      key: string,
+      change: GameSessionChange,
+    ) => {
+      requireKey(key);
+      const identity = `${root}/${key}`;
+      const group = groups.get(identity) || { root, key, changes: [] };
+      group.changes.push(change);
+      groups.set(identity, group);
+    };
+    for (const change of changes) {
+      switch (change.kind) {
+        case "automatch-entry":
+          add("automatch", change.inviteId, change);
+          break;
+        case "telegram-source":
+        case "telegram-source-merge":
+          add("telegramAutomatches", change.inviteId, change);
+          break;
+        case "telegram-outbox":
+          add("telegramProjectionOutbox/automatch", change.inviteId, change);
+          break;
+        case "profile-outbox":
+        case "profile-outbox-merge":
+          add("profileGameProjectionOutbox/automatch", change.inviteId, change);
+          break;
+        case "mutation-receipt":
+          add("gameplayMutationReceipts", change.operationId, change);
+          add("gameplayMutationReceiptExpirations", change.operationId, change);
       }
     }
-    const groups = new Map<string, typeof entries>();
-    for (const entry of entries) {
-      const key = `${entry.owned.root}/${entry.owned.key}`;
-      const group = groups.get(key) || [];
-      group.push(entry);
-      groups.set(key, group);
-    }
     return Promise.all(
-      [...groups.values()].map(async (group) => {
-        const first = group[0].owned;
-        const current = await read(first.root, first.key!, signal);
+      [...groups.values()].map(async ({ root, key, changes }) => {
+        const current = await read(root, key, signal);
         let value = current.value;
-        for (const entry of group) {
-          value = setNested(
-            value,
-            entry.owned.nested,
-            resolveAutomatchServerValues(
-              entry.value,
-              nestedValue(current.value, entry.owned.nested),
+        for (const change of changes) {
+          if (change.kind === "mutation-receipt") {
+            value = resolveAutomatchServerValues(
+              root === "gameplayMutationReceipts"
+                ? change.value
+                : change.expiration,
+              current.value,
               nowMs,
-            ),
-          );
+            );
+          } else if (
+            change.kind === "telegram-source-merge" ||
+            change.kind === "profile-outbox-merge"
+          ) {
+            for (const [field, next] of Object.entries(change.value)) {
+              requireKey(field);
+              value = setNested(
+                value,
+                [field],
+                resolveAutomatchServerValues(
+                  next,
+                  nestedValue(current.value, [field]),
+                  nowMs,
+                ),
+              );
+            }
+            if (change.kind === "profile-outbox-merge")
+              for (const [matchId, next] of Object.entries(
+                change.historicalMatches || {},
+              )) {
+                requireKey(matchId);
+                value = setNested(
+                  value,
+                  ["historicalMatches", matchId],
+                  resolveAutomatchServerValues(
+                    next,
+                    nestedValue(current.value, ["historicalMatches", matchId]),
+                    nowMs,
+                  ),
+                );
+              }
+          } else if (
+            change.kind === "automatch-entry" ||
+            change.kind === "telegram-source" ||
+            change.kind === "telegram-outbox" ||
+            change.kind === "profile-outbox"
+          ) {
+            value = resolveAutomatchServerValues(
+              change.value,
+              current.value,
+              nowMs,
+            );
+          }
         }
         return { current, value };
       }),
     );
   }
 
-  async function patchRoot(
-    updates: Record<string, unknown>,
+  async function transactRecord(
+    root: AutomatchRoot,
+    key: string,
+    update: (current: unknown) => TransactionDecision<unknown>,
     signal?: AbortSignal,
-  ): Promise<void> {
+  ): Promise<TransactionResult<unknown>> {
     const nowMs = now();
     for (let attempt = 0; attempt < 25; attempt++) {
-      if (await commit(await preparePatch(updates, nowMs, signal), signal))
-        return;
-    }
-    throw new AutomatchD1Failure("automatch-patch-contention");
-  }
-
-  async function transactPath(
-    path: string,
-    updater: (current: unknown) => unknown,
-    signal?: AbortSignal,
-  ): Promise<StateTransactionResult> {
-    const owned = parseAutomatchPath(path);
-    if (!owned?.key)
-      throw new TypeError("automatch-transaction-must-target-record");
-    const nowMs = now();
-    for (let attempt = 0; attempt < 25; attempt++) {
-      const current = await read(owned.root, owned.key, signal);
-      const value = nestedValue(current.value, owned.nested);
+      const current = await read(root, key, signal);
       const decision = validateTelegramTransactionDecision(
-        updater(structuredClone(value)),
+        update(structuredClone(current.value)),
       );
       if (!decision.commit)
-        return { committed: false, decision: decision.decision, value };
-      const next = resolveAutomatchServerValues(decision.value, value, nowMs);
-      if (
-        await commit(
-          [{ current, value: setNested(current.value, owned.nested, next) }],
-          signal,
-        )
-      ) {
-        return { committed: true, decision: decision.decision, value: next };
-      }
+        return {
+          committed: false,
+          decision: decision.decision,
+          value: current.value,
+        };
+      const value = resolveAutomatchServerValues(
+        decision.value,
+        current.value,
+        nowMs,
+      );
+      if (await commit([{ current, value }], signal))
+        return { committed: true, decision: decision.decision, value };
     }
     throw new AutomatchD1Failure("automatch-transaction-contention");
   }
+
+  const values = async (
+    root: AutomatchRoot,
+    query: AutomatchCollectionQuery,
+    signal?: AbortSignal,
+  ) => {
+    const rows = await list(root, query, signal);
+    return rows.length
+      ? Object.fromEntries(rows.map((row) => [row.key, row.value]))
+      : null;
+  };
 
   async function expireReceipts(
     cutoffMs: number,
@@ -961,15 +962,105 @@ export function createAutomatchD1Store(
 
   return {
     read,
+    prepareChanges,
+    readAutomatchEntry: async (inviteId: string, signal?: AbortSignal) =>
+      (await read("automatch", inviteId, signal)).value,
+    listAutomatchEntriesByLogin: (
+      uid: string,
+      limit: number,
+      signal?: AbortSignal,
+    ) =>
+      values(
+        "automatch",
+        { orderBy: "uid", equalTo: uid, limitToFirst: limit },
+        signal,
+      ),
+    readFirstAutomatchEntry: (signal?: AbortSignal) =>
+      values("automatch", { orderBy: "$key", limitToFirst: 1 }, signal),
+    readMutationReceipt: async (operationId: string, signal?: AbortSignal) =>
+      (await read("gameplayMutationReceipts", operationId, signal)).value,
+    readAutomatchTelegramSource: async (
+      inviteId: string,
+      signal?: AbortSignal,
+    ) => (await read("telegramAutomatches", inviteId, signal)).value,
+    transactAutomatchTelegramSource: (
+      inviteId: string,
+      update: (value: unknown) => TransactionDecision<unknown>,
+      signal?: AbortSignal,
+    ) => transactRecord("telegramAutomatches", inviteId, update, signal),
+    readAutomatchTelegramOutbox: async (
+      inviteId: string,
+      signal?: AbortSignal,
+    ) =>
+      (await read("telegramProjectionOutbox/automatch", inviteId, signal))
+        .value,
+    transactAutomatchTelegramOutbox: (
+      inviteId: string,
+      update: (value: unknown) => TransactionDecision<unknown>,
+      signal?: AbortSignal,
+    ) =>
+      transactRecord(
+        "telegramProjectionOutbox/automatch",
+        inviteId,
+        update,
+        signal,
+      ),
+    listDueAutomatchTelegramOutboxes: (
+      nowMs: number,
+      limit: number,
+      signal?: AbortSignal,
+    ) =>
+      values(
+        "telegramProjectionOutbox/automatch",
+        {
+          orderBy: "updatedAtMs",
+          startAt: 0,
+          endAt: nowMs,
+          limitToFirst: limit,
+        },
+        signal,
+      ),
+    readAutomatchProfileOutbox: async (
+      inviteId: string,
+      signal?: AbortSignal,
+    ) =>
+      (await read("profileGameProjectionOutbox/automatch", inviteId, signal))
+        .value,
+    transactAutomatchProfileOutbox: (
+      inviteId: string,
+      update: (value: unknown) => TransactionDecision<unknown>,
+      signal?: AbortSignal,
+    ) =>
+      transactRecord(
+        "profileGameProjectionOutbox/automatch",
+        inviteId,
+        update,
+        signal,
+      ),
+    listDueAutomatchProfileOutboxes: (
+      beforeMs: number,
+      limit: number,
+      signal?: AbortSignal,
+    ) =>
+      values(
+        "profileGameProjectionOutbox/automatch",
+        { orderBy: "lastQueuedAtMs", endAt: beforeMs, limitToFirst: limit },
+        signal,
+      ),
+    listMalformedAutomatchProfileOutboxes: (
+      limit: number,
+      signal?: AbortSignal,
+    ) =>
+      values(
+        "profileGameProjectionOutbox/automatch",
+        { orderBy: "lastQueuedAtMs", startAt: "", limitToFirst: limit },
+        signal,
+      ),
     list,
     listEntriesByLogins,
-    getPath,
-    preparePatch,
     buildRevisionGuardStatements,
     buildCommitStatements,
     commit,
-    patchRoot,
-    transactPath,
     expireReceipts,
   };
 }

@@ -1,3 +1,4 @@
+import { createLegacyInviteSourceD1Store as createInviteSourceD1Store } from "../test/legacyInviteSourceFixture.ts";
 import { env } from "cloudflare:workers";
 import {
   applyD1Migrations,
@@ -10,7 +11,6 @@ import {
 import { afterEach, beforeAll, expect, it } from "vitest";
 import { INVITE_METADATA_SOCKET_PROTOCOL } from "@mons/shared/invite-metadata";
 import { INVITE_WAGERS_SOCKET_PROTOCOL } from "@mons/shared/invite-wagers";
-import { createInviteSourceD1Store } from "../src/inviteSourceD1.ts";
 import { handleInviteMetadataRoute } from "../src/inviteMetadataRoute.ts";
 import { handleInviteWagersRoute } from "../src/inviteWagersRoute.ts";
 import {

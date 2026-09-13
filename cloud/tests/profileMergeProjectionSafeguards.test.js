@@ -248,7 +248,8 @@ const runInviteProjection = async ({
         assert.equal(readInviteId, inviteId);
         return invite;
       },
-      async getStatePath(path) {
+      async readAutomatchEntry(inviteId) {
+        const path = `automatch/${inviteId}`;
         if (path === `automatch/${inviteId}`) return null;
         if (/^players\/.+\/profile$/.test(path)) {
           throw new Error("unexpected-state-profile-owner-read");
@@ -423,7 +424,8 @@ test("invite projection ignores an legacy profile shadow when D1 has no owner", 
         assert.equal(readInviteId, inviteId);
         return { hostId: "host-login" };
       },
-      async getStatePath(path) {
+      async readAutomatchEntry(inviteId) {
+        const path = `automatch/${inviteId}`;
         if (path === `automatch/${inviteId}`) return null;
         if (path === "players/host-login/profile") {
           legacyProfileReads += 1;
@@ -465,7 +467,8 @@ test("invite projection retries D1 ownership failures without writing", async ()
         assert.equal(readInviteId, inviteId);
         return { hostId: "host-login" };
       },
-      async getStatePath(path) {
+      async readAutomatchEntry(inviteId) {
+        const path = `automatch/${inviteId}`;
         if (path === `automatch/${inviteId}`) return null;
         if (/^players\/.+\/profile$/.test(path)) {
           throw new Error("unexpected-state-profile-owner-read");

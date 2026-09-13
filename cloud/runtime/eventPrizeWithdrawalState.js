@@ -58,9 +58,6 @@ const decodeAdminSecretKey = (value) => {
   return bytes?.length === 64 ? bytes : null;
 };
 
-const getEventPrizeWithdrawalPath = (eventId, prizeId) =>
-  `eventPrizeWithdrawals/${normalizeString(eventId)}/${normalizeString(prizeId)}`;
-
 const isWithdrawalRecordOwnedByRequest = (
   value,
   profileId,
@@ -101,7 +98,7 @@ const getWithdrawalProjectionProfileIds = ({ withdrawal, profileIds }) =>
     ),
   );
 
-const buildWithdrawalCompletionUpdates = ({
+const buildWithdrawalCompletion = ({
   withdrawal,
   profileId,
   eventId,
@@ -132,13 +129,7 @@ const buildWithdrawalCompletionUpdates = ({
     completedAtMs,
     updatedAtMs: completedAtMs,
   };
-  const updates = {
-    [getEventPrizeWithdrawalPath(eventId, prizeId)]: completed,
-  };
-  return {
-    completed,
-    updates,
-  };
+  return completed;
 };
 
 const decideWithdrawalClaim = ({
@@ -238,14 +229,13 @@ const decideWithdrawalClaim = ({
 module.exports = {
   EVENT_PRIZE_ADMIN_WALLET,
   WITHDRAWAL_LEASE_MS,
-  buildWithdrawalCompletionUpdates,
+  buildWithdrawalCompletion,
   decodeAdminSecretKey,
   decideWithdrawalClaim,
   filterProjectableEventPrizeAssignments,
   getCompletedEventPrizeProjectionCleanupRequest,
   getEventPrizeAssetAddress,
   getEventPrizeAssetStandard,
-  getEventPrizeWithdrawalPath,
   getWithdrawalProjectionProfileIds,
   isCompletedEventPrizeWithdrawal,
   isMatchingProfileEventPrizeAssignment,

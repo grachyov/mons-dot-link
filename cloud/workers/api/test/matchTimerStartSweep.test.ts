@@ -1,3 +1,4 @@
+import type { MatchStateRecord } from "../src/matchStateTypes.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Game } from "mons-rules";
@@ -22,11 +23,12 @@ function match(
 
 function repository(
   records: Readonly<Record<string, unknown>>,
-): Pick<GameplayRepository, "getStatePath" | "readInviteMetadata"> {
+): Pick<GameplayRepository, "readMatchRecord" | "readInviteMetadata"> {
   return {
-    getStatePath: async (path) => {
+    readMatchRecord: async ({ playerId, matchId }) => {
+      const path = `players/${playerId}/matches/${matchId}`;
       assert.ok(!path.startsWith("invites/"));
-      return records[path] ?? null;
+      return (records[path] ?? null) as MatchStateRecord | null;
     },
     readInviteMetadata: async (inviteId) =>
       (records[`invites/${inviteId}`] ?? null) as Record<
@@ -151,10 +153,11 @@ test("cleans legacy markers from owner-only terminal and later-turn proof", asyn
       stores.timerStarts,
       {
         readInviteMetadata: async () => assert.fail("unexpected-invite-read"),
-        getStatePath: async (path) => {
+        readMatchRecord: async ({ playerId, matchId }) => {
+          const path = `players/${playerId}/matches/${matchId}`;
           assert.ok(!path.startsWith("invites/"));
           paths.push(path);
-          return records[path] ?? null;
+          return (records[path] ?? null) as MatchStateRecord | null;
         },
       },
       {
@@ -247,10 +250,11 @@ test("backfills one bounded legacy invite match without guessing ambiguous oppon
           unknown
         > | null;
       },
-      getStatePath: async (path) => {
+      readMatchRecord: async ({ playerId, matchId }) => {
+        const path = `players/${playerId}/matches/${matchId}`;
         assert.ok(!path.startsWith("invites/"));
         paths.push(path);
-        return records[path] ?? null;
+        return (records[path] ?? null) as MatchStateRecord | null;
       },
     },
     {
@@ -384,7 +388,7 @@ test("fails the sweep with a bounded sanitized summary", async () => {
         stores.timerStarts,
         {
           readInviteMetadata: async () => assert.fail("unexpected-invite-read"),
-          getStatePath: async () => {
+          readMatchRecord: async () => {
             throw new Error("private-state-detail");
           },
         },

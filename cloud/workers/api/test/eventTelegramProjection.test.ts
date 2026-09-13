@@ -1,3 +1,5 @@
+import { buildEventTelegramProjection } from "../../../runtime/telegram/eventProjectionCore.js";
+import { attachProjectionTestPorts } from "./projectionTestPorts.ts";
 import { eventReadFixture } from "./eventReadFixture.ts";
 import type { EventReads } from "../../../runtime/eventReads.js";
 import type { EventOutboxReads } from "../src/eventOutboxReadRepository.ts";
@@ -12,20 +14,17 @@ import { buildSundayMonsReminder } from "../../../runtime/telegram/sundayMonsRem
 import type { TelegramResult } from "../../../runtime/telegram/client.js";
 import type { TelegramRepository } from "../../../runtime/telegram/deliveryEngine.js";
 import type { TelegramAnnouncementRecord } from "../src/telegramD1.ts";
+import { buildEventTelegramProjectionUpdates } from "../../../tests/eventProjectionChangesFixture.js";
+import { telegramRepositoryFixture } from "./telegramRepositoryFixture.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import {
-  buildEventTelegramProjection,
-  buildEventTelegramProjectionUpdates,
-} from "../../../runtime/telegram/eventProjectionCore.js";
-import { createTelegramRepository } from "../../../runtime/telegram/repositoryCore.js";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
-import {
-  processEventProjectionTask,
+  processEventProjectionTask as processTypedEventProjectionTask,
   sweepEventTelegramProjections,
 } from "../src/eventTelegramProjection.ts";
 import {
   getEventTelegramProjectionGenerationPath,
   getEventTelegramProjectionOutboxPath,
-} from "../src/eventTelegramProjectionProducer.ts";
+} from "./legacyEventProjectionFixture.ts";
 import type {
   RatingProjectionRepository,
   RatingUpdateData,
@@ -33,6 +32,28 @@ import type {
 import type { TelegramProjectionTask } from "../src/telegramProjectionTasks.ts";
 import { handleTelegramProjectionMessage } from "../src/telegramProjection.ts";
 import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
+
+type ProjectionArguments = Parameters<typeof processTypedEventProjectionTask>;
+function processEventProjectionTask(
+  task: ProjectionArguments[0],
+  state: ProjectionArguments[1] &
+    Pick<StateRepository, "getPath" | "transactPath">,
+  rating: ProjectionArguments[2],
+  enqueue: ProjectionArguments[3],
+  now: ProjectionArguments[4],
+  telegram: ProjectionArguments[5] = telegramRepositoryFixture(state),
+  reminder?: ProjectionArguments[6],
+) {
+  return processTypedEventProjectionTask(
+    task,
+    state,
+    rating,
+    enqueue,
+    now,
+    telegram,
+    reminder,
+  );
+}
 
 function store(initial: Record<string, unknown>) {
   const values = new Map(Object.entries(initial));
@@ -74,7 +95,7 @@ function store(initial: Record<string, unknown>) {
     },
   };
   return {
-    client,
+    client: attachProjectionTestPorts(client),
     read: (path: string) => values.get(path) ?? null,
     write: (path: string, value: unknown) => values.set(path, value),
   };
@@ -85,10 +106,14 @@ function ratingRepository(): RatingProjectionRepository {
     applyFebruaryChallengeReplay: async () => undefined,
     claimRatingTelegramProjection: async () => false,
     finalizeRatingUpdate: async () => ({ status: "lost" }),
-    getStatePath: async () => null,
+    readInviteMetadata: async () => null,
+    readMatchRecord: async () => null,
+    readMatchPair: async () => {
+      throw new Error("unexpected-match-pair-read");
+    },
     listDueRatingTelegramProjections: async () => [],
     markRatingTelegramProjection: async () => undefined,
-    patchStateRoot: async () => undefined,
+    putEventProgressOutbox: async () => undefined,
     readProfileOwnershipSnapshot: async () => {
       throw new Error("unexpected-profile-ownership-read");
     },
@@ -135,7 +160,13 @@ test("event projection persists desired state before delivery and clears its out
       state.client,
       ratingRepository(),
       async (input) => {
-        assert.ok(state.read(`telegramMessages/${input.messageKey}/desired`));
+        assert.ok(
+          (
+            state.read(`telegramMessages/${input.messageKey}`) as {
+              desired?: unknown;
+            }
+          )?.desired,
+        );
         assert.equal(state.read("eventTelegramProjections/event-1"), null);
         deliveries.push(input);
       },
@@ -182,7 +213,7 @@ test("a published heading survives a failed projection commit and later flag cha
   });
   const messagePath = "telegramMessages/event:event-1:upcoming";
   const messages = store({});
-  const telegram = createTelegramRepository({
+  const telegram = telegramRepositoryFixture({
     getPath: messages.client.getPath,
     transactPath: messages.client.transactPath,
   });
@@ -346,7 +377,7 @@ test("a legacy send racing projection retains its heading and retries participan
         [messagePath]: race === "already sending" ? sending : { desired },
       });
       let interruptCommit = race !== "already sending";
-      const telegram = createTelegramRepository({
+      const telegram = telegramRepositoryFixture({
         getPath: messages.client.getPath,
         transactPath: async (path, updater) => {
           if (path === messagePath && interruptCommit) {
@@ -465,7 +496,7 @@ test("uncertain invites preserve lifecycle and manual recovery decisions", async
             "events/event-1": event,
           });
           const messages = store({});
-          const telegram = createTelegramRepository(messages.client);
+          const telegram = telegramRepositoryFixture(messages.client);
           const now = () => Date.UTC(2026, 7, 25, 12);
           const pending: Array<{ messageKey: string; revision: string }> = [];
           let failInitialEnqueue = loseInitialProjection;
@@ -792,7 +823,7 @@ test("a manual invite receipt unlocks an edit through the Telegram repository an
   const messageKey = "event:event-1:upcoming";
   const messagePath = `telegramMessages/${messageKey}`;
   const messages = store({});
-  const telegram = createTelegramRepository({
+  const telegram = telegramRepositoryFixture({
     getPath: messages.client.getPath,
     transactPath: messages.client.transactPath,
   });
@@ -938,7 +969,7 @@ test("rating read failures retain pending event work for a successful retry", as
     },
   });
   const messages = store({});
-  const telegram = createTelegramRepository({
+  const telegram = telegramRepositoryFixture({
     getPath: messages.client.getPath,
     transactPath: messages.client.transactPath,
   });
@@ -1046,9 +1077,11 @@ test("a newer generation fences stale desired and state commits", async () => {
     "eventTelegramProjections/event-1": {
       eventTelegramProjectionGuard: { generation: 2 },
     },
-    "telegramMessages/event:event-1:upcoming/desired": {
-      eventTelegramProjectionGuard: { generation: 2 },
-      revision: "newer",
+    "telegramMessages/event:event-1:upcoming": {
+      desired: {
+        eventTelegramProjectionGuard: { generation: 2 },
+        revision: "newer",
+      },
     },
   });
   let deliveries = 0;
@@ -1065,10 +1098,10 @@ test("a newer generation fences stale desired and state commits", async () => {
   assert.equal(deliveries, 0);
   assert.equal(
     (
-      state.read("telegramMessages/event:event-1:upcoming/desired") as {
-        revision: string;
+      state.read("telegramMessages/event:event-1:upcoming") as {
+        desired: { revision: string };
       }
-    ).revision,
+    ).desired.revision,
     "newer",
   );
 });
@@ -1144,7 +1177,7 @@ function reminderProjectionFixture() {
     [`events/${task.eventId}`]: event,
   });
   const messages = store({});
-  const telegram = createTelegramRepository({
+  const telegram = telegramRepositoryFixture({
     getPath: messages.client.getPath,
     transactPath: messages.client.transactPath,
   });

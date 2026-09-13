@@ -1,18 +1,23 @@
-import assert from "node:assert/strict";
-import test from "node:test";
 import {
-  createEventTelegramProjectionRepository,
   getEventTelegramProjectionGenerationPath,
   getEventTelegramProjectionOutboxPath,
-} from "../src/eventTelegramProjectionProducer.ts";
+} from "./legacyEventProjectionFixture.ts";
+import {
+  attachEventTestPorts,
+  type EventTestSource,
+} from "./eventTestPorts.ts";
+import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createEventTelegramProjectionRepository } from "../src/eventTelegramProjectionProducer.ts";
 import type { EventGameplayRepository } from "../src/eventRepository.ts";
 import { eventReadFixture } from "./eventReadFixture.ts";
 import { TELEGRAM_TEST_ENV } from "./testEnv.ts";
 
 function repository(
-  patch: EventGameplayRepository["patchStateRoot"],
+  patch: NonNullable<EventTestSource["patchStateRoot"]>,
 ): EventGameplayRepository {
-  return {
+  return attachEventTestPorts<EventGameplayRepository & EventTestSource>({
     ...eventReadFixture(async () => null),
     readInviteMetadata: async () => {
       throw new Error("unexpected-invite-metadata-read");
@@ -34,7 +39,7 @@ function repository(
     getStatePath: async () => null,
     patchStateRoot: patch,
     transactStatePath: async () => ({ committed: false, value: null }),
-  };
+  });
 }
 
 test("event writes persist exact outboxes before enqueueing", async () => {
@@ -58,12 +63,14 @@ test("event writes persist exact outboxes before enqueueing", async () => {
     },
   );
 
-  await wrapped.patchStateRoot({
-    "events/event-b/status": "active",
-    "events/event-a/updatedAtMs": 123,
-    "events/event-b/updatedAtMs": 123,
-    "invites/invite-1/status": "active",
-  });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({
+      "events/event-b/status": "active",
+      "events/event-a/updatedAtMs": 123,
+      "events/event-b/updatedAtMs": 123,
+      "invites/invite-1": { status: "active" },
+    }),
+  );
 
   assert.deepEqual(enqueued, [
     {
@@ -107,8 +114,8 @@ test("non-event writes pass through without projection work", async () => {
       },
     },
   );
-  const updates = { "invites/invite-1/status": "active" };
-  await wrapped.patchStateRoot(updates);
+  const updates = { "invites/invite-1": { status: "active" } };
+  await wrapped.commitEventPlan(decodeEventUpdates(updates));
   assert.deepEqual(patches, [updates]);
   assert.equal(enqueues, 0);
 });
@@ -130,7 +137,9 @@ test("enqueue failure leaves the committed marker recoverable", async () => {
       now: () => 456,
     },
   );
-  await wrapped.patchStateRoot({ "events/event-1/status": "active" });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({ "events/event-1/status": "active" }),
+  );
   assert.deepEqual(persisted[getEventTelegramProjectionOutboxPath("event-1")], {
     schemaVersion: 1,
     status: "pending",
@@ -157,7 +166,9 @@ test("scheduled dispatch does not hold the committed mutation open", async () =>
       schedule: (work) => scheduled.push(work),
     },
   );
-  await wrapped.patchStateRoot({ "events/event-1/status": "active" });
+  await wrapped.commitEventPlan(
+    decodeEventUpdates({ "events/event-1/status": "active" }),
+  );
   assert.equal(scheduled.length, 1);
   finishEnqueue?.();
   await scheduled[0];

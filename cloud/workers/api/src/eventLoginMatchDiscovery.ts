@@ -23,21 +23,6 @@ function collectionValues(value: unknown): unknown[] {
   return values;
 }
 
-export function isPlayerMatchPath(path: string): boolean {
-  const parts = path.replace(/^\/+|\/+$/g, "").split("/");
-  return parts[0] === "players" && parts[2] === "matches" && parts.length === 4;
-}
-
-export function eventMatchCreationInviteIds(
-  updates: Readonly<Record<string, unknown>>,
-): string[] {
-  return Object.entries(updates).flatMap(([path, value]) =>
-    isPlayerMatchPath(path) && value !== null
-      ? [path.replace(/^\/+|\/+$/g, "").split("/")[3]]
-      : [],
-  );
-}
-
 export function eventMatchInviteIds(event: Record<string, unknown>): string[] {
   const matches = collectionValues(event.rounds).flatMap((value) => {
     if (value === null || value === undefined) return [];
@@ -62,7 +47,10 @@ export function eventMatchInviteIds(event: Record<string, unknown>): string[] {
 
 export async function captureEventMatchDiscovery(
   db: D1Database,
-  repository: Pick<GameplayRepository, "getStatePath" | "readInviteMetadata">,
+  repository: Pick<
+    GameplayRepository,
+    "readMatchRecord" | "readInviteMetadata"
+  >,
   inputInviteIds: readonly string[],
   signal?: AbortSignal,
   nowMs = Date.now(),
@@ -98,9 +86,8 @@ export async function captureEventMatchDiscovery(
           }
           return Promise.all(
             [hostId, guestId].map(async (loginUid) => {
-              const match = await repository.getStatePath(
-                `players/${loginUid}/matches/${inviteId}`,
-                { shallow: true },
+              const match = await repository.readMatchRecord(
+                { playerId: loginUid, matchId: inviteId },
                 signal,
               );
               if (match === null || match === undefined) {

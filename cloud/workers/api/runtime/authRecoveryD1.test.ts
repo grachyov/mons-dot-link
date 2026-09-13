@@ -643,7 +643,9 @@ describe("canonical auth recovery with D1 storage", () => {
     await expect(service.recoverProfile(f.targetProfileId)).resolves.toBe(
       false,
     );
-    expect(await store.getPath(f.targetPath)).toEqual({
+    expect(
+      await store.readProfileEventPrizeAssignment(f.targetProfileId, eventId),
+    ).toEqual({
       ...f.assignment,
       profileId: f.targetProfileId,
     });
@@ -668,7 +670,7 @@ describe("canonical auth recovery with D1 storage", () => {
         .first<number>("revision"),
     ).toBe(revision);
     expect(
-      await store.getPath(`profileEventPrizes/${sourceProfileId}/${eventId}`),
+      await store.readProfileEventPrizeAssignment(sourceProfileId, eventId),
     ).toEqual(f.assignment);
     expect(
       await testEnv.EVENT_DB.prepare(
@@ -685,7 +687,7 @@ describe("canonical auth recovery with D1 storage", () => {
       const store = createD1AuthRecoveryPrizeStore(testEnv.EVENT_DB);
       if (failure === "busy") {
         const nowMs = Date.now();
-        await store.transactPath(`eventLocks/${eventId}`, () => ({
+        await store.transactEventLease({ kind: "event", id: eventId }, () => ({
           value: {
             lockId: "other-lock",
             ownerUid: "other-owner",
@@ -713,7 +715,9 @@ describe("canonical auth recovery with D1 storage", () => {
         ),
       ).resolves.toBe(false);
       expect(await f.readJob()).toEqual(before);
-      expect(await store.getPath(f.targetPath)).toBeNull();
+      expect(
+        await store.readProfileEventPrizeAssignment(f.targetProfileId, eventId),
+      ).toBeNull();
     },
   );
 
@@ -726,7 +730,8 @@ describe("canonical auth recovery with D1 storage", () => {
       prizeStore: {
         ...store,
         async transactStoredProfileEventPrizeWithEventLease(
-          path,
+          profileId,
+          assignmentEventId,
           updater,
           guard,
           signal,
@@ -737,7 +742,8 @@ describe("canonical auth recovery with D1 storage", () => {
             .bind(eventId)
             .run();
           return store.transactStoredProfileEventPrizeWithEventLease(
-            path,
+            profileId,
+            assignmentEventId,
             updater,
             guard,
             signal,
@@ -749,7 +755,9 @@ describe("canonical auth recovery with D1 storage", () => {
       false,
     );
     expect(await f.readJob()).toEqual(before);
-    expect(await store.getPath(f.targetPath)).toBeNull();
+    expect(
+      await store.readProfileEventPrizeAssignment(f.targetProfileId, eventId),
+    ).toBeNull();
   });
 
   it.each(["before", "during"])(
@@ -764,12 +772,14 @@ describe("canonical auth recovery with D1 storage", () => {
       );
       const complete = () =>
         withdrawals.record(eventId, prizeId).transaction(() => ({
-          eventId,
-          prizeId,
-          status: "completed",
-          assetAddress: definition.assetAddress,
-          assetStandard: definition.standard,
-          updatedAtMs: Date.now(),
+          value: {
+            eventId,
+            prizeId,
+            status: "completed",
+            assetAddress: definition.assetAddress,
+            assetStandard: definition.standard,
+            updatedAtMs: Date.now(),
+          },
         }));
       if (timing === "before") await complete();
       let reads = 0;
@@ -791,9 +801,9 @@ describe("canonical auth recovery with D1 storage", () => {
         false,
       );
       expect(
-        await createD1AuthRecoveryPrizeStore(testEnv.EVENT_DB).getPath(
-          f.targetPath,
-        ),
+        await createD1AuthRecoveryPrizeStore(
+          testEnv.EVENT_DB,
+        ).readProfileEventPrizeAssignment(f.targetProfileId, eventId),
       ).toBeNull();
       expect(await f.readJob()).toMatchObject({
         source_phase: "games",

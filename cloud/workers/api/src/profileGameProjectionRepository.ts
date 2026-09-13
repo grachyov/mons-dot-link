@@ -51,7 +51,7 @@ import type { MatchPresentationReadDependencies } from "./matchPresentationAcces
 
 type ProjectionStateRepository = Pick<
   GameplayRepository,
-  "getStatePath" | "readInviteMetadata"
+  "readAutomatchEntry" | "readInviteMetadata"
 >;
 
 export type ProfileGameProjectionRuntime = {
@@ -209,7 +209,7 @@ export function createProfileGameProjectionRuntime(
       return getProfileGameProjection(d1, profileId, inviteId);
     },
 
-    getStatePath: (path) => state.getStatePath(path),
+    readAutomatchEntry: (inviteId) => state.readAutomatchEntry(inviteId),
     readInviteMetadata: (inviteId) => state.readInviteMetadata(inviteId),
 
     async getMatchEmoji(inviteId, matchId, loginUid) {
@@ -277,7 +277,7 @@ export function createEventProfileGameProjectionRuntime(
   dependencies: Omit<ProfileGameProjectionDependencies, "state"> & {
     state?: Pick<
       EventGameplayRepository,
-      "getStatePath" | "readInviteMetadata" | "readEvent"
+      "readMatchRecord" | "readInviteMetadata" | "readEvent"
     >;
   } = {},
 ): EventProfileGameProjectionRuntime {

@@ -1,3 +1,7 @@
+import {
+  attachGameplayTestPorts,
+  type LegacyGameplayTestMethods,
+} from "./gameSessionTestPorts.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
@@ -290,7 +294,14 @@ function ownershipSnapshot(
 function repository(initial: Record<string, unknown> = {}, nowMs = 1_000) {
   const values = new Map(Object.entries(initial));
   const patches: Record<string, unknown>[] = [];
-  const result: GameplayRepository = {
+  const source: Omit<
+    GameplayRepository,
+    | keyof import("../src/gameSessionContracts.ts").GameSessionPort
+    | keyof import("../src/repositoryContracts.ts").MatchStatePort
+    | "wagers"
+  > &
+    LegacyGameplayTestMethods &
+    Pick<GameplayRepository, "readInviteMetadata"> = {
     applyWagerTransferOnce: async () => "applied",
     deleteNavigationGame: async () => "deleted",
     getNavigationGame: async () => null,
@@ -356,7 +367,12 @@ function repository(initial: Record<string, unknown> = {}, nowMs = 1_000) {
       };
     },
   };
-  return { patches, repository: result, values };
+  const result = attachGameplayTestPorts(source);
+  return {
+    patches,
+    repository: result as typeof result & GameplayRepository,
+    values,
+  };
 }
 
 function presentation() {

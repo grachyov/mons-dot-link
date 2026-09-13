@@ -1,6 +1,9 @@
+import type {
+  EventCommand,
+  EventCommitPlan,
+} from "../../../runtime/eventCommands.js";
 import { STATE_FAILURE_MESSAGES } from "./stateCompatibility.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
-import { stateIncrement } from "./stateRepositoryTypes.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import type { EventTelegramProjectionTask } from "./telegramProjectionTasks.ts";
 
@@ -18,31 +21,25 @@ type ProducerDependencies = {
   schedule?: (work: Promise<void>) => void;
 };
 
-function eventIdsFromUpdates(updates: Record<string, unknown>): string[] {
-  const eventIds = new Set<string>();
-  for (const path of Object.keys(updates)) {
-    const [root, eventId] = path.split("/");
-    if (root === "events" && eventId && isSafeRecordKey(eventId)) {
-      eventIds.add(eventId);
-    }
-  }
-  return Array.from(eventIds).sort();
-}
-
-export function getEventTelegramProjectionOutboxPath(eventId: string): string {
-  if (!isSafeRecordKey(eventId)) {
-    throw new TypeError(STATE_FAILURE_MESSAGES.invalidEventId);
-  }
-  return `${EVENT_TELEGRAM_PROJECTION_OUTBOX_ROOT}/${eventId}`;
-}
-
-export function getEventTelegramProjectionGenerationPath(
-  eventId: string,
-): string {
-  if (!isSafeRecordKey(eventId)) {
-    throw new TypeError(STATE_FAILURE_MESSAGES.invalidEventId);
-  }
-  return `${EVENT_TELEGRAM_PROJECTION_GENERATION_ROOT}/${eventId}`;
+function eventIdsFromUpdates(updates: readonly EventCommand[]): string[] {
+  return [
+    ...new Set(
+      updates.flatMap((command) =>
+        [
+          "event",
+          "event-field",
+          "event-participant",
+          "event-disqualification",
+          "event-round",
+          "event-match-status",
+        ].includes(command.kind) &&
+        "eventId" in command &&
+        isSafeRecordKey(command.eventId)
+          ? [command.eventId]
+          : [],
+      ),
+    ),
+  ].sort();
 }
 
 export function buildEventTelegramProjectionOutbox(
@@ -79,10 +76,10 @@ export function createEventTelegramProjectionRepository(
   const now = dependencies.now || Date.now;
   return {
     ...repository,
-    async patchStateRoot(updates, signal) {
+    async commitEventPlan(updates, signal) {
       const eventIds = eventIdsFromUpdates(updates);
       if (eventIds.length === 0) {
-        await repository.patchStateRoot(updates, signal);
+        await repository.commitEventPlan(updates, signal);
         return;
       }
       const updatedAtMs = now();
@@ -91,14 +88,26 @@ export function createEventTelegramProjectionRepository(
         eventId,
         requestId: createRequestId(),
       }));
-      const nextUpdates = { ...updates };
+      const nextUpdates: EventCommitPlan = [...updates];
       for (const task of tasks) {
-        nextUpdates[getEventTelegramProjectionOutboxPath(task.eventId)] =
-          buildEventTelegramProjectionOutbox(task.requestId, updatedAtMs);
-        nextUpdates[getEventTelegramProjectionGenerationPath(task.eventId)] =
-          stateIncrement(1);
+        nextUpdates.push(
+          {
+            kind: "telegram-outbox",
+            eventId: task.eventId,
+            value: buildEventTelegramProjectionOutbox(
+              task.requestId,
+              updatedAtMs,
+            ),
+          },
+          {
+            kind: "telegram-generation",
+            eventId: task.eventId,
+            value: 1,
+            increment: true,
+          },
+        );
       }
-      await repository.patchStateRoot(nextUpdates, signal);
+      await repository.commitEventPlan(nextUpdates, signal);
       const dispatch = async () => {
         const results = await Promise.allSettled(tasks.map(enqueue));
         for (let index = 0; index < results.length; index += 1) {

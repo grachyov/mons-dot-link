@@ -24,12 +24,29 @@ const clone = (value) =>
 
 const createMemoryRepository = (database) =>
   createTelegramRepository({
-    async getPath(path) {
-      const snapshot = await database.ref(path).once("value");
+    async readMessage(messageKey) {
+      const snapshot = await database
+        .ref(`telegramMessages/${messageKey}`)
+        .once("value");
       return snapshot.exists() ? snapshot.val() : null;
     },
-    transactPath(path, updater) {
-      return runStateDecisionTransaction(database.ref(path), updater);
+    transactMessage(messageKey, updater) {
+      return runStateDecisionTransaction(
+        database.ref(`telegramMessages/${messageKey}`),
+        updater,
+      );
+    },
+    async readControl() {
+      const snapshot = await database
+        .ref("telegramDeliveryControl")
+        .once("value");
+      return snapshot.exists() ? snapshot.val() : null;
+    },
+    transactControl(updater) {
+      return runStateDecisionTransaction(
+        database.ref("telegramDeliveryControl"),
+        updater,
+      );
     },
   });
 

@@ -36,8 +36,8 @@ import {
 import * as monsRules from "mons-rules";
 import {
   TELEGRAM_AUTOMATCH_VERSION,
-  buildAutomatchTelegramProjectionOutboxUpdates,
-  buildMatchedAutomatchTelegramUpdates,
+  buildAutomatchTelegramProjectionChanges,
+  buildMatchedAutomatchTelegramChanges,
 } from "../../../runtime/telegram/automatchSource.js";
 import { getDisplayNameFromAddress } from "../../../runtime/telegramDisplay.js";
 import { AuthApiFailure } from "./authErrors.ts";
@@ -45,7 +45,7 @@ import type { RequestIdentity } from "./requestIdentity.ts";
 import {
   STATE_SERVER_TIMESTAMP,
   stateIncrement,
-} from "./stateRepositoryTypes.ts";
+} from "./stateCompatibility.ts";
 import { isCanonicalLoginUid, isSafeRecordKey } from "./recordKeys.ts";
 import {
   createGameplayRepository,
@@ -56,7 +56,8 @@ import {
   GameSessionMutationLockFailure,
   type GameSessionMutationLockStore,
 } from "./gameplayCoordinationD1.ts";
-import { buildAutomatchProfileGameProjectionOutboxMergeUpdates } from "./profileGameProjectionOutbox.ts";
+import { requestAutomatchProfileProjection } from "./gameSessionProjectionChanges.ts";
+import type { GameSessionChange } from "./gameSessionContracts.ts";
 import type { HistoricalMatchDescriptor } from "./historicalMatches.ts";
 import type {
   AutomatchProfileGameProjectionTask,
@@ -114,7 +115,7 @@ type GameSessionMutationOutcome<T extends GameSessionResponse> = {
   historicalMatches?: HistoricalMatchDescriptor[];
   projectReason?: string;
   response: T;
-  updates?: Record<string, unknown>;
+  changes?: GameSessionChange[];
 };
 
 type GameSessionMutationDependencies = {
@@ -158,14 +159,6 @@ function secureRandom(): number {
   const values = new Uint32Array(1);
   crypto.getRandomValues(values);
   return values[0] / 0x1_0000_0000;
-}
-
-function mutationReceiptPath(operationId: string): string {
-  return `${GAME_SESSION_MUTATION_RECEIPT_ROOT}/${operationId}`;
-}
-
-function mutationReceiptExpirationPath(operationId: string): string {
-  return `${GAME_SESSION_MUTATION_RECEIPT_EXPIRATION_ROOT}/${operationId}`;
 }
 
 function normalizeMatch(value: unknown): GameSessionMatch | null {
@@ -454,8 +447,8 @@ async function runGameSessionMutation<T extends GameSessionResponse>(
     request.operationId,
     dependencies.mutationLocks,
     async (refresh) => {
-      const rawReceipt = await repository.getStatePath(
-        mutationReceiptPath(request.operationId),
+      const rawReceipt = await repository.readMutationReceipt(
+        request.operationId,
       );
       const existing = parseReceipt(rawReceipt);
       if (rawReceipt !== null && rawReceipt !== undefined && !existing) {
@@ -484,38 +477,40 @@ async function runGameSessionMutation<T extends GameSessionResponse>(
       const projectionRequestId = outcome.projectReason
         ? request.operationId
         : null;
-      const updates: Record<string, unknown> = {
-        ...(outcome.updates || {}),
-        [mutationReceiptPath(request.operationId)]: {
-          schemaVersion: 1,
+      const changes: GameSessionChange[] = [
+        ...(outcome.changes || []),
+        {
+          kind: "mutation-receipt",
           operationId: request.operationId,
-          kind,
-          inviteId: request.inviteId,
-          fingerprint,
-          projectionRequestId,
-          requesterUid,
-          response: outcome.response,
-          completedAtMs: STATE_SERVER_TIMESTAMP,
+          value: {
+            schemaVersion: 1,
+            operationId: request.operationId,
+            kind,
+            inviteId: request.inviteId,
+            fingerprint,
+            projectionRequestId,
+            requesterUid,
+            response: outcome.response,
+            completedAtMs: STATE_SERVER_TIMESTAMP,
+          },
+          expiration: { completedAtMs: STATE_SERVER_TIMESTAMP },
         },
-        [mutationReceiptExpirationPath(request.operationId)]: {
-          completedAtMs: STATE_SERVER_TIMESTAMP,
-        },
-      };
+      ];
       if (outcome.projectReason) {
-        Object.assign(
-          updates,
-          buildAutomatchProfileGameProjectionOutboxMergeUpdates({
+        changes.push(
+          ...requestAutomatchProfileProjection({
             historicalMatches: outcome.historicalMatches,
             inviteId: request.inviteId,
             reason: outcome.projectReason,
             requestId: request.operationId,
             timestamp: STATE_SERVER_TIMESTAMP,
+            merge: true,
           }),
         );
       }
       await dependencies.assertMutationAllowed?.();
       await refresh();
-      await repository.patchStateRoot(updates);
+      await repository.commitSessionChanges(changes);
       if (projectionRequestId) {
         await dispatchProjection(
           request.inviteId,
@@ -707,15 +702,24 @@ export async function createManualInvite(
       return {
         response,
         projectReason: "manual-invite-created",
-        updates: {
-          [`invites/${request.inviteId}`]: {
-            version: CONTROLLER_VERSION,
-            hostId: identity.uid,
-            hostColor,
-            guestId: null,
+        changes: [
+          {
+            kind: "invite-merge",
+            inviteId: request.inviteId,
+            value: {
+              version: CONTROLLER_VERSION,
+              hostId: identity.uid,
+              hostColor,
+              guestId: null,
+            },
           },
-          [`players/${identity.uid}/matches/${request.inviteId}`]: match,
-        },
+          {
+            kind: "match-create",
+            playerId: identity.uid,
+            matchId: request.inviteId,
+            value: match,
+          },
+        ],
       };
     },
     dependencies,
@@ -746,14 +750,14 @@ function joiningProfile(
   );
 }
 
-function automatchJoinUpdates(
+function automatchJoinChanges(
   inviteId: string,
   operationId: string,
   automatch: Record<string, unknown>,
   profile: GameplayProfile,
-): Record<string, unknown> {
+): GameSessionChange[] {
   if (automatch.telegramDeliveryVersion !== TELEGRAM_AUTOMATCH_VERSION) {
-    return { [`automatch/${inviteId}`]: null };
+    return [{ kind: "automatch-entry", inviteId, value: null }];
   }
   const existingName = getDisplayNameFromAddress(
     automatch.username,
@@ -769,20 +773,20 @@ function automatchJoinUpdates(
     profile.rating,
     profile.emoji,
   );
-  return {
-    [`automatch/${inviteId}`]: null,
-    ...buildMatchedAutomatchTelegramUpdates({
+  return [
+    { kind: "automatch-entry", inviteId, value: null },
+    ...buildMatchedAutomatchTelegramChanges({
       inviteId,
       matchedText: `${existingName} vs. ${joiningName} https://mons.link/${inviteId}`,
       timestamp: STATE_SERVER_TIMESTAMP,
       generation: stateIncrement(1),
     }),
-    ...buildAutomatchTelegramProjectionOutboxUpdates({
+    ...buildAutomatchTelegramProjectionChanges({
       inviteId,
       requestId: operationId,
       timestamp: STATE_SERVER_TIMESTAMP,
     }),
-  };
+  ];
 }
 
 export async function joinInvite(
@@ -863,7 +867,7 @@ export async function joinInvite(
       let pendingAutomatch: Record<string, unknown> | null = null;
       if (isAutoInviteId(request.inviteId) && !currentGuestUid) {
         pendingAutomatch = toRecord(
-          await repository.getStatePath(`automatch/${request.inviteId}`),
+          await repository.readAutomatchEntry(request.inviteId),
         );
         if (readStoredString(pendingAutomatch?.uid) !== hostUid) {
           throw failedPrecondition("automatch-not-pending");
@@ -871,9 +875,10 @@ export async function joinInvite(
       }
       const guestUid = currentGuestUid || identity.uid;
       const existingMatch = normalizeMatch(
-        await repository.getStatePath(
-          `players/${guestUid}/matches/${request.inviteId}`,
-        ),
+        await repository.readMatchRecord({
+          playerId: guestUid,
+          matchId: request.inviteId,
+        }),
       );
       if (joinedExisting && existingMatch) {
         return {
@@ -887,9 +892,10 @@ export async function joinInvite(
         };
       }
       const hostMatch = normalizeMatch(
-        await repository.getStatePath(
-          `players/${hostUid}/matches/${request.inviteId}`,
-        ),
+        await repository.readMatchRecord({
+          playerId: hostUid,
+          matchId: request.inviteId,
+        }),
       );
       if (!hostMatch) {
         throw failedPrecondition("host-match-not-found");
@@ -899,33 +905,43 @@ export async function joinInvite(
         request.emojiId,
         request.aura,
       );
-      const updates: Record<string, unknown> = {
-        [`invites/${request.inviteId}/guestId`]: guestUid,
-        [`players/${guestUid}/matches/${request.inviteId}`]: match,
-      };
+      const changes: GameSessionChange[] = [
+        {
+          kind: "invite-fields",
+          inviteId: request.inviteId,
+          value: { guestId: guestUid },
+        },
+        {
+          kind: "match-create",
+          playerId: guestUid,
+          matchId: request.inviteId,
+          value: match,
+        },
+      ];
       if (isAutoInviteId(request.inviteId)) {
         const automatch =
           pendingAutomatch ||
-          toRecord(
-            await repository.getStatePath(`automatch/${request.inviteId}`),
-          ) ||
+          toRecord(await repository.readAutomatchEntry(request.inviteId)) ||
           {};
         const profile = joiningProfile(
           identity,
           request,
           await readOwnership(),
         );
-        Object.assign(
-          updates,
-          automatchJoinUpdates(
+        changes.push(
+          ...automatchJoinChanges(
             request.inviteId,
             request.operationId,
             automatch,
             profile,
           ),
           {
-            [`invites/${request.inviteId}/automatchStateHint`]: "matched",
-            [`invites/${request.inviteId}/automatchCanceledAt`]: null,
+            kind: "invite-fields",
+            inviteId: request.inviteId,
+            value: {
+              automatchStateHint: "matched",
+              automatchCanceledAt: null,
+            },
           },
         );
       }
@@ -938,7 +954,7 @@ export async function joinInvite(
           matchId: request.inviteId,
         },
         projectReason: "manual-invite-joined",
-        updates,
+        changes,
       };
     },
     dependencies,
@@ -1029,12 +1045,12 @@ export async function proposeRematch(
         throw failedPrecondition("rematch-unavailable");
       }
       const matchId = `${request.inviteId}${index}`;
-      const matchPath = `players/${participant.actorUid}/matches/${matchId}`;
       const [storedMatch, storedOpponent] = await Promise.all([
-        repository.getStatePath(matchPath),
-        repository.getStatePath(
-          `players/${participant.opponentUid}/matches/${matchId}`,
-        ),
+        repository.readMatchRecord({ playerId: participant.actorUid, matchId }),
+        repository.readMatchRecord({
+          playerId: participant.opponentUid,
+          matchId: matchId,
+        }),
       ]);
       const existingMatch = normalizeMatch(storedMatch);
       const color = rematchColor(invite, participant.role, index);
@@ -1095,10 +1111,24 @@ export async function proposeRematch(
               ],
             }
           : {}),
-        updates: {
-          [`invites/${request.inviteId}/${field}`]: rematches,
-          ...(existingMatch ? {} : { [matchPath]: match }),
-        },
+        changes: [
+          {
+            kind: "invite-rematches",
+            inviteId: request.inviteId,
+            role: participant.role,
+            value: rematches,
+          },
+          ...(existingMatch
+            ? []
+            : [
+                {
+                  kind: "match-create" as const,
+                  playerId: participant.actorUid,
+                  matchId,
+                  value: match,
+                },
+              ]),
+        ],
       };
     },
     dependencies,
@@ -1171,9 +1201,14 @@ export async function endRematchSeries(
               ],
             }
           : {}),
-        updates: {
-          [`invites/${request.inviteId}/${field}`]: rematches,
-        },
+        changes: [
+          {
+            kind: "invite-rematches",
+            inviteId: request.inviteId,
+            role: participant.role,
+            value: rematches,
+          },
+        ],
       };
     },
     dependencies,
@@ -1210,9 +1245,10 @@ export async function ensureParticipantMatch(
         repository,
       );
       const existing = normalizeMatch(
-        await repository.getStatePath(
-          `players/${participant.actorUid}/matches/${request.matchId}`,
-        ),
+        await repository.readMatchRecord({
+          playerId: participant.actorUid,
+          matchId: request.matchId,
+        }),
       );
       if (existing) {
         return {
@@ -1227,9 +1263,10 @@ export async function ensureParticipantMatch(
         };
       }
       const opponent = normalizeMatch(
-        await repository.getStatePath(
-          `players/${participant.opponentUid}/matches/${request.matchId}`,
-        ),
+        await repository.readMatchRecord({
+          playerId: participant.opponentUid,
+          matchId: request.matchId,
+        }),
       );
       if (!opponent) {
         throw failedPrecondition("opponent-match-not-found");
@@ -1245,9 +1282,14 @@ export async function ensureParticipantMatch(
           match,
         },
         projectReason: "manual-match-created",
-        updates: {
-          [`players/${participant.actorUid}/matches/${request.matchId}`]: match,
-        },
+        changes: [
+          {
+            kind: "match-create",
+            playerId: participant.actorUid,
+            matchId: request.matchId,
+            value: match,
+          },
+        ],
       };
     },
     dependencies,

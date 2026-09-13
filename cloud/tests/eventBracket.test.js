@@ -259,7 +259,7 @@ test("rejects a later-round invite when its participants have merged", async () 
   const final = createEmptyEventMatch("1_0");
   setMatchSlotParticipant(final, "host", participantsById.p1);
   setMatchSlotParticipant(final, "guest", participantsById.p2);
-  const inviteUpdates = {};
+  const inviteUpdates = [];
   const runtime = createEventBracketRuntime({
     buildRandomGameSeed: async () => ({
       gameVariant: "Classic",
@@ -285,7 +285,7 @@ test("rejects a later-round invite when its participants have merged", async () 
     /profile-ownership-unavailable/,
   );
   assert.equal(final.inviteId, null);
-  assert.deepEqual(inviteUpdates, {});
+  assert.deepEqual(inviteUpdates, []);
 });
 
 test("rejects a later-round invite when a stored login owns another profile", async () => {
@@ -296,7 +296,7 @@ test("rejects a later-round invite when a stored login owns another profile", as
   const final = createEmptyEventMatch("1_0");
   setMatchSlotParticipant(final, "host", participantsById.p1);
   setMatchSlotParticipant(final, "guest", participantsById.p2);
-  const inviteUpdates = {};
+  const inviteUpdates = [];
   const runtime = createEventBracketRuntime({
     buildRandomGameSeed: async () => ({
       gameVariant: "Classic",
@@ -318,7 +318,7 @@ test("rejects a later-round invite when a stored login owns another profile", as
     /profile-ownership-unavailable/,
   );
   assert.equal(final.inviteId, null);
-  assert.deepEqual(inviteUpdates, {});
+  assert.deepEqual(inviteUpdates, []);
 });
 
 test("creates a later-round invite from one ownership snapshot", async () => {
@@ -342,7 +342,7 @@ test("creates a later-round invite from one ownership snapshot", async () => {
       rounds: { 1: { matches: { "1_0": final } } },
       nowMs: 1_800_000_000_000,
       participantsById,
-      inviteUpdates: {},
+      inviteUpdates: [],
       ownershipSnapshot: ownershipSnapshot(participantsById),
     }),
     true,
@@ -555,8 +555,10 @@ test("prize projection accepts an unplaced participant merged into the winner", 
   const projected = [];
   const runtime = createEventBracketRuntime({
     state: {
-      transaction: async (path, updater) => {
-        const value = updater(null);
+      transactProfileEventPrize: async (profileId, eventId, updater) => {
+        const path = `profileEventPrizes/${profileId}/${eventId}`;
+        const output = updater(null);
+        const value = "commit" in output ? undefined : output.value;
         projected.push({ path, value });
         return { committed: value !== undefined, value };
       },

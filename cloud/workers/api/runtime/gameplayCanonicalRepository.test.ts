@@ -1,8 +1,9 @@
+import { matchTestPort } from "../test/gameSessionTestPorts.ts";
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { CompletePlayerProfile } from "@mons/shared/profiles";
-import type { StateRepository } from "../src/stateRepositoryTypes.ts";
+import type { StateRepository } from "../test/stateRepositoryTestTypes.ts";
 import {
   canonicalProfileFields,
   createCanonicalRatingRepository,
@@ -384,7 +385,7 @@ describe("canonical gameplay repositories", () => {
       ],
     });
     const repository = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const ownership = await repository.readProfileOwnershipSnapshot({
       loginUids: ["d1-game-login-winner", "d1-game-login-loser"],
@@ -468,11 +469,11 @@ describe("canonical gameplay repositories", () => {
     const repository = createGameplayRepository(
       { ...testEnv, PROFILE_DB: failAfterFirstWrite(testEnv.PROFILE_DB) },
       {
-        stateClient: state,
+        stateClient: matchTestPort(state),
       },
     );
     const replayRepository = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const transfer = {
       operationId: "d1-insufficient-wager",
@@ -547,7 +548,7 @@ describe("canonical gameplay repositories", () => {
       },
     });
     const repository = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const transfer = {
       operationId: "d1-same-profile-wager",
@@ -610,7 +611,7 @@ describe("canonical gameplay repositories", () => {
       sortValues: { rating: 0 },
     });
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const rating = createRatingRepository(testEnv, gameplay);
     const gameplayOwnership = await gameplay.readProfileOwnershipSnapshot({
@@ -692,7 +693,7 @@ describe("canonical gameplay repositories", () => {
         profileIds: [sourceProfileId, profileId, "missing-profile"],
       };
       const gameplay = createGameplayRepository(testEnv, {
-        stateClient: state,
+        stateClient: matchTestPort(state),
       });
       const mining = createMiningRepository(testEnv);
       const snapshots = await Promise.all([
@@ -827,7 +828,9 @@ describe("canonical gameplay repositories", () => {
         },
       ],
     });
-    const gameplay = createGameplayRepository(testEnv, { stateClient: state });
+    const gameplay = createGameplayRepository(testEnv, {
+      stateClient: matchTestPort(state),
+    });
     const rating = createRatingRepository(testEnv, gameplay, {
       now: () => 3_000,
     });
@@ -854,7 +857,9 @@ describe("canonical gameplay repositories", () => {
     await insertProfile(playerProfileId, "d1-feb-existing-player-login");
     await insertProfile(sourceOpponentProfileId, null);
     await insertProfile(targetOpponentProfileId, null);
-    const gameplay = createGameplayRepository(testEnv, { stateClient: state });
+    const gameplay = createGameplayRepository(testEnv, {
+      stateClient: matchTestPort(state),
+    });
     const rating = createRatingRepository(testEnv, gameplay, {
       now: () => 3_000,
     });
@@ -891,7 +896,9 @@ describe("canonical gameplay repositories", () => {
     await insertProfile(playerProfileId, "d1-feb-fenced-player-login");
     await insertProfile(sourceOpponentProfileId, null);
     await insertProfile(targetOpponentProfileId, null);
-    const gameplay = createGameplayRepository(testEnv, { stateClient: state });
+    const gameplay = createGameplayRepository(testEnv, {
+      stateClient: matchTestPort(state),
+    });
     await createRatingRepository(testEnv, gameplay, {
       now: () => 2_000,
     }).applyFebruaryChallengeReplay(playerProfileId, sourceOpponentProfileId);
@@ -1015,7 +1022,9 @@ describe("canonical gameplay repositories", () => {
         });
       },
     );
-    const gameplay = createGameplayRepository(testEnv, { stateClient: state });
+    const gameplay = createGameplayRepository(testEnv, {
+      stateClient: matchTestPort(state),
+    });
     const rating = createCanonicalRatingRepository(racedDb, gameplay, {
       createFailure: () => new Error("rating-unavailable"),
       maxAttempts: 5,
@@ -1054,7 +1063,7 @@ describe("canonical gameplay repositories", () => {
       false,
     );
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     let observeFinalization = false;
     const preparedQueries: string[] = [];
@@ -1268,7 +1277,7 @@ describe("canonical gameplay repositories", () => {
     "loads $label event scores through the canonical rating repository",
     async ({ label, player, opponent, expectedPlayer, expectedOpponent }) => {
       const gameplay = createGameplayRepository(testEnv, {
-        stateClient: state,
+        stateClient: matchTestPort(state),
       });
       const rating = createRatingRepository(testEnv, gameplay, {
         now: () => 2_000,
@@ -1405,7 +1414,7 @@ describe("canonical gameplay repositories", () => {
       ],
     });
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const rating = createCanonicalRatingRepository(
       testEnv.PROFILE_DB,
@@ -1466,7 +1475,7 @@ describe("canonical gameplay repositories", () => {
     );
     await insertProfile("d1-edit-opponent", "d1-edit-opponent-login");
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const identity = {
       inviteId: "d1-edit-invite",
@@ -1634,7 +1643,9 @@ describe("canonical gameplay repositories", () => {
         },
       ],
     });
-    const gameplay = createGameplayRepository(testEnv, { stateClient: state });
+    const gameplay = createGameplayRepository(testEnv, {
+      stateClient: matchTestPort(state),
+    });
     const baseRating = createRatingRepository(testEnv, gameplay, {
       now: () => 2_000,
     });
@@ -1714,7 +1725,7 @@ describe("canonical gameplay repositories", () => {
   it("retries rating finalization when a missing login is created", async () => {
     await insertProfile("d1-created-opponent", "d1-created-opponent-login");
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const identity = {
       inviteId: "d1-created-invite",
@@ -1796,7 +1807,7 @@ describe("canonical gameplay repositories", () => {
     await insertProfile("d1-race-target", null, { rating: 1800 });
     await insertProfile("d1-race-opponent", "d1-race-opponent-login");
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const identity = {
       inviteId: "d1-race-invite",
@@ -1979,7 +1990,7 @@ describe("canonical gameplay repositories", () => {
     await insertProfile("d1-ambiguous-player", "d1-ambiguous-login-player");
     await insertProfile("d1-ambiguous-opponent", "d1-ambiguous-login-opponent");
     const gameplay = createGameplayRepository(testEnv, {
-      stateClient: state,
+      stateClient: matchTestPort(state),
     });
     const identity = {
       inviteId: "d1-ambiguous-invite",
@@ -2085,7 +2096,8 @@ describe("canonical gameplay repositories", () => {
             string,
             unknown
           > | null,
-        getStatePath: async (path) => stateValues.get(path) ?? null,
+        readAutomatchEntry: async (inviteId) =>
+          stateValues.get(`automatch/${inviteId}`) ?? null,
       },
       wait: async () => undefined,
     });

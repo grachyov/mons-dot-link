@@ -22,7 +22,7 @@ export type ProfileGamesProjectionRepository = {
     profileId: string,
     inviteId: string,
   ): Promise<ProjectionDocument | null>;
-  getStatePath(path: string): Promise<unknown>;
+  readAutomatchEntry(inviteId: string): Promise<unknown>;
   readInviteMetadata(inviteId: string): Promise<Record<string, unknown> | null>;
   getMatchEmoji?(
     inviteId: string,

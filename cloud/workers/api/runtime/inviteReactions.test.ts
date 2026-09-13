@@ -1,3 +1,4 @@
+import { gameplayTestPort } from "../test/gameSessionTestPorts.ts";
 import {
   socketTestIdentity,
   socketTestSessionHeaders,
@@ -137,7 +138,7 @@ describe("invite reaction rooms", () => {
       ),
     );
     const repository = createGameplayRepository(env, {
-      stateClient: {
+      stateClient: gameplayTestPort({
         getPath: async () => {
           throw new Error("unexpected-source-read");
         },
@@ -147,7 +148,7 @@ describe("invite reaction rooms", () => {
         transactPath: async () => {
           throw new Error("unexpected-source-write");
         },
-      },
+      }),
     });
     repository.readProfileOwnershipSnapshot = async (query) => ({
       canonicalProfileIdByProfileId: new Map(),

@@ -1,5 +1,9 @@
+import type { EventMutation } from "../../../runtime/eventCommands.js";
+import type {
+  TransactionDecision,
+  TransactionResult,
+} from "../../../runtime/transactions.js";
 import { STATE_EFFECTS_FIELD } from "./stateCompatibility.ts";
-import { STATE_VALUE_FIELD } from "./stateCompatibility.ts";
 import { isEventPrizeId } from "@mons/shared/event-prizes";
 import type {
   EventJsonRecord,
@@ -143,13 +147,18 @@ type StoredEventSnapshot = EventSnapshot & {
   pendingTransitionId: string | null;
 };
 
-type PathMutationOptions = {
+type EventMutationOptions = {
   admission: EventWriteAdmission;
   allowStoredProfilePrizeAssignment?: boolean;
   eventLease?: EventLeaseGuard;
   eventSnapshot?: StoredEventSnapshot;
   expectedEventRevisions?: Readonly<Record<string, number>>;
-  expectedPathValues?: Readonly<Record<string, unknown>>;
+  expectedRecords?: {
+    progress?: Readonly<Record<string, unknown>>;
+    dead?: Readonly<Record<string, unknown>>;
+    profileGame?: Readonly<Record<string, unknown>>;
+    telegram?: Readonly<Record<string, unknown>>;
+  };
   expectedProfilePrizeRevisions?: Readonly<Record<string, number>>;
   expectedTelegramStateRevisions?: Readonly<Record<string, number>>;
   now?: () => number;
@@ -157,18 +166,15 @@ type PathMutationOptions = {
   transition?: { eventId: string; transitionId: string };
 };
 
-type PublicPathMutationOptions = Omit<
-  PathMutationOptions,
+type PublicEventMutationOptions = Omit<
+  EventMutationOptions,
   "allowStoredProfilePrizeAssignment" | "eventSnapshot" | "profilePrizeSnapshot"
 >;
 
-type PathMutationResult = {
+type EventMutationResult = {
   eventRevisions: Record<string, number>;
   profilePrizeRevisions: Record<string, number>;
 };
-
-type EventTransactionDecision =
-  { commit: false; decision?: string } | { value: unknown; decision?: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -870,22 +876,6 @@ function isConstraintFailure(error: unknown): boolean {
   );
 }
 
-function splitPath(path: string): string[] {
-  const parts = path.split("/");
-  if (parts.some((part) => !part))
-    throw new EventD1Failure("invalid-event-path");
-  return parts;
-}
-
-function getNested(root: unknown, parts: readonly string[]): unknown {
-  let current = root;
-  for (const part of parts) {
-    if (!isRecord(current) || !Object.hasOwn(current, part)) return null;
-    current = current[part];
-  }
-  return cloneJson(current);
-}
-
 function setNested(
   root: Record<string, unknown>,
   parts: readonly string[],
@@ -1123,25 +1113,23 @@ function eventRecordStatement(
     );
 }
 
-async function patchEventOwnedPathsInternal(
+async function commitEventMutationsInternal(
   db: EventD1Connection,
-  updates: Readonly<Record<string, unknown>>,
-  options: PathMutationOptions,
-): Promise<PathMutationResult> {
+  changes: readonly EventMutation[],
+  options: EventMutationOptions,
+): Promise<EventMutationResult> {
   const now = options.now || Date.now;
   const nowMs = safeInteger(now());
   const eventStates = new Map<string, EventMutationState>();
   const profileStates = new Map<string, ProfilePrizeMutationState>();
   const eventSnapshot = options.eventSnapshot;
   if (eventSnapshot) {
-    const paths = Object.keys(updates);
-    const parts = paths.length === 1 ? splitPath(paths[0]) : [];
     if (
-      (parts[0] !== "events" && parts[0] !== "eventPrizeSelections") ||
-      parts[1] !== eventSnapshot.eventId
-    ) {
+      changes.length !== 1 ||
+      !("eventId" in changes[0]) ||
+      changes[0].eventId !== eventSnapshot.eventId
+    )
       throw new EventD1Failure("invalid-event-snapshot-scope");
-    }
     eventStates.set(eventSnapshot.eventId, {
       current: eventSnapshot.event,
       next: cloneJson(eventSnapshot.event),
@@ -1154,10 +1142,13 @@ async function patchEventOwnedPathsInternal(
   }
   const snapshot = options.profilePrizeSnapshot;
   if (snapshot) {
-    const path = `profileEventPrizes/${snapshot.profileId}/${snapshot.eventId}`;
-    if (Object.keys(updates).length !== 1 || !Object.hasOwn(updates, path)) {
+    if (
+      changes.length !== 1 ||
+      changes[0].kind !== "profile-prize" ||
+      changes[0].profileId !== snapshot.profileId ||
+      changes[0].eventId !== snapshot.eventId
+    )
       throw new EventD1Failure("invalid-profile-prize-snapshot-scope");
-    }
     const originalPrizes =
       snapshot.assignment === null
         ? {}
@@ -1177,156 +1168,184 @@ async function patchEventOwnedPathsInternal(
     { generation?: unknown; state?: unknown }
   >();
 
-  for (const [path, value] of Object.entries(updates)) {
-    const parts = splitPath(path);
-    if (parts[0] === "events" && parts.length >= 2) {
-      const eventId = exactKey(parts[1]);
-      if (!eventId) throw new EventD1Failure("invalid-event-path");
-      const state = await getEventMutationState(db, eventStates, eventId);
-      if (parts.length === 2) {
-        if (value === null) {
-          throw new EventD1Failure("event-deletion-unsupported");
-        }
-        state.next = validateEventAggregate(eventId, value);
-      } else {
-        if (!state.next) throw new EventD1Conflict("event-not-found");
-        setNested(state.next, parts.slice(2), value);
-      }
-      continue;
-    }
-    if (parts[0] === "eventPrizeSelections" && parts.length >= 2) {
-      const eventId = exactKey(parts[1]);
-      if (!eventId) throw new EventD1Failure("invalid-event-path");
-      const state = await getEventMutationState(db, eventStates, eventId);
-      if (!state.next) throw new EventD1Conflict("event-not-found");
-      const selections = await ensureSelections(db, eventId, state);
-      if (parts.length === 2) {
-        const replacement = value === null ? {} : value;
-        if (!isRecord(replacement)) {
-          throw new EventD1Failure("invalid-event-prize-selections");
-        }
-        state.selections = Object.fromEntries(
-          Object.entries(replacement).map(([profileId, prizeId]) => {
-            const normalizedProfileId = exactKey(profileId);
-            if (!normalizedProfileId) {
-              throw new EventD1Failure("invalid-event-prize-selection");
-            }
-            return [
-              normalizedProfileId,
-              validatePrizeSelection(eventId, prizeId),
-            ];
-          }),
-        );
-      } else if (parts.length === 3) {
-        const profileId = exactKey(parts[2]);
-        if (!profileId) throw new EventD1Failure("invalid-event-path");
-        if (value === null) delete selections[profileId];
-        else selections[profileId] = validatePrizeSelection(eventId, value);
-      } else {
+  for (const change of changes) {
+    for (const key of ["eventId", "profileId", "outboxId"] as const)
+      if (key in change && !exactKey(change[key as keyof typeof change]))
         throw new EventD1Failure("invalid-event-path");
-      }
-      state.selectionsChanged = true;
-      continue;
-    }
-    if (parts[0] === "profileEventPrizes" && parts.length >= 2) {
-      const profileId = exactKey(parts[1]);
-      if (!profileId) throw new EventD1Failure("invalid-event-path");
-      let state = profileStates.get(profileId);
-      if (!state) {
-        state = await readProfilePrizeMutationState(db, profileId);
-        profileStates.set(profileId, state);
-      }
-      if (parts.length === 2) {
-        const replacement = value === null ? {} : value;
-        if (!isRecord(replacement)) {
-          throw new EventD1Failure("invalid-profile-event-prizes");
-        }
-        state.prizes = Object.fromEntries(
-          Object.entries(replacement).map(([eventId, assignment]) => [
-            eventId,
-            validateEventPrizeAssignment(profileId, eventId, assignment),
-          ]),
-        );
-      } else if (parts.length === 3) {
-        const eventId = exactKey(parts[2]);
+    if (
+      "roundKey" in change &&
+      change.roundKey !== null &&
+      !exactKey(change.roundKey)
+    )
+      throw new EventD1Failure("invalid-event-path");
+    if ("matchKey" in change && !exactKey(change.matchKey))
+      throw new EventD1Failure("invalid-event-path");
+    const { value } = change;
+    switch (change.kind) {
+      case "event":
+      case "event-field":
+      case "event-participant":
+      case "event-disqualification":
+      case "event-round":
+      case "event-match-status": {
+        const eventId = exactKey(change.eventId);
         if (!eventId) throw new EventD1Failure("invalid-event-path");
-        if (value === null) delete state.prizes[eventId];
-        else {
-          state.prizes[eventId] = options.allowStoredProfilePrizeAssignment
-            ? parseStoredEventPrizeAssignment(profileId, eventId, value)
-            : validateEventPrizeAssignment(profileId, eventId, value);
+        const state = await getEventMutationState(db, eventStates, eventId);
+        if (change.kind === "event") {
+          if (value === null)
+            throw new EventD1Failure("event-deletion-unsupported");
+          state.next = validateEventAggregate(eventId, value);
+        } else {
+          if (!state.next) throw new EventD1Conflict("event-not-found");
+          if (change.kind === "event-round")
+            setNested(state.next, ["rounds", exactKey(change.roundKey)], value);
+          if (change.kind === "event-match-status")
+            setNested(
+              state.next,
+              [
+                "rounds",
+                exactKey(change.roundKey),
+                "matches",
+                exactKey(change.matchKey),
+                "status",
+              ],
+              value,
+            );
+          if (change.kind === "event-field")
+            setNested(state.next, [change.field], value);
+          if (change.kind === "event-participant")
+            setNested(
+              state.next,
+              ["participants", exactKey(change.profileId)],
+              value,
+            );
+          if (change.kind === "event-disqualification")
+            setNested(
+              state.next,
+              change.roundKey === null
+                ? ["thirdPlaceMatch", "winnerDisqualified"]
+                : [
+                    "rounds",
+                    exactKey(change.roundKey),
+                    "matches",
+                    exactKey(change.matchKey),
+                    "winnerDisqualified",
+                  ],
+              value,
+            );
         }
-      } else {
-        throw new EventD1Failure("invalid-event-path");
+        break;
       }
-      continue;
-    }
-    if (parts[0] === "eventProgressOutbox" && parts.length >= 2) {
-      const outboxId = exactKey(parts[1]);
-      if (!outboxId) throw new EventD1Failure("invalid-event-path");
-      if (parts.length === 2) {
-        progressUpdates.set(outboxId, value);
-      } else {
+      case "prize-selections":
+      case "prize-selection": {
+        const eventId = exactKey(change.eventId);
+        if (!eventId) throw new EventD1Failure("invalid-event-path");
+        const state = await getEventMutationState(db, eventStates, eventId);
+        if (!state.next) throw new EventD1Conflict("event-not-found");
+        const selections = await ensureSelections(db, eventId, state);
+        if (change.kind === "prize-selections") {
+          const replacement = value === null ? {} : value;
+          if (!isRecord(replacement))
+            throw new EventD1Failure("invalid-event-prize-selections");
+          state.selections = Object.fromEntries(
+            Object.entries(replacement).map(([profileId, prizeId]) => {
+              const key = exactKey(profileId);
+              if (!key)
+                throw new EventD1Failure("invalid-event-prize-selection");
+              return [key, validatePrizeSelection(eventId, prizeId)];
+            }),
+          );
+        } else {
+          const profileId = exactKey(change.profileId);
+          if (!profileId) throw new EventD1Failure("invalid-event-path");
+          if (value === null) delete selections[profileId];
+          else selections[profileId] = validatePrizeSelection(eventId, value);
+        }
+        state.selectionsChanged = true;
+        break;
+      }
+      case "profile-prizes":
+      case "profile-prize": {
+        const profileId = exactKey(change.profileId);
+        if (!profileId) throw new EventD1Failure("invalid-event-path");
+        let state = profileStates.get(profileId);
+        if (!state) {
+          state = await readProfilePrizeMutationState(db, profileId);
+          profileStates.set(profileId, state);
+        }
+        if (change.kind === "profile-prizes") {
+          const replacement = value === null ? {} : value;
+          if (!isRecord(replacement))
+            throw new EventD1Failure("invalid-profile-event-prizes");
+          state.prizes = Object.fromEntries(
+            Object.entries(replacement).map(([eventId, assignment]) => [
+              eventId,
+              validateEventPrizeAssignment(profileId, eventId, assignment),
+            ]),
+          );
+        } else {
+          const eventId = exactKey(change.eventId);
+          if (!eventId) throw new EventD1Failure("invalid-event-path");
+          if (value === null) delete state.prizes[eventId];
+          else
+            state.prizes[eventId] = options.allowStoredProfilePrizeAssignment
+              ? parseStoredEventPrizeAssignment(profileId, eventId, value)
+              : validateEventPrizeAssignment(profileId, eventId, value);
+        }
+        break;
+      }
+      case "progress-outbox":
+        progressUpdates.set(exactKey(change.outboxId), value);
+        break;
+      case "progress-dead":
+        progressDeadUpdates.set(exactKey(change.outboxId), value);
+        break;
+      case "progress-dispatched": {
+        const outboxId = exactKey(change.outboxId);
         const current = await readEventProgressOutbox(db, outboxId);
         if (!current) throw new EventD1Conflict("event-progress-not-found");
-        const next = cloneJson(current);
-        setNested(next, parts.slice(2), value);
-        progressUpdates.set(outboxId, next);
+        progressUpdates.set(outboxId, {
+          ...cloneJson(current),
+          lastQueuedAtMs: value,
+        });
+        break;
       }
-      continue;
-    }
-    if (parts[0] === "eventProgressOutboxDead" && parts.length === 2) {
-      const outboxId = exactKey(parts[1]);
-      if (!outboxId) throw new EventD1Failure("invalid-event-path");
-      progressDeadUpdates.set(outboxId, value);
-      continue;
-    }
-    if (
-      parts[0] === "profileGameProjectionOutbox" &&
-      parts[1] === "event" &&
-      parts.length >= 3
-    ) {
-      const eventId = exactKey(parts[2]);
-      if (!eventId) throw new EventD1Failure("invalid-event-path");
-      if (parts.length === 3) {
-        profileProjectionUpdates.set(eventId, value);
-      } else {
+      case "profile-game-outbox":
+        profileProjectionUpdates.set(exactKey(change.eventId), value);
+        break;
+      case "profile-game-outbox-field":
+      case "profile-game-outbox-cleanup": {
+        const eventId = exactKey(change.eventId);
         const stored = profileProjectionUpdates.has(eventId)
           ? profileProjectionUpdates.get(eventId)
           : await readEventProfileGameProjectionOutbox(db, eventId);
         const next = isRecord(stored) ? cloneJson(stored) : {};
-        setNested(next, parts.slice(3), value);
+        setNested(
+          next,
+          change.kind === "profile-game-outbox-field"
+            ? [change.field]
+            : ["cleanupOwnerProfileIds", exactKey(change.profileId)],
+          value,
+        );
         profileProjectionUpdates.set(eventId, next);
+        break;
       }
-      continue;
-    }
-    if (
-      parts[0] === "telegramProjectionOutbox" &&
-      parts[1] === "event" &&
-      parts.length === 3
-    ) {
-      const eventId = exactKey(parts[2]);
-      if (!eventId) throw new EventD1Failure("invalid-event-path");
-      telegramProjectionUpdates.set(eventId, value);
-      continue;
-    }
-    if (
-      (parts[0] === "eventTelegramProjectionGenerations" ||
-        parts[0] === "eventTelegramProjections") &&
-      parts.length === 2
-    ) {
-      const eventId = exactKey(parts[1]);
-      if (!eventId) throw new EventD1Failure("invalid-event-path");
-      const update = telegramStateUpdates.get(eventId) || {};
-      if (parts[0] === "eventTelegramProjectionGenerations") {
-        update.generation = value;
-      } else {
-        update.state = value;
+      case "telegram-outbox":
+        telegramProjectionUpdates.set(exactKey(change.eventId), value);
+        break;
+      case "telegram-state":
+      case "telegram-generation": {
+        const eventId = exactKey(change.eventId);
+        const update = telegramStateUpdates.get(eventId) || {};
+        if (change.kind === "telegram-state") update.state = value;
+        else
+          update.generation = change.increment
+            ? { increment: change.value }
+            : change.value;
+        telegramStateUpdates.set(eventId, update);
+        break;
       }
-      telegramStateUpdates.set(eventId, update);
-      continue;
     }
-    throw new EventD1Failure("unsupported-event-path");
   }
 
   if (options.transition) {
@@ -1479,14 +1498,13 @@ async function patchEventOwnedPathsInternal(
   }
 
   for (const [outboxId, raw] of progressUpdates) {
-    const path = `eventProgressOutbox/${outboxId}`;
-    if (Object.hasOwn(options.expectedPathValues || {}, path)) {
+    if (Object.hasOwn(options.expectedRecords?.progress || {}, outboxId)) {
       guards.push(
         recordJsonGuard(
           db,
           "event_progress_outboxes",
           outboxId,
-          options.expectedPathValues![path],
+          options.expectedRecords!.progress![outboxId],
           "pending",
         ),
       );
@@ -1535,14 +1553,13 @@ async function patchEventOwnedPathsInternal(
   }
 
   for (const [outboxId, raw] of progressDeadUpdates) {
-    const path = `eventProgressOutboxDead/${outboxId}`;
-    if (Object.hasOwn(options.expectedPathValues || {}, path)) {
+    if (Object.hasOwn(options.expectedRecords?.dead || {}, outboxId)) {
       guards.push(
         recordJsonGuard(
           db,
           "event_progress_outboxes",
           outboxId,
-          options.expectedPathValues![path],
+          options.expectedRecords!.dead![outboxId],
           "dead",
         ),
       );
@@ -1588,14 +1605,13 @@ async function patchEventOwnedPathsInternal(
   }
 
   for (const [eventId, raw] of profileProjectionUpdates) {
-    const path = `profileGameProjectionOutbox/event/${eventId}`;
-    if (Object.hasOwn(options.expectedPathValues || {}, path)) {
+    if (Object.hasOwn(options.expectedRecords?.profileGame || {}, eventId)) {
       guards.push(
         recordJsonGuard(
           db,
           "event_profile_game_projection_outboxes",
           eventId,
-          options.expectedPathValues![path],
+          options.expectedRecords!.profileGame![eventId],
         ),
       );
     }
@@ -1632,14 +1648,13 @@ async function patchEventOwnedPathsInternal(
   }
 
   for (const [eventId, raw] of telegramProjectionUpdates) {
-    const path = `telegramProjectionOutbox/event/${eventId}`;
-    if (Object.hasOwn(options.expectedPathValues || {}, path)) {
+    if (Object.hasOwn(options.expectedRecords?.telegram || {}, eventId)) {
       guards.push(
         recordJsonGuard(
           db,
           "event_telegram_projection_outboxes",
           eventId,
-          options.expectedPathValues![path],
+          options.expectedRecords!.telegram![eventId],
         ),
       );
     }
@@ -1690,9 +1705,7 @@ async function patchEventOwnedPathsInternal(
     let state = current?.state || {};
     if (update.generation !== undefined) {
       const increment = isRecord(update.generation)
-        ? isRecord(update.generation[STATE_VALUE_FIELD])
-          ? update.generation[STATE_VALUE_FIELD].increment
-          : undefined
+        ? update.generation.increment
         : undefined;
       generation =
         increment === undefined
@@ -1753,234 +1766,105 @@ async function patchEventOwnedPathsInternal(
   return { eventRevisions, profilePrizeRevisions };
 }
 
-export function patchEventOwnedPaths(
+export function commitEventMutations(
   db: EventD1Connection,
-  updates: Readonly<Record<string, unknown>>,
-  options: PublicPathMutationOptions,
-): Promise<PathMutationResult> {
-  return patchEventOwnedPathsInternal(db, updates, options);
+  changes: readonly EventMutation[],
+  options: PublicEventMutationOptions,
+): Promise<EventMutationResult> {
+  return commitEventMutationsInternal(db, changes, options);
 }
-
-export async function readEventOwnedPath(
+export async function readEventLease(
   db: EventD1Connection,
-  path: string,
-): Promise<unknown> {
-  const parts = splitPath(path);
-  if (parts[0] === "events" && parts.length >= 2) {
-    const snapshot = await readEventSnapshot(db, parts[1]);
-    return parts.length === 2
-      ? snapshot.event
-      : getNested(snapshot.event, parts.slice(2));
-  }
-  if (parts[0] === "eventPrizeSelections" && parts.length >= 2) {
-    const snapshot = await readEventSnapshot(db, parts[1]);
-    return parts.length === 2
-      ? snapshot.prizeSelections
-      : getNested(snapshot.prizeSelections, parts.slice(2));
-  }
-  if (parts[0] === "profileEventPrizes" && parts.length >= 2) {
-    const snapshot = await readProfileEventPrizes(db, parts[1]);
-    return parts.length === 2
-      ? snapshot.prizes
-      : getNested(snapshot.prizes, parts.slice(2));
-  }
-  if (parts[0] === "eventProgressOutbox" && parts.length >= 2) {
-    const record = await readEventProgressOutbox(db, parts[1]);
-    return parts.length === 2 ? record : getNested(record, parts.slice(2));
-  }
-  if (parts[0] === "eventProgressOutboxDead" && parts.length === 2) {
-    const row = await db
-      .prepare(
-        `SELECT record_json FROM event_progress_outboxes
-         WHERE outbox_id = ? AND status = 'dead'`,
-      )
-      .bind(parts[1])
-      .first<{ record_json: string }>();
-    return row ? decodeJson(row.record_json) : null;
-  }
-  if (
-    parts[0] === "profileGameProjectionOutbox" &&
-    parts[1] === "event" &&
-    parts.length === 3
-  ) {
-    return readEventProfileGameProjectionOutbox(db, parts[2]);
-  }
-  if (
-    parts[0] === "telegramProjectionOutbox" &&
-    parts[1] === "event" &&
-    parts.length === 3
-  ) {
-    return readEventTelegramProjectionOutbox(db, parts[2]);
-  }
-  if (parts[0] === "eventTelegramProjectionGenerations" && parts.length === 2) {
-    return (
-      (await readEventTelegramProjectionState(db, parts[1]))?.generation || 0
-    );
-  }
-  if (parts[0] === "eventTelegramProjections" && parts.length === 2) {
-    return (
-      (await readEventTelegramProjectionState(db, parts[1]))?.state || null
-    );
-  }
-  if (parts[0] === "eventLocks" && parts.length === 2) {
-    const row = await db
-      .prepare(
-        `SELECT lease_id, owner_uid, acquired_at_ms, refreshed_at_ms,
+  eventId: string,
+): Promise<EventLeaseRecord | null> {
+  const row = await db
+    .prepare(
+      `SELECT lease_id, owner_uid, acquired_at_ms, refreshed_at_ms,
                 expires_at_ms FROM event_leases WHERE event_id = ?`,
-      )
-      .bind(parts[1])
-      .first<{
-        acquired_at_ms: number;
-        expires_at_ms: number;
-        lease_id: string;
-        owner_uid: string;
-        refreshed_at_ms: number;
-      }>();
-    return row
-      ? {
-          lockId: row.lease_id,
-          ownerUid: row.owner_uid,
-          acquiredAtMs: row.acquired_at_ms,
-          refreshedAtMs: row.refreshed_at_ms,
-          expiresAtMs: row.expires_at_ms,
-        }
-      : null;
-  }
-  if (parts[0] === "eventSyncThrottles" && parts.length === 2) {
-    const row = await db
-      .prepare(
-        `SELECT owner_uid, token, started_at_ms
-         FROM event_sync_throttles WHERE event_id = ?`,
-      )
-      .bind(parts[1])
-      .first<{ owner_uid: string; started_at_ms: number; token: string }>();
-    return row
-      ? {
-          ownerUid: row.owner_uid,
-          token: row.token,
-          startedAtMs: row.started_at_ms,
-        }
-      : null;
-  }
-  throw new EventD1Failure("unsupported-event-path");
+    )
+    .bind(eventId)
+    .first<{
+      acquired_at_ms: number;
+      expires_at_ms: number;
+      lease_id: string;
+      owner_uid: string;
+      refreshed_at_ms: number;
+    }>();
+  return row
+    ? {
+        lockId: row.lease_id,
+        ownerUid: row.owner_uid,
+        acquiredAtMs: row.acquired_at_ms,
+        refreshedAtMs: row.refreshed_at_ms,
+        expiresAtMs: row.expires_at_ms,
+      }
+    : null;
 }
-
-async function transactEventOwnedPathInternal(
+export async function readEventSyncThrottle(
   db: EventD1Connection,
-  path: string,
-  updater: (current: unknown) => EventTransactionDecision,
+  eventId: string,
+): Promise<EventSyncThrottleRecord | null> {
+  const row = await db
+    .prepare(
+      `SELECT owner_uid, token, started_at_ms
+         FROM event_sync_throttles WHERE event_id = ?`,
+    )
+    .bind(eventId)
+    .first<{ owner_uid: string; started_at_ms: number; token: string }>();
+  return row
+    ? {
+        ownerUid: row.owner_uid,
+        token: row.token,
+        startedAtMs: row.started_at_ms,
+      }
+    : null;
+}
+export type EventLeaseRecord = {
+  lockId: string;
+  ownerUid: string;
+  acquiredAtMs: number;
+  refreshedAtMs: number;
+  expiresAtMs: number;
+  ownerId?: string;
+};
+export type EventSyncThrottleRecord = {
+  ownerUid: string;
+  token: string;
+  startedAtMs: number;
+};
+async function transactEventValue<T>(
+  db: EventD1Connection,
+  updater: (current: T | null) => TransactionDecision<T>,
+  load: () => Promise<{
+    value: T | null;
+    mutation: (value: T | null) => EventMutation;
+    options?: Partial<EventMutationOptions>;
+  }>,
   options: {
     admission: EventWriteAdmission;
-    allowStoredProfilePrizeAssignment?: boolean;
     eventLease?: EventLeaseGuard;
-    now?: () => number;
     signal?: AbortSignal;
+    now?: () => number;
+    allowStoredProfilePrizeAssignment?: boolean;
   },
-): Promise<{ committed: boolean; decision?: string; value: unknown }> {
-  for (
-    let attempt = 0;
-    attempt < MAX_EVENT_TRANSACTION_ATTEMPTS;
-    attempt += 1
-  ) {
+): Promise<TransactionResult<T>> {
+  for (let attempt = 0; attempt < MAX_EVENT_TRANSACTION_ATTEMPTS; attempt++) {
     options.signal?.throwIfAborted();
-    const parts = splitPath(path);
-    let expectedEventRevisions: Record<string, number> | undefined;
-    let expectedPathValues: Record<string, unknown> | undefined;
-    let expectedProfilePrizeRevisions: Record<string, number> | undefined;
-    let expectedTelegramStateRevisions: Record<string, number> | undefined;
-    let profilePrizeSnapshot: ProfilePrizeAssignmentSnapshot | undefined;
-    let eventSnapshot: StoredEventSnapshot | undefined;
-    let current: unknown;
-    if (
-      (parts[0] === "events" || parts[0] === "eventPrizeSelections") &&
-      parts[1]
-    ) {
-      const result = await readStoredEventSnapshotIfChanged(db, parts[1]);
-      if (result.notModified) throw new EventD1Failure();
-      eventSnapshot = result.snapshot;
-      expectedEventRevisions = { [parts[1]]: eventSnapshot.revision };
-      current =
-        parts[0] === "events"
-          ? parts.length === 2
-            ? cloneJson(eventSnapshot.event)
-            : getNested(eventSnapshot.event, parts.slice(2))
-          : parts.length === 2
-            ? cloneJson(eventSnapshot.prizeSelections)
-            : getNested(eventSnapshot.prizeSelections, parts.slice(2));
-    } else if (parts[0] === "profileEventPrizes" && parts.length === 3) {
-      profilePrizeSnapshot = await readProfilePrizeAssignmentSnapshot(
-        db,
-        parts[1],
-        parts[2],
-      );
-      expectedProfilePrizeRevisions = {
-        [parts[1]]: profilePrizeSnapshot.revision,
-      };
-      current = cloneJson(profilePrizeSnapshot.assignment);
-    } else if (parts[0] === "profileEventPrizes" && parts[1]) {
-      const snapshot = await readProfileEventPrizes(db, parts[1]);
-      expectedProfilePrizeRevisions = { [parts[1]]: snapshot.revision };
-      current =
-        parts.length === 2
-          ? snapshot.prizes
-          : getNested(snapshot.prizes, parts.slice(2));
-    } else if (
-      ((parts[0] === "profileGameProjectionOutbox" && parts[1] === "event") ||
-        (parts[0] === "telegramProjectionOutbox" && parts[1] === "event")) &&
-      parts.length === 3
-    ) {
-      current = await readEventOwnedPath(db, path);
-      expectedPathValues = { [path]: current };
-    } else if (
-      (parts[0] === "eventTelegramProjections" ||
-        parts[0] === "eventTelegramProjectionGenerations") &&
-      parts.length === 2
-    ) {
-      const snapshot = await readEventTelegramProjectionState(db, parts[1]);
-      current =
-        parts[0] === "eventTelegramProjections"
-          ? snapshot?.state || null
-          : snapshot?.generation || 0;
-      expectedTelegramStateRevisions = {
-        [parts[1]]: snapshot?.revision || 0,
-      };
-    } else if (
-      (parts[0] === "eventProgressOutbox" ||
-        parts[0] === "eventProgressOutboxDead") &&
-      parts.length === 2
-    ) {
-      current = await readEventOwnedPath(db, path);
-      expectedPathValues = { [path]: current };
-    } else {
-      current = await readEventOwnedPath(db, path);
-    }
+    const loaded = await load();
     options.signal?.throwIfAborted();
-    const decision = updater(current);
+    const decision = updater(loaded.value);
     options.signal?.throwIfAborted();
-    if ("commit" in decision) {
+    if ("commit" in decision)
       return {
         committed: false,
         decision: decision.decision,
-        value: current,
+        value: loaded.value,
       };
-    }
     try {
-      await patchEventOwnedPathsInternal(
+      await commitEventMutationsInternal(
         db,
-        { [path]: decision.value },
-        {
-          expectedEventRevisions,
-          expectedPathValues,
-          expectedProfilePrizeRevisions,
-          expectedTelegramStateRevisions,
-          admission: options.admission,
-          allowStoredProfilePrizeAssignment:
-            options.allowStoredProfilePrizeAssignment,
-          eventLease: options.eventLease,
-          eventSnapshot,
-          now: options.now,
-          profilePrizeSnapshot,
-        },
+        [loaded.mutation(decision.value)],
+        { ...options, ...loaded.options },
       );
       return {
         committed: true,
@@ -1997,54 +1881,269 @@ async function transactEventOwnedPathInternal(
   }
   throw new EventD1Conflict();
 }
-
-export function transactEventOwnedPath(
+type EventTransactionOptions = {
+  admission: EventWriteAdmission;
+  eventLease?: EventLeaseGuard;
+  signal?: AbortSignal;
+  now?: () => number;
+};
+export function transactEventPrizeSelection(
   db: EventD1Connection,
-  path: string,
-  updater: (current: unknown) => EventTransactionDecision,
-  options: {
-    admission: EventWriteAdmission;
-    eventLease?: EventLeaseGuard;
-    now?: () => number;
-    signal?: AbortSignal;
-  },
-): Promise<{ committed: boolean; decision?: string; value: unknown }> {
-  return transactEventOwnedPathInternal(db, path, updater, options);
+  eventId: string,
+  profileId: string,
+  updater: (current: string | null) => TransactionDecision<string>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const result = await readStoredEventSnapshotIfChanged(db, eventId);
+      if (result.notModified) throw new EventD1Failure();
+      const snapshot = result.snapshot;
+      return {
+        value: snapshot.prizeSelections[profileId] ?? null,
+        mutation: (value: string | null): EventMutation => ({
+          kind: "prize-selection",
+          eventId,
+          profileId,
+          value,
+        }),
+        options: {
+          eventSnapshot: snapshot,
+          expectedEventRevisions: { [eventId]: snapshot.revision },
+        },
+      };
+    },
+    options,
+  );
 }
-
-export function transactStoredProfileEventPrizePath(
+function transactProfileEventPrizeInternal(
   db: EventD1Connection,
-  path: string,
-  updater: (current: unknown) => EventTransactionDecision,
-  options: {
-    admission: EventWriteAdmission;
-    eventLease: EventLeaseGuard;
-    now?: () => number;
-    signal?: AbortSignal;
+  profileId: string,
+  eventId: string,
+  updater: (
+    current: EventPrizeAssignmentRecord | null,
+  ) => TransactionDecision<EventPrizeAssignmentRecord>,
+  options: EventTransactionOptions & {
+    allowStoredProfilePrizeAssignment?: boolean;
   },
-): Promise<{ committed: boolean; decision?: string; value: unknown }> {
-  const parts = splitPath(path);
-  if (
-    parts.length !== 3 ||
-    parts[0] !== "profileEventPrizes" ||
-    !exactKey(parts[1]) ||
-    !exactKey(parts[2]) ||
-    parts[2] !== options.eventLease.eventId
-  ) {
-    throw new EventD1Failure("invalid-stored-profile-event-prize-path");
-  }
-  return transactEventOwnedPathInternal(db, path, updater, {
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const snapshot = await readProfilePrizeAssignmentSnapshot(
+        db,
+        profileId,
+        eventId,
+      );
+      return {
+        value: cloneJson(snapshot.assignment),
+        mutation: (
+          value: EventPrizeAssignmentRecord | null,
+        ): EventMutation => ({
+          kind: "profile-prize",
+          eventId,
+          profileId,
+          value,
+        }),
+        options: {
+          profilePrizeSnapshot: snapshot,
+          expectedProfilePrizeRevisions: { [profileId]: snapshot.revision },
+        },
+      };
+    },
+    options,
+  );
+}
+export function transactProfileEventPrize(
+  db: EventD1Connection,
+  profileId: string,
+  eventId: string,
+  updater: (
+    current: EventPrizeAssignmentRecord | null,
+  ) => TransactionDecision<EventPrizeAssignmentRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactProfileEventPrizeInternal(
+    db,
+    profileId,
+    eventId,
+    updater,
+    options,
+  );
+}
+export function transactStoredProfileEventPrize(
+  db: EventD1Connection,
+  profileId: string,
+  eventId: string,
+  updater: (
+    current: EventPrizeAssignmentRecord | null,
+  ) => TransactionDecision<EventPrizeAssignmentRecord>,
+  options: EventTransactionOptions & { eventLease: EventLeaseGuard },
+) {
+  if (!options.eventLease || options.eventLease.eventId !== eventId)
+    throw new EventD1Failure("invalid-event-lease");
+  return transactProfileEventPrizeInternal(db, profileId, eventId, updater, {
     ...options,
     allowStoredProfilePrizeAssignment: true,
   });
 }
 
-export async function transactEventCoordinationPath(
+export async function readEventProgressDeadOutbox(
   db: EventD1Connection,
-  path: string,
-  updater: (current: unknown) => EventTransactionDecision,
+  outboxId: string,
+): Promise<EventOutboxRecord | null> {
+  const row = await db
+    .prepare(
+      "SELECT record_json FROM event_progress_outboxes WHERE outbox_id = ? AND status = 'dead'",
+    )
+    .bind(outboxId)
+    .first<{ record_json: string }>();
+  return row ? (decodeJson(row.record_json) as EventOutboxRecord) : null;
+}
+export function transactEventProgressOutbox(
+  db: EventD1Connection,
+  outboxId: string,
+  updater: (
+    current: EventOutboxRecord | null,
+  ) => TransactionDecision<EventOutboxRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const value = await readEventProgressOutbox(db, outboxId);
+      return {
+        value,
+        mutation: (value: EventOutboxRecord | null): EventMutation => ({
+          kind: "progress-outbox",
+          outboxId,
+          value,
+        }),
+        options: { expectedRecords: { progress: { [outboxId]: value } } },
+      };
+    },
+    options,
+  );
+}
+export function transactEventProgressDeadOutbox(
+  db: EventD1Connection,
+  outboxId: string,
+  updater: (
+    current: EventOutboxRecord | null,
+  ) => TransactionDecision<EventOutboxRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const value = await readEventProgressDeadOutbox(db, outboxId);
+      return {
+        value,
+        mutation: (value: EventOutboxRecord | null): EventMutation => ({
+          kind: "progress-dead",
+          outboxId,
+          value,
+        }),
+        options: { expectedRecords: { dead: { [outboxId]: value } } },
+      };
+    },
+    options,
+  );
+}
+export function transactEventProfileGameProjectionOutbox(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (
+    current: EventOutboxRecord | null,
+  ) => TransactionDecision<EventOutboxRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const value = await readEventProfileGameProjectionOutbox(db, eventId);
+      return {
+        value,
+        mutation: (value: EventOutboxRecord | null): EventMutation => ({
+          kind: "profile-game-outbox",
+          eventId,
+          value,
+        }),
+        options: { expectedRecords: { profileGame: { [eventId]: value } } },
+      };
+    },
+    options,
+  );
+}
+export function transactEventTelegramProjectionOutbox(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (
+    current: EventOutboxRecord | null,
+  ) => TransactionDecision<EventOutboxRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const value = await readEventTelegramProjectionOutbox(db, eventId);
+      return {
+        value,
+        mutation: (value: EventOutboxRecord | null): EventMutation => ({
+          kind: "telegram-outbox",
+          eventId,
+          value,
+        }),
+        options: { expectedRecords: { telegram: { [eventId]: value } } },
+      };
+    },
+    options,
+  );
+}
+export function transactEventTelegramProjectionState(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (
+    current: EventOutboxRecord | null,
+  ) => TransactionDecision<EventOutboxRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const current = await readEventTelegramProjectionState(db, eventId);
+      return {
+        value: current?.state || null,
+        mutation: (value: EventOutboxRecord | null): EventMutation => ({
+          kind: "telegram-state",
+          eventId,
+          value,
+        }),
+        options: {
+          expectedTelegramStateRevisions: { [eventId]: current?.revision || 0 },
+        },
+      };
+    },
+    options,
+  );
+}
+async function transactEventCoordination<
+  T extends EventLeaseRecord | EventSyncThrottleRecord,
+>(
+  db: EventD1Connection,
+  kind: "lease" | "throttle",
+  eventId: string,
+  updater: (current: T | null) => TransactionDecision<T>,
   options: { admission: EventWriteAdmission },
-): Promise<{ committed: boolean; decision?: string; value: unknown }> {
+): Promise<TransactionResult<T>> {
   const runMutation = async (
     statement: D1PreparedStatement,
   ): Promise<D1Result> => {
@@ -2061,21 +2160,16 @@ export async function transactEventCoordinationPath(
       throw error;
     }
   };
-  const parts = splitPath(path);
-  if (
-    parts.length !== 2 ||
-    (parts[0] !== "eventLocks" && parts[0] !== "eventSyncThrottles")
-  ) {
-    throw new EventD1Failure("unsupported-event-coordination-path");
-  }
-  const eventId = exactKey(parts[1]);
+  eventId = exactKey(eventId);
   if (!eventId) throw new EventD1Failure("invalid-event-path");
   for (
     let attempt = 0;
     attempt < MAX_EVENT_TRANSACTION_ATTEMPTS;
     attempt += 1
   ) {
-    const current = await readEventOwnedPath(db, path);
+    const current = (await (kind === "lease"
+      ? readEventLease(db, eventId)
+      : readEventSyncThrottle(db, eventId))) as T | null;
     const decision = updater(current);
     if ("commit" in decision) {
       return {
@@ -2084,8 +2178,10 @@ export async function transactEventCoordinationPath(
         value: current,
       };
     }
-    if (parts[0] === "eventLocks") {
-      const currentRecord = isRecord(current) ? current : null;
+    if (kind === "lease") {
+      const currentRecord: Record<string, unknown> | null = isRecord(current)
+        ? current
+        : null;
       if (decision.value === null) {
         if (!currentRecord) {
           return { committed: true, decision: decision.decision, value: null };
@@ -2109,7 +2205,9 @@ export async function transactEventCoordinationPath(
         }
         continue;
       }
-      const next = isRecord(decision.value) ? decision.value : null;
+      const next: Record<string, unknown> | null = isRecord(decision.value)
+        ? decision.value
+        : null;
       const lockId = next ? exactKey(next.lockId) : "";
       const ownerUid = next ? exactKey(next.ownerUid) : "";
       if (!next || !lockId || !ownerUid) {
@@ -2159,12 +2257,14 @@ export async function transactEventCoordinationPath(
         return {
           committed: true,
           decision: decision.decision,
-          value: cloneJson(next),
+          value: cloneJson(next) as T,
         };
       }
       continue;
     }
-    const currentRecord = isRecord(current) ? current : null;
+    const currentRecord: Record<string, unknown> | null = isRecord(current)
+      ? current
+      : null;
     if (decision.value === null) {
       const result = currentRecord
         ? await runMutation(
@@ -2181,7 +2281,9 @@ export async function transactEventCoordinationPath(
       }
       continue;
     }
-    const next = isRecord(decision.value) ? decision.value : null;
+    const next: Record<string, unknown> | null = isRecord(decision.value)
+      ? decision.value
+      : null;
     const ownerUid = next ? exactKey(next.ownerUid) : "";
     const token = next ? exactKey(next.token) : "";
     if (!next || !ownerUid || !token) {
@@ -2216,13 +2318,33 @@ export async function transactEventCoordinationPath(
       return {
         committed: true,
         decision: decision.decision,
-        value: cloneJson(next),
+        value: cloneJson(next) as T,
       };
     }
   }
   throw new EventD1Conflict();
 }
 
+export function transactEventLease(
+  db: EventD1Connection,
+  key: string,
+  updater: (
+    current: EventLeaseRecord | null,
+  ) => TransactionDecision<EventLeaseRecord>,
+  options: { admission: EventWriteAdmission },
+) {
+  return transactEventCoordination(db, "lease", key, updater, options);
+}
+export function transactEventSyncThrottle(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (
+    current: EventSyncThrottleRecord | null,
+  ) => TransactionDecision<EventSyncThrottleRecord>,
+  options: { admission: EventWriteAdmission },
+) {
+  return transactEventCoordination(db, "throttle", eventId, updater, options);
+}
 function validateTransitionIntent(
   value: EventTransitionIntent,
 ): EventTransitionIntent {
@@ -2606,4 +2728,133 @@ export async function readEventTelegramProjectionState(
     revision: safeInteger(row.revision, 1),
     state,
   };
+}
+
+export function transactEventRecord(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (
+    current: EventJsonRecord | null,
+  ) => TransactionDecision<EventJsonRecord>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const result = await readStoredEventSnapshotIfChanged(db, eventId);
+      if (result.notModified) throw new EventD1Failure();
+      const snapshot = result.snapshot;
+      return {
+        value: cloneJson(snapshot.event),
+        mutation: (value: EventJsonRecord | null): EventMutation => ({
+          kind: "event",
+          eventId,
+          value: value!,
+        }),
+        options: {
+          eventSnapshot: snapshot,
+          expectedEventRevisions: { [eventId]: snapshot.revision },
+        },
+      };
+    },
+    options,
+  );
+}
+export function transactEventField<
+  K extends import("../../../runtime/eventCommands.js").EventField,
+>(
+  db: EventD1Connection,
+  eventId: string,
+  field: K,
+  updater: (
+    current:
+      import("../../../runtime/eventCommands.js").EventFieldValues[K] | null,
+  ) => TransactionDecision<
+    import("../../../runtime/eventCommands.js").EventFieldValues[K]
+  >,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const result = await readStoredEventSnapshotIfChanged(db, eventId);
+      if (result.notModified) throw new EventD1Failure();
+      const snapshot = result.snapshot;
+      return {
+        value: cloneJson(snapshot.event?.[field] ?? null) as
+          | import("../../../runtime/eventCommands.js").EventFieldValues[K]
+          | null,
+        mutation: (
+          value:
+            | import("../../../runtime/eventCommands.js").EventFieldValues[K]
+            | null,
+        ): EventMutation =>
+          ({ kind: "event-field", eventId, field, value }) as EventMutation,
+        options: {
+          eventSnapshot: snapshot,
+          expectedEventRevisions: { [eventId]: snapshot.revision },
+        },
+      };
+    },
+    options,
+  );
+}
+export function transactEventPrizeSelections(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (
+    current: Record<string, string> | null,
+  ) => TransactionDecision<Record<string, string>>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const result = await readStoredEventSnapshotIfChanged(db, eventId);
+      if (result.notModified) throw new EventD1Failure();
+      const snapshot = result.snapshot;
+      return {
+        value: cloneJson(snapshot.prizeSelections),
+        mutation: (value: Record<string, string> | null): EventMutation => ({
+          kind: "prize-selections",
+          eventId,
+          value,
+        }),
+        options: {
+          eventSnapshot: snapshot,
+          expectedEventRevisions: { [eventId]: snapshot.revision },
+        },
+      };
+    },
+    options,
+  );
+}
+export function transactEventTelegramProjectionGeneration(
+  db: EventD1Connection,
+  eventId: string,
+  updater: (current: number | null) => TransactionDecision<number>,
+  options: EventTransactionOptions,
+) {
+  return transactEventValue(
+    db,
+    updater,
+    async () => {
+      const current = await readEventTelegramProjectionState(db, eventId);
+      return {
+        value: current?.generation || 0,
+        mutation: (value: number | null): EventMutation => ({
+          kind: "telegram-generation",
+          eventId,
+          value: value!,
+        }),
+        options: {
+          expectedTelegramStateRevisions: { [eventId]: current?.revision || 0 },
+        },
+      };
+    },
+    options,
+  );
 }

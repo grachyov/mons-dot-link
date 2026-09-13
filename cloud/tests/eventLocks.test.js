@@ -12,6 +12,8 @@ const {
   runStateDecisionTransaction,
 } = require("../runtime/stateDecisionTransaction");
 
+const { eventTestLeasePath } = require("../workers/api/test/eventTestPorts.ts");
+
 const clone = (value) =>
   value === undefined ? undefined : structuredClone(value);
 
@@ -83,7 +85,7 @@ const createManager = ({
   setInterval,
   clearInterval,
   logger,
-  lockRoot,
+  lockKind,
   includeLegacyOwnerId,
 }) => {
   let idIndex = 0;
@@ -94,57 +96,47 @@ const createManager = ({
     setInterval,
     clearInterval,
     logger: logger || { error() {} },
-    lockRoot,
+    lockKind,
     includeLegacyOwnerId,
-    transactPath: (path, updater) =>
-      runStateDecisionTransaction(database.ref(path), updater),
+    transactEventLease: (key, updater) =>
+      runStateDecisionTransaction(
+        database.ref(eventTestLeasePath(key)),
+        updater,
+      ),
   });
 };
 
-test("validates configured lock roots and preserves the core default", () => {
-  const database = createColdDatabase();
-  assert.throws(
-    () =>
+test("validates lease domains and preserves the core default", () => {
+  for (const lockKind of [
+    "",
+    "/locks",
+    "locks/nested",
+    "locks//nested",
+    "locks\u0001child",
+  ]) {
+    assert.throws(
+      () =>
+        createEventLockManagerCore({
+          createLockId: () => "lock",
+          lockKind,
+          transactEventLease: async () => ({ committed: false, value: null }),
+        }),
+      /invalid event lease kind/,
+    );
+  }
+  for (const lockKind of [
+    "event",
+    "profile-game-projection",
+    "telegram-projection",
+    "transition",
+  ])
+    assert.ok(
       createEventLockManagerCore({
         createLockId: () => "lock",
-        lockRoot: "",
-        transactPath: async () => ({ committed: false, value: null }),
+        lockKind,
+        transactEventLease: async () => ({ committed: false, value: null }),
       }),
-    /lockRoot must be a non-empty string/,
-  );
-  assert.throws(
-    () =>
-      createEventLockManagerCore({
-        createLockId: () => "lock",
-        lockRoot: "/locks",
-        transactPath: async () => ({ committed: false, value: null }),
-      }),
-    /lockRoot must be a valid state path/,
-  );
-  const nested = createEventLockManagerCore({
-    createLockId: () => "lock",
-    lockRoot: "locks/nested",
-    transactPath: async () => ({ committed: false, value: null }),
-  });
-  assert.ok(nested);
-  assert.throws(
-    () =>
-      createEventLockManagerCore({
-        createLockId: () => "lock",
-        lockRoot: "locks//nested",
-        transactPath: async () => ({ committed: false, value: null }),
-      }),
-    /lockRoot must be a valid state path/,
-  );
-  assert.throws(
-    () =>
-      createEventLockManagerCore({
-        createLockId: () => "lock",
-        lockRoot: "locks\u0001child",
-        transactPath: async () => ({ committed: false, value: null }),
-      }),
-    /lockRoot must be a valid state path/,
-  );
+    );
   assert.equal(EVENT_LOCK_ROOT, "eventLocks");
 });
 
@@ -178,7 +170,7 @@ test("profile projection leases interoperate with legacy ownerId consumers", asy
   const manager = createManager({
     database,
     now: () => 1_000,
-    lockRoot: "profileGameProjectionLocks/event",
+    lockKind: "profile-game-projection",
     includeLegacyOwnerId: true,
   });
   const handle = await manager.acquireEventLock("event-1", "new-owner");
@@ -221,13 +213,13 @@ test("core and projection roots coexist while projection contenders exclude each
     database,
     now: () => 1_000,
     ids: ["projection-lock"],
-    lockRoot: "eventTelegramProjectionLocks",
+    lockKind: "telegram-projection",
   });
   const projectionContender = createManager({
     database,
     now: () => 1_000,
     ids: ["projection-contender"],
-    lockRoot: "eventTelegramProjectionLocks",
+    lockKind: "telegram-projection",
   });
 
   const coreHandle = await coreManager.acquireEventLock("event-1", "domain");
