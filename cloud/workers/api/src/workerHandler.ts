@@ -58,6 +58,7 @@ import { recoverEventTransitionIntents } from "./eventRepository.ts";
 import { readAutomatchRuntimeControl } from "./automatchD1.ts";
 import { MATCH_SNAPSHOT_PATH } from "@mons/shared/game-sessions";
 import { handleMatchSnapshotRoute } from "./matchSnapshotRoute.ts";
+import { runScheduledTasks } from "./scheduledTasks.ts";
 
 export { extractIdFromJsonUri } from "./helius.ts";
 export type { ProviderFetch } from "./provider.ts";
@@ -171,24 +172,44 @@ export async function handleScheduled(
   const runPersistenceTask = async (task: () => Promise<unknown>) => {
     if (await persistenceWritesEnabled) await task();
   };
-  const results = await Promise.allSettled([
-    runProfileTask(tasks.authRecovery),
-    runProfileTask(tasks.eventProgress),
-    runProfileTask(tasks.eventTransitions),
-    runProfileTask(() => runPersistenceTask(tasks.profileGameProjection)),
-    runProfileTask(() => runPersistenceTask(tasks.telegramProjection)),
-    runProfileTask(() => runPersistenceTask(tasks.gameSessionTransitions)),
-    runProfileTask(tasks.matchTimerStarts),
-    tasks.gameSessionLocks(),
-    runPersistenceTask(tasks.gameSessionReceipts),
-    tasks.authState(),
-  ]);
-  const failure = results.find(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
+  await runScheduledTasks(
+    [
+      { name: "authRecovery", run: () => runProfileTask(tasks.authRecovery) },
+      { name: "eventProgress", run: () => runProfileTask(tasks.eventProgress) },
+      {
+        name: "eventTransitions",
+        run: () => runProfileTask(tasks.eventTransitions),
+      },
+      {
+        name: "profileGameProjection",
+        run: () =>
+          runProfileTask(() => runPersistenceTask(tasks.profileGameProjection)),
+      },
+      {
+        name: "telegramProjection",
+        run: () =>
+          runProfileTask(() => runPersistenceTask(tasks.telegramProjection)),
+      },
+      {
+        name: "gameSessionTransitions",
+        run: () =>
+          runProfileTask(() =>
+            runPersistenceTask(tasks.gameSessionTransitions),
+          ),
+      },
+      {
+        name: "matchTimerStarts",
+        run: () => runProfileTask(tasks.matchTimerStarts),
+      },
+      { name: "gameSessionLocks", run: tasks.gameSessionLocks },
+      {
+        name: "gameSessionReceipts",
+        run: () => runPersistenceTask(tasks.gameSessionReceipts),
+      },
+      { name: "authState", run: tasks.authState },
+    ],
+    { scheduledTime: controller.scheduledTime },
   );
-  if (failure) {
-    throw failure.reason;
-  }
 }
 
 function retryQueueMessages(batch: MessageBatch<unknown>): void {

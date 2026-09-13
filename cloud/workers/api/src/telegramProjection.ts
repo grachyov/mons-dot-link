@@ -47,7 +47,10 @@ import {
   sweepEventTelegramProjections,
 } from "./eventTelegramProjection.ts";
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
-import { collectSuccessfulClaims, sendQueueTasks } from "./projectionSweep.ts";
+import {
+  claimAndEnqueueProjectionTasks,
+  sendQueueTasks,
+} from "./projectionSweep.ts";
 import {
   infrastructureRetryDelaySeconds as projectionRetryDelaySeconds,
   MAX_INFRASTRUCTURE_RETRY_DELAY_SECONDS as MAX_PROJECTION_RETRY_DELAY_SECONDS,
@@ -562,20 +565,21 @@ async function sweepAutomatchProjections(
             : new Error("projection-invalid-record-failed");
       }
     }
-    const claims = await collectSuccessfulClaims(
+    const { sentCount, claimFailure } = await claimAndEnqueueProjectionTasks({
       candidates,
-      (candidate) => claimAutomatchSweepCandidate(state, candidate, nowMs),
-      "projection-claim-failed",
-    );
-    const tasks = claims.claimed.map(({ task }) => task);
-    await sendTaskBatches(env.TELEGRAM_PROJECTION_QUEUE, tasks);
-    if (claims.failure) {
-      throw claims.failure;
+      claim: (candidate) =>
+        claimAutomatchSweepCandidate(state, candidate, nowMs),
+      toTask: ({ task }) => task,
+      queue: env.TELEGRAM_PROJECTION_QUEUE,
+      fallbackErrorMessage: "projection-claim-failed",
+    });
+    if (claimFailure) {
+      throw claimFailure;
     }
     if (invalidFailure) {
       throw invalidFailure;
     }
-    return tasks.length;
+    return sentCount;
   } catch (error) {
     logger.error(
       JSON.stringify({
@@ -598,25 +602,25 @@ async function sweepRatingProjections(
       nowMs,
       PROJECTION_SWEEP_LIMIT,
     );
-    const claims = await collectSuccessfulClaims(
-      records,
-      (record) =>
+    const { sentCount, claimFailure } = await claimAndEnqueueProjectionTasks({
+      candidates: records,
+      claim: (record) =>
         rating.claimRatingTelegramProjection(
           record.operationId,
           record.updateTime,
           nowMs,
         ),
-      "projection-claim-failed",
-    );
-    const tasks: TelegramProjectionTask[] = claims.claimed.map((record) => ({
-      kind: "rating-telegram-projection",
-      operationId: record.operationId,
-    }));
-    await sendTaskBatches(env.TELEGRAM_PROJECTION_QUEUE, tasks);
-    if (claims.failure) {
-      throw claims.failure;
+      toTask: (record): TelegramProjectionTask => ({
+        kind: "rating-telegram-projection",
+        operationId: record.operationId,
+      }),
+      queue: env.TELEGRAM_PROJECTION_QUEUE,
+      fallbackErrorMessage: "projection-claim-failed",
+    });
+    if (claimFailure) {
+      throw claimFailure;
     }
-    return tasks.length;
+    return sentCount;
   } catch (error) {
     logger.error(
       JSON.stringify({

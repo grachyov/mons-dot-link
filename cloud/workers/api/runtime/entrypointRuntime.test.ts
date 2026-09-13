@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as entrypoint from "../src/index.ts";
 import {
   createEventProgressWorkflowDependencies,
@@ -287,6 +287,7 @@ describe("Worker entrypoint", () => {
       eventTransitions: async () => calls.push("eventTransitions"),
       gameSessionLocks: async () => calls.push("gameSessionLocks"),
       gameSessionReceipts: async () => calls.push("gameSessionReceipts"),
+      gameSessionTransitions: async () => calls.push("gameSessionTransitions"),
       matchTimerStarts: async () => calls.push("matchTimerStarts"),
       profileGameProjection: async () => calls.push("profileGameProjection"),
       telegramProjection: async () => calls.push("telegramProjection"),
@@ -314,6 +315,7 @@ describe("Worker entrypoint", () => {
         "eventTransitions",
         "gameSessionLocks",
         "gameSessionReceipts",
+        "gameSessionTransitions",
         "matchTimerStarts",
         "profileGameProjection",
         "telegramProjection",
@@ -321,10 +323,13 @@ describe("Worker entrypoint", () => {
     );
   });
 
-  it("runs all scheduled work and reports the first failure", async () => {
+  it("runs all scheduled work, logs each failure, and reports the first failure", async () => {
     const calls: string[] = [];
     const progressFailure = new Error("event-progress-failed");
     const transitionFailure = new Error("poison-transition");
+    const logger = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     let thrown: unknown;
     try {
       await handleScheduled(
@@ -343,6 +348,7 @@ describe("Worker entrypoint", () => {
           },
           gameSessionLocks: async () => undefined,
           gameSessionReceipts: async () => undefined,
+          gameSessionTransitions: async () => undefined,
           matchTimerStarts: async () => undefined,
           profileGameProjection: async () => undefined,
           telegramProjection: async () => undefined,
@@ -350,6 +356,25 @@ describe("Worker entrypoint", () => {
       );
     } catch (error) {
       thrown = error;
+    } finally {
+      const logs = logger.mock.calls.map(([value]) => JSON.parse(value));
+      logger.mockRestore();
+      expect(logs).toEqual([
+        {
+          event: "scheduled_task_failed",
+          task: "eventProgress",
+          durationMs: expect.any(Number),
+          scheduledTime: controller.scheduledTime,
+          code: "event-progress-failed",
+        },
+        {
+          event: "scheduled_task_failed",
+          task: "eventTransitions",
+          durationMs: expect.any(Number),
+          scheduledTime: controller.scheduledTime,
+          code: "poison-transition",
+        },
+      ]);
     }
     expect(new Set(calls)).toEqual(
       new Set(["eventProgress", "eventTransitions"]),

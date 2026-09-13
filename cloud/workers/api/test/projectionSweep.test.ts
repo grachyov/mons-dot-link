@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  claimAndEnqueueProjectionTasks,
   collectSuccessfulClaims,
   sendQueueTasks,
 } from "../src/projectionSweep.ts";
@@ -95,4 +96,97 @@ test("projection claims use the caller's fallback for non-Error failures", async
 
   assert.deepEqual(result.claimed, [3]);
   assert.equal(result.failure?.message, "profile-game-projection-claim-failed");
+});
+
+test("projection dispatch sends initial tasks and successful claims before returning the first failure", async () => {
+  const failure = new Error("claim-unavailable");
+  const visited: number[] = [];
+  const batches: string[][] = [];
+  let claiming = false;
+  const result = await claimAndEnqueueProjectionTasks({
+    candidates: [1, 2, 3, 4, 5],
+    async claim(item) {
+      assert.equal(claiming, false);
+      claiming = true;
+      visited.push(item);
+      await Promise.resolve();
+      claiming = false;
+      if (item === 2) throw failure;
+      if (item === 4) throw new Error("later-failure");
+      return item !== 1;
+    },
+    toTask: (item) => `claimed-${item}`,
+    initialTasks: ["repaired-1", "repaired-2"],
+    queue: {
+      async sendBatch(messages) {
+        assert.deepEqual(visited, [1, 2, 3, 4, 5]);
+        batches.push(Array.from(messages, ({ body }) => body));
+        return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
+      },
+    },
+    fallbackErrorMessage: "projection-claim-failed",
+  });
+
+  assert.deepEqual(batches, [
+    ["repaired-1", "repaired-2", "claimed-3", "claimed-5"],
+  ]);
+  assert.deepEqual(result, { sentCount: 4, claimFailure: failure });
+});
+
+test("projection dispatch sends repaired-only work and skips empty batches", async () => {
+  const batches: string[][] = [];
+  const queue = {
+    async sendBatch(messages) {
+      batches.push(Array.from(messages, ({ body }) => body));
+      return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
+    },
+  } satisfies Pick<Queue<string>, "sendBatch">;
+
+  for (const initialTasks of [["repaired"], []]) {
+    assert.deepEqual(
+      await claimAndEnqueueProjectionTasks({
+        candidates: [],
+        claim: async () => {
+          throw new Error("unexpected-claim");
+        },
+        toTask: () => "unexpected-task",
+        initialTasks,
+        queue,
+        fallbackErrorMessage: "projection-claim-failed",
+      }),
+      { sentCount: initialTasks.length, claimFailure: null },
+    );
+  }
+  assert.deepEqual(batches, [["repaired"]]);
+});
+
+test("projection dispatch preserves queue failure precedence and stops later batches", async () => {
+  const claimFailure = new Error("claim-unavailable");
+  const queueFailure = new Error("queue-unavailable");
+  const batches: number[][] = [];
+  await assert.rejects(
+    claimAndEnqueueProjectionTasks({
+      candidates: Array.from({ length: 202 }, (_, index) => index),
+      claim: async (item) => {
+        if (item === 0) throw claimFailure;
+        return true;
+      },
+      toTask: (item) => item,
+      queue: {
+        async sendBatch(messages) {
+          batches.push(Array.from(messages, ({ body }) => body));
+          if (batches.length === 2) throw queueFailure;
+          return {
+            metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+          };
+        },
+      },
+      fallbackErrorMessage: "projection-claim-failed",
+    }),
+    (error) => error === queueFailure,
+  );
+  assert.deepEqual(batches, [
+    Array.from({ length: 100 }, (_, index) => index + 1),
+    Array.from({ length: 100 }, (_, index) => index + 101),
+  ]);
 });

@@ -2461,6 +2461,95 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
   );
 });
 
+for (const kind of ["automatch", "event"] as const) {
+  test(`${kind} recovery preserves repair and claim failure precedence after sending successful work`, async () => {
+    const repairFailure = new Error("repair-unavailable");
+    const claimFailure = new Error("claim-unavailable");
+    const queueFailure = new Error("queue-unavailable");
+    for (const failSend of [false, true]) {
+      const batches: unknown[][] = [];
+      const validRecord =
+        kind === "automatch" ? automatchOutbox() : eventOutbox();
+      const values = new Map<string, unknown>([
+        ["broken-repair", "invalid"],
+        ["broken-claim", validRecord],
+        ["valid", validRecord],
+      ]);
+      const visited: string[] = [];
+      const state = attachProjectionTestPorts({
+        getStatePath: async (_path: string, query?: Record<string, unknown>) =>
+          query?.startAt === "" ? {} : Object.fromEntries(values),
+        listDueEventProfileGameProjectionOutboxes: async () =>
+          [...values].map(([eventId, record]) => ({ eventId, record })),
+        transactStatePath: async (
+          path: string,
+          updater: (current: unknown) => unknown,
+        ) => {
+          const id = path.split("/").at(-1) || "";
+          visited.push(id);
+          if (id === "broken-repair") throw repairFailure;
+          if (id === "broken-claim") throw claimFailure;
+          return applyStateTransaction(values.get(id), updater);
+        },
+      });
+      const sweep =
+        kind === "automatch"
+          ? sweepAutomatchProfileGameProjections
+          : sweepEventProfileGameProjections;
+      await assert.rejects(
+        sweep(
+          {
+            ...TELEGRAM_TEST_ENV,
+            PROFILE_GAME_PROJECTION_QUEUE: {
+              ...TELEGRAM_TEST_ENV.PROFILE_GAME_PROJECTION_QUEUE,
+              async sendBatch(messages) {
+                batches.push(Array.from(messages, ({ body }) => body));
+                if (failSend) throw queueFailure;
+                return {
+                  metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+                };
+              },
+            },
+          },
+          {
+            createStateRepository: () => state,
+            createRequestId: () => "repair-request",
+            logger: silentLogger,
+            now: () => 600_000,
+          },
+        ),
+        (error) => {
+          if (failSend) return error === queueFailure;
+          if (kind === "automatch") return error === claimFailure;
+          assert.ok(error instanceof AggregateError);
+          assert.equal(
+            error.message,
+            "event-profile-game-projection-sweep-failed",
+          );
+          assert.deepEqual(error.errors, [repairFailure, claimFailure]);
+          return true;
+        },
+      );
+      assert.deepEqual(visited, ["broken-repair", "broken-claim", "valid"]);
+      assert.deepEqual(batches, [
+        [
+          kind === "automatch"
+            ? {
+                kind: "automatch-profile-game-projection",
+                inviteId: "valid",
+                requestId: validRecord.requestId,
+              }
+            : {
+                kind: "event-profile-game-projection",
+                eventId: "valid",
+                requestId: validRecord.requestId,
+              },
+        ],
+      ]);
+    }
+  });
+}
+
 test("automatch recovery claims an outbox only once", async () => {
   let current: unknown = automatchOutbox("request-1", 50, 100);
   const state = attachProjectionTestPorts({

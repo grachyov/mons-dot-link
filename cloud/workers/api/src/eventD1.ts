@@ -120,6 +120,12 @@ type RuntimeControlRow = {
   updated_at_ms: number;
 };
 
+type DecodedEventRow = {
+  event: EventJsonRecord;
+  pendingTransitionId: string | null;
+  revision: number;
+};
+
 type EventMutationState = {
   current: EventJsonRecord | null;
   next: EventJsonRecord | null;
@@ -371,7 +377,7 @@ function validatePrizeSelection(eventId: string, value: unknown): string {
   return prizeId;
 }
 
-function parseEventRow(row: EventRow): EventMutationState {
+function decodeEventRow(row: EventRow): DecodedEventRow {
   const event = validateEventAggregate(
     row.event_id,
     decodeJson(row.record_json),
@@ -384,20 +390,16 @@ function parseEventRow(row: EventRow): EventMutationState {
     throw new EventD1Failure("event-row-mismatch");
   }
   return {
-    current: event,
-    next: cloneJson(event),
-    originalSelections: null,
+    event,
     pendingTransitionId: row.pending_transition_id,
     revision: safeInteger(row.revision, 1),
-    selections: null,
-    selectionsChanged: false,
   };
 }
 
-async function readEventState(
+async function readEventRecord(
   db: EventD1Connection,
   eventId: string,
-): Promise<EventMutationState> {
+): Promise<DecodedEventRow | null> {
   const normalizedEventId = exactKey(eventId);
   if (!normalizedEventId) throw new EventD1Failure("invalid-event-id");
   const row = await db
@@ -408,17 +410,7 @@ async function readEventState(
     )
     .bind(normalizedEventId)
     .first<EventRow>();
-  return row
-    ? parseEventRow(row)
-    : {
-        current: null,
-        next: null,
-        originalSelections: null,
-        pendingTransitionId: null,
-        revision: 0,
-        selections: null,
-        selectionsChanged: false,
-      };
+  return row ? decodeEventRow(row) : null;
 }
 
 async function readSelections(
@@ -439,7 +431,7 @@ export async function readEvent(
   db: EventD1Connection,
   eventId: string,
 ): Promise<EventJsonRecord | null> {
-  return (await readEventState(db, eventId)).current;
+  return (await readEventRecord(db, eventId))?.event ?? null;
 }
 
 export async function readEventPrizeSelections(
@@ -547,11 +539,11 @@ async function readStoredEventSnapshotIfChanged(
     safeInteger(row.updated_at_ms);
     return { notModified: true, revision: safeInteger(row.revision, 1) };
   }
-  const state = parseEventRow(row);
+  const state = decodeEventRow(row);
   return {
     notModified: false,
     snapshot: {
-      event: state.current!,
+      event: state.event,
       eventId: normalizedEventId,
       pendingTransitionId: state.pendingTransitionId,
       prizeSelections: selectionsFromRows(
@@ -590,7 +582,7 @@ export async function listEventAggregates(
         .bind(limit)
         .all<EventRow>();
   return Object.fromEntries(
-    rows.results.map((row) => [row.event_id, parseEventRow(row).current!]),
+    rows.results.map((row) => [row.event_id, decodeEventRow(row).event]),
   );
 }
 
@@ -901,7 +893,16 @@ async function getEventMutationState(
 ): Promise<EventMutationState> {
   let state = states.get(eventId);
   if (!state) {
-    state = await readEventState(db, eventId);
+    const stored = await readEventRecord(db, eventId);
+    state = {
+      current: stored?.event ?? null,
+      next: stored ? cloneJson(stored.event) : null,
+      originalSelections: null,
+      pendingTransitionId: stored?.pendingTransitionId ?? null,
+      revision: stored?.revision ?? 0,
+      selections: null,
+      selectionsChanged: false,
+    };
     states.set(eventId, state);
   }
   return state;

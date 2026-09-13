@@ -50,7 +50,10 @@ import {
   type ProfileLinkCatchupStore,
 } from "./profileLinkCatchupD1.ts";
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
-import { collectSuccessfulClaims, sendQueueTasks } from "./projectionSweep.ts";
+import {
+  claimAndEnqueueProjectionTasks,
+  sendQueueTasks,
+} from "./projectionSweep.ts";
 import {
   infrastructureRetryDelaySeconds as profileGameProjectionRetryDelaySeconds,
   MAX_INFRASTRUCTURE_RETRY_DELAY_SECONDS as MAX_PROFILE_GAME_PROJECTION_RETRY_DELAY_SECONDS,
@@ -1108,26 +1111,21 @@ export async function sweepAutomatchProfileGameProjections(
   const candidates = entries.flatMap((entry) =>
     entry.kind === "candidate" ? [entry.value] : [],
   );
-  const claims = await collectSuccessfulClaims(
+  const { sentCount, claimFailure } = await claimAndEnqueueProjectionTasks({
     candidates,
-    (candidate) => claimAutomatchSweepCandidate(state, candidate, nowMs),
-    "profile-game-projection-claim-failed",
-  );
-  const tasks: ProfileGameProjectionTask[] = [
-    ...repairedTasks,
-    ...claims.claimed.map(({ task }) => task),
-  ];
-  await sendProfileGameProjectionTasks(
-    env.PROFILE_GAME_PROJECTION_QUEUE,
-    tasks,
-  );
-  if (claims.failure) {
-    throw claims.failure;
+    claim: (candidate) => claimAutomatchSweepCandidate(state, candidate, nowMs),
+    toTask: ({ task }) => task,
+    queue: env.PROFILE_GAME_PROJECTION_QUEUE,
+    initialTasks: repairedTasks,
+    fallbackErrorMessage: "profile-game-projection-claim-failed",
+  });
+  if (claimFailure) {
+    throw claimFailure;
   }
   if (invalidFailure) {
     throw invalidFailure;
   }
-  return tasks.length;
+  return sentCount;
 }
 
 export async function sweepEventProfileGameProjections(
@@ -1197,21 +1195,16 @@ export async function sweepEventProfileGameProjections(
       candidateByEventId.set(entry.value.task.eventId, entry.value);
     }
   }
-  const claims = await collectSuccessfulClaims(
-    Array.from(candidateByEventId.values()),
-    (candidate) => claimEventSweepCandidate(state, candidate, nowMs),
-    "profile-game-projection-claim-failed",
-  );
-  const tasks: ProfileGameProjectionTask[] = [
-    ...repairedTasks,
-    ...claims.claimed.map(({ task }) => task),
-  ];
-  await sendProfileGameProjectionTasks(
-    env.PROFILE_GAME_PROJECTION_QUEUE,
-    tasks,
-  );
-  if (claims.failure) {
-    failures.push(claims.failure);
+  const { sentCount, claimFailure } = await claimAndEnqueueProjectionTasks({
+    candidates: Array.from(candidateByEventId.values()),
+    claim: (candidate) => claimEventSweepCandidate(state, candidate, nowMs),
+    toTask: ({ task }) => task,
+    queue: env.PROFILE_GAME_PROJECTION_QUEUE,
+    initialTasks: repairedTasks,
+    fallbackErrorMessage: "profile-game-projection-claim-failed",
+  });
+  if (claimFailure) {
+    failures.push(claimFailure);
   }
   if (failures.length === 1) {
     throw failures[0];
@@ -1222,7 +1215,7 @@ export async function sweepEventProfileGameProjections(
       "event-profile-game-projection-sweep-failed",
     );
   }
-  return tasks.length;
+  return sentCount;
 }
 
 export async function sweepProfileLinkProfileGameProjections(
@@ -1238,27 +1231,25 @@ export async function sweepProfileLinkProfileGameProjections(
     nowMs - PROFILE_GAME_PROJECTION_RECOVERY_DELAY_MS,
     PROFILE_GAME_PROJECTION_SWEEP_LIMIT,
   );
-  const claims = await collectSuccessfulClaims(
+  const { sentCount, claimFailure } = await claimAndEnqueueProjectionTasks({
     candidates,
-    (job) =>
+    claim: (job) =>
       jobs.claimDispatch(
         job.loginUid,
         job.requestId,
         job.lastQueuedAtMs,
         nowMs,
       ),
-    "profile-game-projection-claim-failed",
-  );
-  await sendProfileGameProjectionTasks(
-    env.PROFILE_GAME_PROJECTION_QUEUE,
-    claims.claimed.map(({ loginUid, requestId }) => ({
+    toTask: ({ loginUid, requestId }): ProfileGameProjectionTask => ({
       kind: "profile-link-profile-game-projection",
       loginUid,
       requestId,
-    })),
-  );
-  if (claims.failure) throw claims.failure;
-  return claims.claimed.length;
+    }),
+    queue: env.PROFILE_GAME_PROJECTION_QUEUE,
+    fallbackErrorMessage: "profile-game-projection-claim-failed",
+  });
+  if (claimFailure) throw claimFailure;
+  return sentCount;
 }
 
 export async function sweepProfileGameProjections(

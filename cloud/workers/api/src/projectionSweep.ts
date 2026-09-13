@@ -28,3 +28,28 @@ export async function collectSuccessfulClaims<T>(
   }
   return { claimed, failure };
 }
+
+export async function claimAndEnqueueProjectionTasks<Candidate, Task>({
+  candidates,
+  claim,
+  toTask,
+  queue,
+  initialTasks = [],
+  fallbackErrorMessage,
+}: {
+  candidates: readonly Candidate[];
+  claim: (candidate: Candidate) => Promise<boolean>;
+  toTask: (candidate: Candidate) => Task;
+  queue: Pick<Queue<Task>, "sendBatch">;
+  initialTasks?: readonly Task[];
+  fallbackErrorMessage: string;
+}): Promise<{ sentCount: number; claimFailure: Error | null }> {
+  const claims = await collectSuccessfulClaims(
+    candidates,
+    claim,
+    fallbackErrorMessage,
+  );
+  const tasks = [...initialTasks, ...claims.claimed.map(toTask)];
+  await sendQueueTasks(queue, tasks);
+  return { sentCount: tasks.length, claimFailure: claims.failure };
+}
