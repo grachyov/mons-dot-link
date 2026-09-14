@@ -20,7 +20,7 @@ import {
   cooldownParams,
   recoveryParams,
 } from "./auth.ts";
-import { ratingWriteRow } from "./accounting.ts";
+import { ratingProjectionWriteRow, ratingWriteRow } from "./accounting.ts";
 import { guardStatement, buildCanonicalGuardStatements } from "./guards.ts";
 
 function canonicalRowMutationStatement<Row extends Record<string, D1Value>>(
@@ -309,6 +309,14 @@ function mutationStatement(
         "operation_id",
         ratingWriteRow(mutation.value),
         mutation.kind === "insert-rating-update",
+      );
+    case "update-rating-projection":
+      return canonicalRowMutationStatement(
+        db,
+        "rating_updates",
+        "operation_id",
+        ratingProjectionWriteRow(mutation.value, mutation.projection),
+        false,
       );
     case "delete-rating-update":
       return db
@@ -850,11 +858,12 @@ function validateCanonicalCommitPlan(plan: CanonicalCommitPlan): void {
         );
         break;
       case "update-rating-update":
+      case "update-rating-projection":
       case "delete-rating-update": {
         const operationId =
-          mutation.kind === "update-rating-update"
-            ? mutation.value.operationId
-            : mutation.operationId;
+          mutation.kind === "delete-rating-update"
+            ? mutation.operationId
+            : mutation.value.operationId;
         requireExpectation(
           has(
             (expectation) =>
@@ -958,6 +967,7 @@ function canonicalTopologyProfileIds(plan: CanonicalCommitPlan): string[] {
       case "delete-method-cooldown":
       case "insert-rating-update":
       case "update-rating-update":
+      case "update-rating-projection":
       case "delete-rating-update":
       case "insert-wager-settlement":
         break;

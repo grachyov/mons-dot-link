@@ -39,6 +39,7 @@ import { classifyD1Failure } from "../src/d1Failure.ts";
 import { createProfileCustomizationRepository } from "../src/profileCustomizationRepository.ts";
 import { observeD1FailureDatabase } from "./d1FailureTestUtils.ts";
 import { profileWriteRow } from "../src/profileCanonical/profiles.ts";
+import { buildCanonicalRatingProjectionMutation } from "../src/profileCanonical/accounting.ts";
 
 const testEnv = env as Env & { TEST_PROFILE_D1_MIGRATIONS: D1Migration[] };
 
@@ -3231,6 +3232,126 @@ describe("canonical profile D1 store", () => {
       await readCanonicalRatingUpdate(testEnv.PROFILE_DB, operationId),
     ).toMatchObject({ status: "done", revision: 2, completedAtMs: 2_000 });
   });
+
+  it.each(["missing", "different operation"] as const)(
+    "rejects a narrow rating projection mutation with %s revision coverage",
+    async (coverage) => {
+      const operationId = "projection-guard-coverage";
+      const initial = ratingValue(operationId);
+      await commitCanonicalPlan(testEnv.PROFILE_DB, {
+        expectations: [{ kind: "rating-update-absent", operationId }],
+        mutations: [{ kind: "insert-rating-update", value: initial }],
+      });
+      const mutation = buildCanonicalRatingProjectionMutation(
+        { ...initial, revision: 1 },
+        { ...initial, eventProgressUpdatedAtMs: 2_000 },
+        "event-progress",
+      );
+      expect(mutation.kind).toBe("update-rating-projection");
+      await expect(
+        commitCanonicalPlan(testEnv.PROFILE_DB, {
+          expectations:
+            coverage === "missing"
+              ? []
+              : [
+                  {
+                    kind: "rating-update-revision",
+                    operationId: "another-operation",
+                    revision: 1,
+                  },
+                ],
+          mutations: [mutation],
+        }),
+      ).rejects.toThrow("unsafe-canonical-commit-plan");
+      expect(
+        await readCanonicalRatingUpdate(testEnv.PROFILE_DB, operationId),
+      ).toEqual({ ...initial, revision: 1 });
+    },
+  );
+
+  it("serializes a narrow rating payload only when compiling its commit", async () => {
+    const operationId = "projection-payload-serialization";
+    const initial = ratingValue(operationId);
+    await commitCanonicalPlan(testEnv.PROFILE_DB, {
+      expectations: [{ kind: "rating-update-absent", operationId }],
+      mutations: [{ kind: "insert-rating-update", value: initial }],
+    });
+    let serializations = 0;
+    const payload = {
+      ...initial.payload,
+      retained: [null, { nested: true }],
+      eventProgressUpdatedAtMs: 2_000,
+    };
+    const mutation = buildCanonicalRatingProjectionMutation(
+      { ...initial, revision: 1 },
+      {
+        ...initial,
+        eventProgressUpdatedAtMs: 2_000,
+        payload: {
+          toJSON() {
+            serializations++;
+            return payload;
+          },
+        },
+      },
+      "event-progress",
+    );
+    expect(serializations).toBe(0);
+    await commitCanonicalPlan(testEnv.PROFILE_DB, {
+      expectations: [
+        { kind: "rating-update-revision", operationId, revision: 1 },
+      ],
+      mutations: [mutation],
+    });
+    expect(serializations).toBe(1);
+    expect(
+      await readCanonicalRatingUpdate(testEnv.PROFILE_DB, operationId),
+    ).toEqual({
+      ...initial,
+      eventProgressUpdatedAtMs: 2_000,
+      payload,
+      revision: 2,
+    });
+  });
+
+  it.each(["integrity", "unknown"] as const)(
+    "preserves %s failure classification for narrow rating projection writes",
+    async (failure) => {
+      const operationId = `projection-${failure}-failure`;
+      const initial = ratingValue(operationId);
+      await commitCanonicalPlan(testEnv.PROFILE_DB, {
+        expectations: [{ kind: "rating-update-absent", operationId }],
+        mutations: [{ kind: "insert-rating-update", value: initial }],
+      });
+      const unknownError = new Error("projection-d1-unavailable");
+      const observed = observeD1FailureDatabase(testEnv.PROFILE_DB, {
+        async beforeBatch() {
+          if (failure === "unknown") throw unknownError;
+        },
+      });
+      const mutation = buildCanonicalRatingProjectionMutation(
+        { ...initial, revision: 1 },
+        { ...initial, eventProgressUpdatedAtMs: -1 },
+        "event-progress",
+      );
+      const result = commitCanonicalPlan(observed.database, {
+        expectations: [
+          { kind: "rating-update-revision", operationId, revision: 1 },
+        ],
+        mutations: [mutation],
+      });
+      if (failure === "unknown") {
+        await expect(result).rejects.toBe(unknownError);
+      } else {
+        await expect(result).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+      }
+      expect(observed.batches).toHaveLength(1);
+      expect(observed.sessions).toEqual([]);
+      expect(
+        await readCanonicalRatingUpdate(testEnv.PROFILE_DB, operationId),
+      ).toEqual({ ...initial, revision: 1 });
+    },
+  );
 
   it("roundtrips every rating write field on insert and update", async () => {
     const operationId = "canonical-rating-fields";

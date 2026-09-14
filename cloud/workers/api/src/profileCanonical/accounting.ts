@@ -8,6 +8,9 @@ import {
   type WagerRow,
   CanonicalProfileConflict,
   type CanonicalRatingUpdateValue,
+  type CanonicalRatingProjectionKind,
+  type CanonicalMutation,
+  type D1Value,
 } from "./types.ts";
 import {
   record,
@@ -127,12 +130,11 @@ export async function readCanonicalWagerSettlement(
   return settlement;
 }
 
-export function ratingWriteRow(
+function ratingValueColumns(
   value: CanonicalRatingUpdateValue,
-): Omit<RatingRow, "revision"> {
+): Omit<RatingRow, "revision" | "payload_json"> {
   return {
     operation_id: value.operationId,
-    payload_json: JSON.stringify(value.payload),
     status: value.status,
     invite_id: value.inviteId,
     match_id: value.matchId,
@@ -156,5 +158,96 @@ export function ratingWriteRow(
     event_progress_state: value.eventProgressState,
     event_progress_updated_at_ms: value.eventProgressUpdatedAtMs,
     event_progress_version: value.eventProgressVersion,
+  };
+}
+
+export function ratingWriteRow(
+  value: CanonicalRatingUpdateValue,
+): Omit<RatingRow, "revision"> {
+  const { operation_id, ...columns } = ratingValueColumns(value);
+  return {
+    operation_id,
+    payload_json: JSON.stringify(value.payload),
+    ...columns,
+  };
+}
+
+const RATING_PROJECTION_FIELDS = {
+  "event-progress": {
+    state: "eventProgressState",
+    updated: "eventProgressUpdatedAtMs",
+    reason: "eventProgressReason",
+    columns: [
+      "event_progress_state",
+      "event_progress_updated_at_ms",
+      "event_progress_version",
+    ],
+  },
+  "profile-game": {
+    state: "profileGameProjectionState",
+    updated: "profileGameProjectionUpdatedAtMs",
+    reason: "profileGameProjectionReason",
+    columns: [
+      "profile_game_projection_state",
+      "profile_game_projection_updated_at_ms",
+      "profile_game_projection_version",
+    ],
+  },
+  telegram: {
+    state: "telegramProjectionState",
+    updated: "telegramProjectionUpdatedAtMs",
+    reason: "telegramProjectionReason",
+    columns: [
+      "telegram_projection_state",
+      "telegram_projection_updated_at_ms",
+      "telegram_projection_version",
+    ],
+  },
+} as const;
+
+export function canonicalRatingProjectionFields(
+  projection: CanonicalRatingProjectionKind,
+) {
+  if (!Object.hasOwn(RATING_PROJECTION_FIELDS, projection)) {
+    throw new TypeError("invalid-canonical-rating-projection");
+  }
+  return RATING_PROJECTION_FIELDS[projection];
+}
+
+export function buildCanonicalRatingProjectionMutation(
+  snapshot: CanonicalRatingUpdateSnapshot,
+  value: CanonicalRatingUpdateValue,
+  projection: CanonicalRatingProjectionKind,
+): Extract<
+  CanonicalMutation,
+  { kind: "update-rating-update" | "update-rating-projection" }
+> {
+  if (snapshot.operationId !== value.operationId) {
+    throw new TypeError("invalid-canonical-rating-projection");
+  }
+  const { columns } = canonicalRatingProjectionFields(projection);
+  const excluded = new Set<string>(columns);
+  const previous = ratingValueColumns(snapshot);
+  const next = ratingValueColumns(value);
+  const changedOutsideProjection = (
+    Object.keys(previous) as Array<keyof typeof previous>
+  ).some(
+    (column) => !excluded.has(column) && previous[column] !== next[column],
+  );
+  return changedOutsideProjection
+    ? { kind: "update-rating-update", value }
+    : { kind: "update-rating-projection", projection, value };
+}
+
+export function ratingProjectionWriteRow(
+  value: CanonicalRatingUpdateValue,
+  projection: CanonicalRatingProjectionKind,
+): Record<string, D1Value> {
+  const { columns } = canonicalRatingProjectionFields(projection);
+  const row = ratingWriteRow(value);
+  return {
+    operation_id: row.operation_id,
+    payload_json: row.payload_json,
+    ...Object.fromEntries(columns.map((column) => [column, row[column]])),
   };
 }

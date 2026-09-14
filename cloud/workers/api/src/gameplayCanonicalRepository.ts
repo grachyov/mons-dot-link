@@ -27,6 +27,11 @@ import {
   type CanonicalWagerSettlement,
 } from "./profileCanonicalD1.ts";
 import {
+  canonicalRatingProjectionFields,
+  buildCanonicalRatingProjectionMutation,
+} from "./profileCanonical/accounting.ts";
+import type { CanonicalRatingProjectionKind } from "./profileCanonical/types.ts";
+import {
   materializeCanonicalProfileUpdate,
   readCanonicalRatingProfiles,
   type CanonicalRatingProfileSnapshot,
@@ -613,23 +618,22 @@ async function claimProjection(
   operationId: string,
   updateTime: string,
   claimedAtMs: number,
-  field:
-    | "eventProgressUpdatedAtMs"
-    | "profileGameProjectionUpdatedAtMs"
-    | "telegramProjectionUpdatedAtMs",
+  projection: CanonicalRatingProjectionKind,
 ): Promise<boolean> {
   const revision = parseRevision(updateTime);
   if (!revision) return false;
   const snapshot = await readCanonicalRatingUpdate(db, operationId);
   if (!snapshot || snapshot.revision !== revision) return false;
+  const fields = canonicalRatingProjectionFields(projection);
   try {
     await commitCanonicalPlan(db, {
       expectations: [{ kind: "rating-update-revision", operationId, revision }],
       mutations: [
-        {
-          kind: "update-rating-update",
-          value: mergedRatingValue(snapshot, { [field]: claimedAtMs }),
-        },
+        buildCanonicalRatingProjectionMutation(
+          snapshot,
+          mergedRatingValue(snapshot, { [fields.updated]: claimedAtMs }),
+          projection,
+        ),
       ],
     });
     return true;
@@ -681,13 +685,10 @@ async function markProjection(
   state: "dead" | "done",
   updatedAtMs: number,
   reason: string | undefined,
-  fields: {
-    reason: string;
-    state: string;
-    updated: string;
-  },
+  projection: CanonicalRatingProjectionKind,
   attempts: number,
 ): Promise<void> {
+  const fields = canonicalRatingProjectionFields(projection);
   for (let attempt = 0; attempt < attempts; attempt++) {
     const snapshot = await readCanonicalRatingUpdate(db, operationId);
     if (!snapshot) throw new TypeError("rating-operation-missing");
@@ -701,14 +702,15 @@ async function markProjection(
           },
         ],
         mutations: [
-          {
-            kind: "update-rating-update",
-            value: mergedRatingValue(snapshot, {
+          buildCanonicalRatingProjectionMutation(
+            snapshot,
+            mergedRatingValue(snapshot, {
               [fields.state]: state,
               [fields.updated]: updatedAtMs,
               [fields.reason]: reason?.trim() || null,
             }),
-          },
+            projection,
+          ),
         ],
       });
       return;
@@ -1092,7 +1094,7 @@ export function createCanonicalRatingRepository(
         operationId,
         updateTime,
         claimedAtMs,
-        "eventProgressUpdatedAtMs",
+        "event-progress",
       );
     },
 
@@ -1106,7 +1108,7 @@ export function createCanonicalRatingRepository(
         operationId,
         updateTime,
         claimedAtMs,
-        "profileGameProjectionUpdatedAtMs",
+        "profile-game",
       );
     },
 
@@ -1116,7 +1118,7 @@ export function createCanonicalRatingRepository(
         operationId,
         updateTime,
         claimedAtMs,
-        "telegramProjectionUpdatedAtMs",
+        "telegram",
       );
     },
 
@@ -1188,11 +1190,7 @@ export function createCanonicalRatingRepository(
         state,
         updatedAtMs,
         reason,
-        {
-          state: "eventProgressState",
-          updated: "eventProgressUpdatedAtMs",
-          reason: "eventProgressReason",
-        },
+        "event-progress",
         attempts,
       );
     },
@@ -1209,11 +1207,7 @@ export function createCanonicalRatingRepository(
         state,
         updatedAtMs,
         reason,
-        {
-          state: "profileGameProjectionState",
-          updated: "profileGameProjectionUpdatedAtMs",
-          reason: "profileGameProjectionReason",
-        },
+        "profile-game",
         attempts,
       );
     },
@@ -1230,11 +1224,7 @@ export function createCanonicalRatingRepository(
         state,
         updatedAtMs,
         reason,
-        {
-          state: "telegramProjectionState",
-          updated: "telegramProjectionUpdatedAtMs",
-          reason: "telegramProjectionReason",
-        },
+        "telegram",
         attempts,
       );
     },

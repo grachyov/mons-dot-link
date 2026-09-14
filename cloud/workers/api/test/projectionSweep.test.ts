@@ -2,9 +2,73 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   claimAndEnqueueProjectionTasks,
+  collectProjectionRepairs,
   collectSuccessfulClaims,
   sendQueueTasks,
 } from "../src/projectionSweep.ts";
+
+test("projection repairs continue sequentially and retain ordered results and failures", async () => {
+  const failure = new Error("repair-unavailable");
+  const visited: number[] = [];
+  let repairing = false;
+  const result = await collectProjectionRepairs(
+    [0, 1, 2, 3, 4, 5, 6],
+    async (entry) => {
+      assert.equal(repairing, false);
+      repairing = true;
+      visited.push(entry);
+      await Promise.resolve();
+      repairing = false;
+      if (entry === 0) return { kind: "changed" };
+      if (entry === 1) return { kind: "removed" };
+      if (entry === 3) throw failure;
+      if (entry === 4) throw "unavailable";
+      if (entry === 5) return;
+      return { kind: "repaired", task: `repaired-${entry}` };
+    },
+    "projection-invalid-record-failed",
+  );
+
+  assert.deepEqual(visited, [0, 1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(result.repairedTasks, ["repaired-2", "repaired-6"]);
+  assert.equal(result.removedCount, 1);
+  assert.equal(result.failures.length, 2);
+  assert.equal(result.failures[0], failure);
+  assert.equal(result.failures[1].message, "projection-invalid-record-failed");
+});
+
+test("projection repairs support quarantine callbacks without generated tasks", async () => {
+  const failure = new Error("quarantine-unavailable");
+  const visited: string[] = [];
+  const result = await collectProjectionRepairs(
+    ["first", "broken", "last"],
+    async (entry): Promise<void> => {
+      visited.push(entry);
+      if (entry === "broken") throw failure;
+    },
+    "projection-invalid-record-failed",
+  );
+
+  assert.deepEqual(visited, ["first", "broken", "last"]);
+  assert.deepEqual(result, {
+    repairedTasks: [],
+    removedCount: 0,
+    failures: [failure],
+  });
+});
+
+test("projection repairs skip empty input", async () => {
+  assert.deepEqual(
+    await collectProjectionRepairs(
+      [],
+      async () => {
+        throw new Error("unexpected-repair");
+      },
+      "projection-invalid-record-failed",
+    ),
+    { repairedTasks: [], removedCount: 0, failures: [] },
+  );
+});
 
 test("projection batches preserve task order and await each send", async () => {
   const tasks = Array.from({ length: 201 }, (_, id) => ({ id }));

@@ -222,46 +222,89 @@ function retryQueueMessages(batch: MessageBatch<unknown>): void {
   }
 }
 
+type QueueHandler = {
+  handle: (batch: MessageBatch<unknown>, env: Env) => Promise<void>;
+  profileWrites: boolean;
+  persistenceWrites: boolean;
+};
+
+const queueHandlers: ReadonlyMap<string, QueueHandler> = new Map([
+  [
+    AUTH_RECOVERY_QUEUE_NAME,
+    {
+      handle: handleAuthRecoveryQueue,
+      profileWrites: true,
+      persistenceWrites: false,
+    },
+  ],
+  [
+    PROFILE_GAME_PROJECTION_QUEUE_NAME,
+    {
+      handle: handleProfileGameProjectionQueue,
+      profileWrites: true,
+      persistenceWrites: true,
+    },
+  ],
+  [
+    EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME,
+    {
+      handle: handleEventProfileGameProjectionQueue,
+      profileWrites: true,
+      persistenceWrites: true,
+    },
+  ],
+  [
+    TELEGRAM_PROJECTION_QUEUE_NAME,
+    {
+      handle: handleTelegramProjectionQueue,
+      profileWrites: true,
+      persistenceWrites: true,
+    },
+  ],
+  [
+    "mons-link-telegram-delivery",
+    {
+      handle: handleTelegramQueue,
+      profileWrites: false,
+      persistenceWrites: false,
+    },
+  ],
+  [
+    WAGER_SETTLEMENT_QUEUE_NAME,
+    {
+      handle: handleWagerSettlementQueue,
+      profileWrites: false,
+      persistenceWrites: false,
+    },
+  ],
+]);
+
 async function handleQueue(
   batch: MessageBatch<unknown>,
   env: Env,
 ): Promise<void> {
+  const handler = queueHandlers.get(batch.queue);
+  if (!handler) {
+    console.error(
+      JSON.stringify({ event: "worker_queue_unsupported", queue: batch.queue }),
+    );
+    throw new Error("unsupported-queue");
+  }
   if (
-    (batch.queue === PROFILE_GAME_PROJECTION_QUEUE_NAME ||
-      batch.queue === EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME ||
-      batch.queue === TELEGRAM_PROJECTION_QUEUE_NAME) &&
+    handler.persistenceWrites &&
     (await readAutomatchRuntimeControl(env.PROFILE_GAMES_DB)).state === "frozen"
   ) {
     retryQueueMessages(batch);
     return;
   }
   if (
-    batch.queue === AUTH_RECOVERY_QUEUE_NAME ||
-    batch.queue === PROFILE_GAME_PROJECTION_QUEUE_NAME ||
-    batch.queue === EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME ||
-    batch.queue === TELEGRAM_PROJECTION_QUEUE_NAME
+    handler.profileWrites &&
+    !(await profileBackgroundMutationsEnabled(env))
   ) {
-    if (!(await profileBackgroundMutationsEnabled(env))) {
-      retryQueueMessages(batch);
-      return;
-    }
+    retryQueueMessages(batch);
+    return;
   }
-  if (batch.queue === AUTH_RECOVERY_QUEUE_NAME) {
-    return handleAuthRecoveryQueue(batch, env);
-  }
-  if (batch.queue === TELEGRAM_PROJECTION_QUEUE_NAME) {
-    return handleTelegramProjectionQueue(batch, env);
-  }
-  if (batch.queue === PROFILE_GAME_PROJECTION_QUEUE_NAME) {
-    return handleProfileGameProjectionQueue(batch, env);
-  }
-  if (batch.queue === EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME) {
-    return handleEventProfileGameProjectionQueue(batch, env);
-  }
-  if (batch.queue === WAGER_SETTLEMENT_QUEUE_NAME) {
-    return handleWagerSettlementQueue(batch, env);
-  }
-  return handleTelegramQueue(batch, env);
+  return handler.handle(batch, env);
 }
 
 export default {

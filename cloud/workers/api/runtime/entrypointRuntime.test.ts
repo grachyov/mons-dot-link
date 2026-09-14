@@ -6,7 +6,10 @@ import {
 } from "../src/eventProgressWorkflow.ts";
 import { EventPrizeWithdrawalWorkflow } from "../src/eventPrizeWithdrawalWorkflow.ts";
 import { AUTH_RECOVERY_QUEUE_NAME } from "../src/authRecovery.ts";
-import { PROFILE_GAME_PROJECTION_QUEUE_NAME } from "../src/profileGameProjectionTasks.ts";
+import {
+  EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME,
+  PROFILE_GAME_PROJECTION_QUEUE_NAME,
+} from "../src/profileGameProjectionTasks.ts";
 import { TELEGRAM_PROJECTION_QUEUE_NAME } from "../src/telegramProjectionTasks.ts";
 import { WAGER_SETTLEMENT_QUEUE_NAME } from "../src/wagerSettlementQueue.ts";
 import worker, { handleScheduled } from "../src/workerHandler.ts";
@@ -116,12 +119,134 @@ describe("Worker entrypoint", () => {
     for (const queue of [
       AUTH_RECOVERY_QUEUE_NAME,
       PROFILE_GAME_PROJECTION_QUEUE_NAME,
+      EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME,
       TELEGRAM_PROJECTION_QUEUE_NAME,
     ]) {
       const tracked = queueMessage({ kind: "task" });
       await worker.queue(queueBatch(queue, [tracked.message]), frozen);
       expect(tracked.acknowledgements(), queue).toBe(0);
       expect(tracked.retries, queue).toEqual([{ delaySeconds: 300 }]);
+    }
+  });
+
+  it("routes every configured Queue to its own message validator", async () => {
+    const logger = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    try {
+      for (const [queue, event] of [
+        [AUTH_RECOVERY_QUEUE_NAME, "auth_recovery_queue_invalid_message"],
+        [
+          PROFILE_GAME_PROJECTION_QUEUE_NAME,
+          "profile_game_projection_queue_invalid_message",
+        ],
+        [
+          EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME,
+          "event_profile_game_projection_queue_invalid_message",
+        ],
+        [
+          TELEGRAM_PROJECTION_QUEUE_NAME,
+          "telegram_projection_queue_invalid_message",
+        ],
+        ["mons-link-telegram-delivery", "telegram_queue_invalid_message"],
+        [WAGER_SETTLEMENT_QUEUE_NAME, "wager_settlement_queue_invalid_message"],
+      ]) {
+        const tracked = queueMessage({ kind: "invalid-task" });
+        await worker.queue(
+          queueBatch(queue, [tracked.message]),
+          TELEGRAM_TEST_ENV,
+        );
+        expect(tracked.acknowledgements(), queue).toBe(1);
+        expect(tracked.retries, queue).toEqual([]);
+        expect(logger).toHaveBeenLastCalledWith(expect.stringContaining(event));
+      }
+    } finally {
+      logger.mockRestore();
+    }
+  });
+
+  it("checks projection persistence controls before profile controls", async () => {
+    for (const state of ["frozen", "unreadable"] as const) {
+      for (const queue of [
+        PROFILE_GAME_PROJECTION_QUEUE_NAME,
+        EVENT_PROFILE_GAME_PROJECTION_QUEUE_NAME,
+        TELEGRAM_PROJECTION_QUEUE_NAME,
+      ]) {
+        const failure = new Error("persistence-control-unavailable");
+        const base = TELEGRAM_TEST_ENV.PROFILE_GAMES_DB;
+        const environment: Env = {
+          ...TELEGRAM_TEST_ENV,
+          PROFILE_GAMES_DB: {
+            ...base,
+            withSession: () => ({
+              batch: base.batch.bind(base),
+              getBookmark: () => null,
+              prepare(query) {
+                if (state === "unreadable") throw failure;
+                const statement = base.prepare(query);
+                const frozenStatement: D1PreparedStatement = {
+                  all: statement.all.bind(statement),
+                  raw: statement.raw.bind(statement),
+                  run: statement.run.bind(statement),
+                  bind: () => frozenStatement,
+                  first: async <T>() =>
+                    ({
+                      ...(await statement.first<Record<string, unknown>>()),
+                      state,
+                    }) as T,
+                };
+                return frozenStatement;
+              },
+            }),
+          },
+          get PROFILE_DB(): D1Database {
+            throw new Error("unexpected-profile-control-read");
+          },
+        };
+        const tracked = queueMessage({ kind: "invalid-task" });
+        const processing = worker.queue(
+          queueBatch(queue, [tracked.message]),
+          environment,
+        );
+        if (state === "unreadable") {
+          await expect(processing).rejects.toBe(failure);
+          expect(tracked.retries, queue).toEqual([]);
+        } else {
+          await processing;
+          expect(tracked.retries, queue).toEqual([{ delaySeconds: 300 }]);
+        }
+        expect(tracked.acknowledgements(), queue).toBe(0);
+      }
+    }
+  });
+
+  it("rejects unknown Queues without reading bindings or acknowledging messages", async () => {
+    const logger = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const tracked = queueMessage({ kind: "invalid-task" });
+    const environment = new Proxy({} as Env, {
+      get(_target, property) {
+        throw new Error(`unexpected-binding-access:${String(property)}`);
+      },
+    });
+    try {
+      await expect(
+        worker.queue(
+          queueBatch("unconfigured-queue", [tracked.message]),
+          environment,
+        ),
+      ).rejects.toThrow("unsupported-queue");
+      expect(tracked.acknowledgements()).toBe(0);
+      expect(tracked.retries).toEqual([]);
+      expect(logger).toHaveBeenCalledExactlyOnceWith(
+        JSON.stringify({
+          event: "worker_queue_unsupported",
+          queue: "unconfigured-queue",
+        }),
+      );
+    } finally {
+      logger.mockRestore();
     }
   });
 

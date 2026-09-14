@@ -3,8 +3,10 @@ import test from "node:test";
 import { MATCH_TIMER_TERMINAL, formatMatchTimer } from "@mons/shared/timers";
 import type { MatchTimerRecord } from "../src/matchTimer.ts";
 import {
+  buildMatchStateTimerStartCandidate,
   decideMatchStateTimerClaim,
   decideMatchStateTimerStartCommit,
+  prepareMatchStateTimerStart,
   type TimerPair,
 } from "../src/matchStateTimerPolicy.ts";
 import type { MatchStateClaimTimerRequest } from "../src/matchStateTypes.ts";
@@ -58,6 +60,41 @@ function timerPair(
     },
   };
 }
+
+test("timer start creates the current deadline for missing, older, or invalid timers", () => {
+  for (const timer of ["", formatMatchTimer(6, nowMs - 1000), "malformed"]) {
+    const current = timerPair({ timer });
+    const before = structuredClone(current);
+    const prepared = prepareMatchStateTimerStart(current);
+    assert.deepEqual(buildMatchStateTimerStartCandidate(prepared, nowMs), {
+      timer: formatMatchTimer(7, nowMs + 90_500),
+      turnNumber: 7,
+    });
+    assert.deepEqual(current, before);
+  }
+});
+
+test("timer start preserves an existing current-turn deadline when the clock advances", () => {
+  const current = timerPair({ timer: marker.timer });
+  const before = structuredClone(current);
+  const prepared = prepareMatchStateTimerStart(current);
+  assert.deepEqual(
+    buildMatchStateTimerStartCandidate(prepared, nowMs + 5000),
+    marker,
+  );
+  assert.deepEqual(current, before);
+});
+
+test("timer start rejects a stored timer ahead of the current turn", () => {
+  const current = timerPair({ timer: formatMatchTimer(8, nowMs) });
+  const before = structuredClone(current);
+  assert.throws(() => prepareMatchStateTimerStart(current), {
+    status: 409,
+    code: "failed-precondition",
+    message: "game state changed.",
+  });
+  assert.deepEqual(current, before);
+});
 
 test("timer start accepts concurrent timer changes and preserves non-timer fields", () => {
   const initial = timerPair();
@@ -136,16 +173,18 @@ test("timer decisions preserve terminal, history, then turn error precedence", (
   current.game.winner = "white";
   const start = () =>
     decideMatchStateTimerStartCommit(timerPair(), current, marker);
+  const prepare = () => prepareMatchStateTimerStart(current);
   const claim = () => decideMatchStateTimerClaim(current, request, nowMs);
-  for (const decide of [start, claim]) {
+  for (const decide of [prepare, start, claim]) {
     assert.throws(decide, { message: "game is already over." });
   }
   current.game.winner = undefined;
-  for (const decide of [start, claim]) {
+  for (const decide of [prepare, start, claim]) {
     assert.throws(decide, { message: "something is wrong with the moves." });
   }
   current.game.historyValid = true;
-  assert.throws(start, { message: "can't start a timer on your own turn." });
+  for (const decide of [prepare, start])
+    assert.throws(decide, { message: "can't start a timer on your own turn." });
   assert.throws(claim, {
     message: "can't claim timer victory on your own turn.",
   });

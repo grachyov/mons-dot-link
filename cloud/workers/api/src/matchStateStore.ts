@@ -8,15 +8,16 @@ import { parseInviteMatchIndex } from "@mons/shared/rematches";
 import {
   MATCH_TIMER_DURATION_MS,
   MATCH_TIMER_TERMINAL,
-  formatMatchTimer,
   isStartMatchTimerRequest,
-  parseStrictMatchTimer,
   type ClaimMatchVictoryByTimerResponse,
   type StartMatchTimerResponse,
 } from "@mons/shared/timers";
 import { AuthApiFailure } from "./authErrors.ts";
 import { isCanonicalLoginUid, isSafeRecordKey } from "./recordKeys.ts";
-import type { MatchTimerStartStore } from "./gameplayCoordinationD1.ts";
+import type {
+  MatchTimerStartCandidate,
+  MatchTimerStartStore,
+} from "./gameplayCoordinationD1.ts";
 import {
   LocalMatchTimerStore,
   parseNewMatchTimerStorage,
@@ -37,9 +38,10 @@ import {
   normalizeCreatedMatchState,
 } from "./matchStateLogic.ts";
 import {
-  assertTimerTurn,
+  buildMatchStateTimerStartCandidate,
   decideMatchStateTimerClaim,
   decideMatchStateTimerStartCommit,
+  prepareMatchStateTimerStart,
   timerTerminal,
   type TimerPair,
 } from "./matchStateTimerPolicy.ts";
@@ -486,26 +488,14 @@ export class MatchStateStore {
       );
       fail("game is already over.");
     }
-    assertTimerTurn(initial);
-    const stored = parseStrictMatchTimer(initial.player.timer);
-    if (stored && stored.turnNumber > initial.game.turnNumber)
-      fail("game state changed.");
+    const prepared = prepareMatchStateTimerStart(initial);
     const nowMs = this.now();
     validTimestamp(nowMs);
     const marker = await this.options.timerStarts.getOrAdvance(
       input.playerId,
       input.opponentId,
       input.matchId,
-      {
-        timer:
-          stored?.turnNumber === initial.game.turnNumber
-            ? initial.player.timer
-            : formatMatchTimer(
-                initial.game.turnNumber,
-                nowMs + MATCH_TIMER_DURATION_MS + 500,
-              ),
-        turnNumber: initial.game.turnNumber,
-      },
+      buildMatchStateTimerStartCandidate(prepared, nowMs),
       nowMs,
     );
     let terminal = false;
@@ -518,20 +508,7 @@ export class MatchStateStore {
         if (terminal) fail("game is already over.");
         const fresh = this.resolveTimerPair(freshSnapshot);
         terminal = timerTerminal(fresh);
-        const decision = decideMatchStateTimerStartCommit(
-          initial,
-          fresh,
-          marker,
-        );
-        if (decision.changed) {
-          this.putRecord(input.matchId, input.playerId, decision.playerMatch);
-          this.bump(input.matchId);
-        }
-        return {
-          ok: true,
-          timer: decision.timer,
-          duration: MATCH_TIMER_DURATION_MS,
-        };
+        return this.commitTimerStart(input, initial, fresh, marker);
       });
     } catch (error) {
       if (terminal) {
@@ -555,35 +532,32 @@ export class MatchStateStore {
     )
       fail("game is already over.");
     const current = this.resolveTimerPair(snapshot);
-    assertTimerTurn(current);
-    const stored = parseStrictMatchTimer(current.player.timer);
-    if (stored && stored.turnNumber > current.game.turnNumber)
-      fail("game state changed.");
+    const prepared = prepareMatchStateTimerStart(current);
     const nowMs = this.now();
     validTimestamp(nowMs);
     const marker = this.localTimers.getOrAdvance(
       input.matchId,
       input.playerId,
       input.opponentId,
-      {
-        timer:
-          stored?.turnNumber === current.game.turnNumber
-            ? current.player.timer
-            : formatMatchTimer(
-                current.game.turnNumber,
-                nowMs + MATCH_TIMER_DURATION_MS + 500,
-              ),
-        turnNumber: current.game.turnNumber,
-      },
+      buildMatchStateTimerStartCandidate(prepared, nowMs),
       nowMs,
     );
     if (
-      stored?.turnNumber === current.game.turnNumber &&
-      marker.turnNumber === stored.turnNumber &&
-      marker.timer !== current.player.timer
+      prepared.existingTimer !== null &&
+      marker.turnNumber === prepared.turnNumber &&
+      marker.timer !== prepared.existingTimer
     )
       unavailable("match-timer-storage-conflict");
-    const decision = decideMatchStateTimerStartCommit(current, current, marker);
+    return this.commitTimerStart(input, current, current, marker);
+  }
+
+  private commitTimerStart(
+    input: MatchStateStartTimerRequest,
+    initial: TimerPair,
+    fresh: TimerPair,
+    marker: MatchTimerStartCandidate,
+  ): StartMatchTimerResponse {
+    const decision = decideMatchStateTimerStartCommit(initial, fresh, marker);
     if (decision.changed) {
       this.putRecord(input.matchId, input.playerId, decision.playerMatch);
       this.bump(input.matchId);

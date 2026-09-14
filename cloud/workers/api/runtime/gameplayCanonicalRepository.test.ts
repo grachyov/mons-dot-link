@@ -19,7 +19,12 @@ import {
   readCanonicalLoginOwner,
   readCanonicalProfile,
   readCanonicalWagerSettlement,
+  CanonicalProfileConflict,
+  CanonicalProfileCorruption,
+  type CanonicalRatingUpdateValue,
 } from "../src/profileCanonicalD1.ts";
+import { ProfileWritesDisabledFailure } from "../src/authErrors.ts";
+import { observeD1FailureDatabase } from "./d1FailureTestUtils.ts";
 import { createProfileGameProjectionRuntime } from "../src/profileGameProjectionRepository.ts";
 import { createMiningRepository } from "../src/miningRepository.ts";
 import { getProfileGameProjection } from "../src/profileGamesD1.ts";
@@ -157,6 +162,61 @@ function profile(
     },
     ...overrides,
   };
+}
+
+async function insertProjectionRating(
+  operationId: string,
+  overrides: Partial<CanonicalRatingUpdateValue> = {},
+) {
+  const fields: Omit<CanonicalRatingUpdateValue, "operationId" | "payload"> = {
+    status: "done",
+    inviteId: "projection-invite",
+    matchId: "projection-match",
+    playerId: "projection-player",
+    opponentId: "projection-opponent",
+    playerProfileId: null,
+    opponentProfileId: null,
+    ownerUid: "projection-player",
+    ownerToken: "projection-owner",
+    startedAtMs: 1_000,
+    updatedAtMs: 2_000,
+    leaseExpiresAtMs: 2_000,
+    completedAtMs: 2_000,
+    eventProgressState: "pending",
+    eventProgressUpdatedAtMs: 2_000,
+    eventProgressVersion: 1,
+    profileGameProjectionState: "pending",
+    profileGameProjectionUpdatedAtMs: 2_000,
+    profileGameProjectionVersion: 1,
+    telegramProjectionState: "pending",
+    telegramProjectionUpdatedAtMs: 2_000,
+    telegramProjectionVersion: 1,
+  };
+  const value = {
+    operationId,
+    ...fields,
+    payload: { ...fields, retained: [null, { nested: "retained" }] },
+    ...overrides,
+  };
+  await commitCanonicalPlan(testEnv.PROFILE_DB, {
+    expectations: [{ kind: "rating-update-absent", operationId }],
+    mutations: [{ kind: "insert-rating-update", value }],
+  });
+  return value;
+}
+
+function projectionRatingRepository(db = testEnv.PROFILE_DB) {
+  return createCanonicalRatingRepository(
+    db,
+    createGameplayRepository(testEnv, {
+      stateClient: matchTestPort(state),
+    }),
+    {
+      createFailure: () => new Error("rating-unavailable"),
+      maxAttempts: 2,
+      now: () => 3_000,
+    },
+  );
 }
 
 async function insertProfile(
@@ -1360,6 +1420,278 @@ describe("canonical gameplay repositories", () => {
                   guestScore: playerIsHost ? expectedOpponent : expectedPlayer,
                 },
         });
+      }
+    },
+  );
+
+  it.each([
+    {
+      claim: "claimRatingEventProgress",
+      mark: "markRatingEventProgress",
+      prefix: "event_progress",
+      field: "eventProgress",
+    },
+    {
+      claim: "claimRatingProfileGameProjection",
+      mark: "markRatingProfileGameProjection",
+      prefix: "profile_game_projection",
+      field: "profileGameProjection",
+    },
+    {
+      claim: "claimRatingTelegramProjection",
+      mark: "markRatingTelegramProjection",
+      prefix: "telegram_projection",
+      field: "telegramProjection",
+    },
+  ] as const)(
+    "narrows $field writes while preserving the rating and other projections",
+    async ({ claim, mark, prefix, field }) => {
+      const operationId = `narrow-${prefix}`;
+      const initial = await insertProjectionRating(operationId);
+      const readRow = () =>
+        testEnv.PROFILE_DB.prepare(
+          "SELECT * FROM rating_updates WHERE operation_id = ?",
+        )
+          .bind(operationId)
+          .first<Record<string, unknown>>();
+      const original = await readRow();
+      const queries: string[] = [];
+      const db = beforeMatchingBatch(
+        testEnv.PROFILE_DB,
+        () => false,
+        async () => {},
+        (query) => queries.push(query),
+      );
+      const rating = projectionRatingRepository(db);
+      await expect(rating[claim](operationId, "1", 3_000)).resolves.toBe(true);
+      expect(await readRow()).toEqual({
+        ...original,
+        payload_json: JSON.stringify({
+          ...initial.payload,
+          [`${field}UpdatedAtMs`]: 3_000,
+        }),
+        [`${prefix}_updated_at_ms`]: 3_000,
+        revision: 2,
+      });
+      await rating[mark](operationId, "dead", 4_000, "  failed delivery  ");
+      expect(await readRow()).toEqual({
+        ...original,
+        payload_json: JSON.stringify({
+          ...initial.payload,
+          [`${field}State`]: "dead",
+          [`${field}UpdatedAtMs`]: 4_000,
+          [`${field}Reason`]: "failed delivery",
+        }),
+        [`${prefix}_state`]: "dead",
+        [`${prefix}_updated_at_ms`]: 4_000,
+        revision: 3,
+      });
+      await rating[mark](operationId, "done", 5_000, "  ");
+      expect(await readRow()).toEqual({
+        ...original,
+        payload_json: JSON.stringify({
+          ...initial.payload,
+          [`${field}State`]: "done",
+          [`${field}UpdatedAtMs`]: 5_000,
+          [`${field}Reason`]: null,
+        }),
+        [`${prefix}_state`]: "done",
+        [`${prefix}_updated_at_ms`]: 5_000,
+        revision: 4,
+      });
+      const updates = queries.filter((query) =>
+        /^\s*UPDATE rating_updates\b/.test(query),
+      );
+      expect(updates).toHaveLength(3);
+      for (const update of updates) {
+        const assignments = update.split("SET")[1].split("WHERE")[0];
+        expect(
+          assignments.split(",").map((value) => value.split("=")[0].trim()),
+        ).toEqual([
+          "payload_json",
+          `${prefix}_state`,
+          `${prefix}_updated_at_ms`,
+          `${prefix}_version`,
+          "revision",
+        ]);
+      }
+      expect(
+        queries.filter((query) =>
+          /^\s*SELECT \* FROM rating_updates\b/.test(query),
+        ),
+      ).toHaveLength(3);
+    },
+  );
+
+  it("keeps projection preflight misses and missing mark errors unchanged", async () => {
+    const operationId = "projection-preflight";
+    await insertProjectionRating(operationId);
+    const observed = observeD1FailureDatabase(testEnv.PROFILE_DB);
+    const rating = projectionRatingRepository(observed.database);
+    for (const revision of ["", "0", "01", "1.5", "9007199254740992", "2"]) {
+      await expect(
+        rating.claimRatingEventProgress(operationId, revision, 3_000),
+      ).resolves.toBe(false);
+    }
+    await expect(
+      rating.claimRatingEventProgress("missing", "1", 3_000),
+    ).resolves.toBe(false);
+    await expect(
+      rating.markRatingEventProgress("missing", "done", 3_000),
+    ).rejects.toThrow("rating-operation-missing");
+    expect(observed.batches).toHaveLength(0);
+  });
+
+  it.each(["claim", "mark"] as const)(
+    "preserves global revision conflicts during projection %s",
+    async (operation) => {
+      const operationId = `projection-revision-${operation}`;
+      await insertProjectionRating(operationId);
+      const observed = observeD1FailureDatabase(testEnv.PROFILE_DB, {
+        async beforeBatch(attempt) {
+          if (attempt !== 1) return;
+          await projectionRatingRepository().markRatingTelegramProjection(
+            operationId,
+            "done",
+            2_500,
+            "concurrent delivery",
+          );
+        },
+      });
+      const rating = projectionRatingRepository(observed.database);
+      if (operation === "claim") {
+        await expect(
+          rating.claimRatingEventProgress(operationId, "1", 3_000),
+        ).resolves.toBe(false);
+      } else {
+        await rating.markRatingEventProgress(operationId, "done", 3_000);
+      }
+      expect(observed.errors).toHaveLength(1);
+      expect(observed.batches).toHaveLength(operation === "claim" ? 1 : 2);
+      const row = await testEnv.PROFILE_DB.prepare(
+        "SELECT payload_json, revision FROM rating_updates WHERE operation_id = ?",
+      )
+        .bind(operationId)
+        .first<{ payload_json: string; revision: number }>();
+      expect(row?.revision).toBe(operation === "claim" ? 2 : 3);
+      expect(JSON.parse(row?.payload_json || "{}")).toMatchObject({
+        eventProgressState: operation === "claim" ? "pending" : "done",
+        eventProgressUpdatedAtMs: operation === "claim" ? 2_000 : 3_000,
+        telegramProjectionState: "done",
+        telegramProjectionUpdatedAtMs: 2_500,
+        telegramProjectionReason: "concurrent delivery",
+      });
+    },
+  );
+
+  it("exhausts projection mark retries without hiding revision conflicts", async () => {
+    const operationId = "projection-retry-limit";
+    await insertProjectionRating(operationId);
+    const observed = observeD1FailureDatabase(testEnv.PROFILE_DB, {
+      async beforeBatch() {
+        await testEnv.PROFILE_DB.prepare(
+          "UPDATE rating_updates SET revision = revision + 1 WHERE operation_id = ?",
+        )
+          .bind(operationId)
+          .run();
+      },
+    });
+    await expect(
+      projectionRatingRepository(observed.database).markRatingEventProgress(
+        operationId,
+        "done",
+        3_000,
+      ),
+    ).rejects.toBeInstanceOf(CanonicalProfileConflict);
+    expect(observed.batches).toHaveLength(2);
+    expect(
+      await projectionRatingRepository().readRatingUpdate(operationId),
+    ).toMatchObject({ eventProgressState: "pending" });
+  });
+
+  it.each(["normalization", "invalid payload"] as const)(
+    "preserves legacy projection %s through the full-write fallback",
+    async (mode) => {
+      const operationId = `projection-legacy-${mode}`;
+      const initial = await insertProjectionRating(operationId);
+      const payload = { ...initial.payload };
+      delete payload.telegramProjectionState;
+      if (mode === "invalid payload") delete payload.inviteId;
+      await testEnv.PROFILE_DB.prepare(
+        "UPDATE rating_updates SET payload_json = ? WHERE operation_id = ?",
+      )
+        .bind(JSON.stringify(payload), operationId)
+        .run();
+      const queries: string[] = [];
+      const db = beforeMatchingBatch(
+        testEnv.PROFILE_DB,
+        () => false,
+        async () => {},
+        (query) => queries.push(query),
+      );
+      const result = projectionRatingRepository(db).markRatingEventProgress(
+        operationId,
+        "done",
+        3_000,
+      );
+      if (mode === "invalid payload") {
+        await expect(result).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+      } else {
+        await result;
+      }
+      expect(
+        queries.find((query) => /^\s*UPDATE rating_updates\b/.test(query)),
+      ).toContain("invite_id = ?");
+      const row = await testEnv.PROFILE_DB.prepare(
+        "SELECT telegram_projection_state, event_progress_state, revision FROM rating_updates WHERE operation_id = ?",
+      )
+        .bind(operationId)
+        .first();
+      expect(row).toEqual(
+        mode === "invalid payload"
+          ? {
+              telegram_projection_state: "pending",
+              event_progress_state: "pending",
+              revision: 1,
+            }
+          : {
+              telegram_projection_state: null,
+              event_progress_state: "done",
+              revision: 2,
+            },
+      );
+    },
+  );
+
+  it.each(["claim", "mark"] as const)(
+    "retains frozen-control failures for projection %s",
+    async (operation) => {
+      const operationId = `projection-frozen-${operation}`;
+      await insertProjectionRating(operationId);
+      const observed = observeD1FailureDatabase(testEnv.PROFILE_DB, {
+        async beforeBatch() {
+          await testEnv.PROFILE_DB.prepare(
+            "UPDATE profile_canonical_control SET state = 'frozen' WHERE singleton = 1",
+          ).run();
+        },
+      });
+      const rating = projectionRatingRepository(observed.database);
+      try {
+        await expect(
+          operation === "claim"
+            ? rating.claimRatingEventProgress(operationId, "1", 3_000)
+            : rating.markRatingEventProgress(operationId, "done", 3_000),
+        ).rejects.toBeInstanceOf(ProfileWritesDisabledFailure);
+        expect(observed.batches).toHaveLength(1);
+        expect(observed.sessions).toEqual(["first-primary"]);
+        expect(await rating.readRatingUpdate(operationId)).toMatchObject({
+          eventProgressState: "pending",
+          eventProgressUpdatedAtMs: 2_000,
+        });
+      } finally {
+        await testEnv.PROFILE_DB.prepare(
+          "UPDATE profile_canonical_control SET state = 'active' WHERE singleton = 1",
+        ).run();
       }
     },
   );

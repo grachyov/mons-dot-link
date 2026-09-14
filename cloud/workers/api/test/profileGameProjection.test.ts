@@ -2524,14 +2524,20 @@ test("automatch recovery claims due outboxes, repairs poison, and preserves sour
 for (const kind of ["automatch", "event"] as const) {
   test(`${kind} recovery preserves repair and claim failure precedence after sending successful work`, async () => {
     const repairFailure = new Error("repair-unavailable");
+    const laterRepairFailure = new Error("later-repair-unavailable");
     const claimFailure = new Error("claim-unavailable");
     const queueFailure = new Error("queue-unavailable");
-    for (const failSend of [false, true]) {
+    for (const { failClaim, failSend } of [
+      { failClaim: false, failSend: false },
+      { failClaim: true, failSend: false },
+      { failClaim: true, failSend: true },
+    ]) {
       const batches: unknown[][] = [];
       const validRecord =
         kind === "automatch" ? automatchOutbox() : eventOutbox();
       const values = new Map<string, unknown>([
         ["broken-repair", "invalid"],
+        ["later-broken-repair", "invalid"],
         ["broken-claim", validRecord],
         ["valid", validRecord],
       ]);
@@ -2548,7 +2554,8 @@ for (const kind of ["automatch", "event"] as const) {
           const id = path.split("/").at(-1) || "";
           visited.push(id);
           if (id === "broken-repair") throw repairFailure;
-          if (id === "broken-claim") throw claimFailure;
+          if (id === "later-broken-repair") throw laterRepairFailure;
+          if (id === "broken-claim" && failClaim) throw claimFailure;
           return applyStateTransaction(values.get(id), updater);
         },
       });
@@ -2586,31 +2593,41 @@ for (const kind of ["automatch", "event"] as const) {
         ),
         (error) => {
           if (failSend) return error === queueFailure;
-          if (kind === "automatch") return error === claimFailure;
+          if (kind === "automatch")
+            return error === (failClaim ? claimFailure : repairFailure);
           assert.ok(error instanceof AggregateError);
           assert.equal(
             error.message,
             "event-profile-game-projection-sweep-failed",
           );
-          assert.deepEqual(error.errors, [repairFailure, claimFailure]);
+          assert.deepEqual(error.errors, [
+            repairFailure,
+            laterRepairFailure,
+            ...(failClaim ? [claimFailure] : []),
+          ]);
           return true;
         },
       );
-      assert.deepEqual(visited, ["broken-repair", "broken-claim", "valid"]);
+      assert.deepEqual(visited, [
+        "broken-repair",
+        "later-broken-repair",
+        "broken-claim",
+        "valid",
+      ]);
       assert.deepEqual(batches, [
-        [
+        [...(failClaim ? [] : ["broken-claim"]), "valid"].map((id) =>
           kind === "automatch"
             ? {
                 kind: "automatch-profile-game-projection",
-                inviteId: "valid",
+                inviteId: id,
                 requestId: validRecord.requestId,
               }
             : {
                 kind: "event-profile-game-projection",
-                eventId: "valid",
+                eventId: id,
                 requestId: validRecord.requestId,
               },
-        ],
+        ),
       ]);
     }
   });

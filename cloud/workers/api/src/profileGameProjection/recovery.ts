@@ -19,6 +19,7 @@ import { createProfileGameProjectionLockStore } from "../profileGameProjectionLo
 import { createProfileLinkCatchupStore } from "../profileLinkCatchupD1.ts";
 import {
   claimAndEnqueueProjectionTasks,
+  collectProjectionRepairs,
   sendQueueTasks,
 } from "../projectionSweep.ts";
 import {
@@ -439,29 +440,16 @@ export async function sweepAutomatchProfileGameProjections(
   const invalidInviteIds = entries.flatMap((entry) =>
     entry.kind === "invalid" ? [entry.inviteId] : [],
   );
-  let invalidFailure: Error | null = null;
-  const repairedTasks: AutomatchProfileGameProjectionTask[] = [];
-  let invalidRemoved = 0;
-  for (const inviteId of invalidInviteIds) {
-    try {
-      const result = await repairInvalidAutomatchSweepEntry(
-        state,
-        inviteId,
-        nowMs,
-        createRequestId,
-      );
-      if (result.kind === "repaired") {
-        repairedTasks.push(result.task);
-      } else if (result.kind === "removed") {
-        invalidRemoved++;
-      }
-    } catch (error) {
-      invalidFailure ||=
-        error instanceof Error
-          ? error
-          : new Error("profile-game-projection-invalid-record-failed");
-    }
-  }
+  const {
+    repairedTasks,
+    removedCount: invalidRemoved,
+    failures: repairFailures,
+  } = await collectProjectionRepairs(
+    invalidInviteIds,
+    (inviteId) =>
+      repairInvalidAutomatchSweepEntry(state, inviteId, nowMs, createRequestId),
+    "profile-game-projection-invalid-record-failed",
+  );
   if (repairedTasks.length > 0 || invalidRemoved > 0) {
     logger.error(
       JSON.stringify({
@@ -485,8 +473,8 @@ export async function sweepAutomatchProfileGameProjections(
   if (claimFailure) {
     throw claimFailure;
   }
-  if (invalidFailure) {
-    throw invalidFailure;
+  if (repairFailures.length > 0) {
+    throw repairFailures[0];
   }
   return sentCount;
 }
@@ -519,30 +507,16 @@ export async function sweepEventProfileGameProjections(
       ),
     ),
   );
-  const failures: Error[] = [];
-  const repairedTasks: EventProfileGameProjectionTask[] = [];
-  let invalidRemoved = 0;
-  for (const eventId of invalidEventIds) {
-    try {
-      const result = await repairInvalidEventSweepEntry(
-        state,
-        eventId,
-        nowMs,
-        createRequestId,
-      );
-      if (result.kind === "repaired") {
-        repairedTasks.push(result.task);
-      } else if (result.kind === "removed") {
-        invalidRemoved += 1;
-      }
-    } catch (error) {
-      failures.push(
-        error instanceof Error
-          ? error
-          : new Error("event-profile-game-invalid-record-failed"),
-      );
-    }
-  }
+  const {
+    repairedTasks,
+    removedCount: invalidRemoved,
+    failures,
+  } = await collectProjectionRepairs(
+    invalidEventIds,
+    (eventId) =>
+      repairInvalidEventSweepEntry(state, eventId, nowMs, createRequestId),
+    "event-profile-game-invalid-record-failed",
+  );
   if (repairedTasks.length > 0 || invalidRemoved > 0) {
     logger.error(
       JSON.stringify({

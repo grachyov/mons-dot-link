@@ -9,6 +9,38 @@ export async function sendQueueTasks<T>(
   }
 }
 
+type ProjectionRepairResult<Task> =
+  { kind: "changed" } | { kind: "removed" } | { kind: "repaired"; task: Task };
+
+export async function collectProjectionRepairs<Entry, Task = never>(
+  entries: readonly Entry[],
+  repair: (entry: Entry) => Promise<ProjectionRepairResult<Task> | void>,
+  fallbackErrorMessage: string,
+): Promise<{
+  repairedTasks: Task[];
+  removedCount: number;
+  failures: Error[];
+}> {
+  const repairedTasks: Task[] = [];
+  let removedCount = 0;
+  const failures: Error[] = [];
+  for (const entry of entries) {
+    try {
+      const result = await repair(entry);
+      if (result?.kind === "repaired") {
+        repairedTasks.push(result.task);
+      } else if (result?.kind === "removed") {
+        removedCount += 1;
+      }
+    } catch (error) {
+      failures.push(
+        error instanceof Error ? error : new Error(fallbackErrorMessage),
+      );
+    }
+  }
+  return { repairedTasks, removedCount, failures };
+}
+
 export async function collectSuccessfulClaims<T>(
   items: readonly T[],
   claim: (item: T) => Promise<boolean>,

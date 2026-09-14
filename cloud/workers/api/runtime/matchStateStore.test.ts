@@ -341,11 +341,13 @@ describe("canonical match state storage", () => {
     await runInDurableObject(room, async (_instance, ctx) => {
       let store: MatchStateStore;
       const markerStore = timers();
+      const deletePair = vi.fn(markerStore.deletePair);
       store = new MatchStateStore(
         ctx.storage,
         options({
           timerStarts: {
             ...markerStore,
+            deletePair,
             async getOrAdvance(...args) {
               const marker = await markerStore.getOrAdvance(...args);
               store.surrender({
@@ -365,6 +367,73 @@ describe("canonical match state storage", () => {
       );
       expect(store.readPair(input).playerMatch?.timer).toBe("");
       expect(store.readPair(input).opponentMatch?.status).toBe("surrendered");
+      expect(deletePair).toHaveBeenCalledExactlyOnceWith(
+        input.playerId,
+        input.opponentId,
+        input.matchId,
+      );
+    });
+  });
+
+  it("preserves the D1 marker and canonical state when a takeback precedes a timer restart", async () => {
+    const { room, input, records } = fixture();
+    await runInDurableObject(room, async (_instance, ctx) => {
+      let now = future;
+      const markerStore = timers();
+      const store = new MatchStateStore(
+        ctx.storage,
+        options({
+          timerStarts: markerStore,
+          now: () => now,
+          resolveGame: (player) => ({
+            ...game,
+            turnNumber: player.flatMovesString === "a" ? 9 : 7,
+          }),
+        }),
+      );
+      store.createRecords({ ...input, records });
+      const first = await store.startTimer(input);
+      store.move(move(input));
+      now += 10_000;
+      const advanced = await store.startTimer(input);
+      expect(advanced.timer).toBe(formatMatchTimer(9, now + 90_500));
+      const savedMarker = {
+        timer: advanced.timer,
+        turnNumber: 9,
+        updatedAtMs: now,
+      };
+      store.move(
+        move(input, {
+          previousFlatMovesString: "a",
+          flatMovesString: "a-takeback",
+          fen: "initial",
+        }),
+      );
+      now += 10_000;
+      const before = store.readPair(input);
+      await expect(store.startTimer(input)).rejects.toThrow(
+        "game state changed.",
+      );
+      expect(store.readPair(input)).toEqual(before);
+      ctx.storage.sql.exec(
+        "UPDATE match_state_records SET value_json = json_set(value_json, '$.timer', '') WHERE match_id = ? AND player_id = ?",
+        input.matchId,
+        input.playerId,
+      );
+      const withoutTimer = store.readPair(input);
+      await expect(store.startTimer(input)).rejects.toThrow(
+        "game state changed.",
+      );
+      expect(store.readPair(input)).toEqual(withoutTimer);
+      expect(
+        await markerStore.getOrAdvance(
+          input.playerId,
+          input.opponentId,
+          input.matchId,
+          { timer: first.timer, turnNumber: 7 },
+          now,
+        ),
+      ).toEqual(savedMarker);
     });
   });
 

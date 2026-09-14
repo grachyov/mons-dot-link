@@ -704,74 +704,105 @@ test("recovery takes current records and reports scan failures", async () => {
   ]);
 });
 
-test("recovery sends successful claims before reporting claim failures", async () => {
-  const batches: TelegramProjectionTask[][] = [];
-  const env = {
-    ...PROJECTION_TEST_ENV,
-    TELEGRAM_PROJECTION_QUEUE: {
-      ...PROJECTION_TEST_ENV.TELEGRAM_PROJECTION_QUEUE,
-      sendBatch: async (messages: Iterable<MessageSendRequest<unknown>>) => {
-        batches.push(
-          Array.from(messages).map(
-            ({ body }) => body as TelegramProjectionTask,
-          ),
-        );
-        return {
-          metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
-        };
+test("recovery preserves repair and claim failure precedence after sending successful work", async () => {
+  for (const { failClaim, failSend } of [
+    { failClaim: false, failSend: false },
+    { failClaim: true, failSend: false },
+    { failClaim: true, failSend: true },
+  ]) {
+    const batches: TelegramProjectionTask[][] = [];
+    const env = {
+      ...PROJECTION_TEST_ENV,
+      TELEGRAM_PROJECTION_QUEUE: {
+        ...PROJECTION_TEST_ENV.TELEGRAM_PROJECTION_QUEUE,
+        sendBatch: async (messages: Iterable<MessageSendRequest<unknown>>) => {
+          batches.push(
+            Array.from(messages).map(
+              ({ body }) => body as TelegramProjectionTask,
+            ),
+          );
+          if (failSend) throw new Error("queue-failed");
+          return {
+            metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+          };
+        },
       },
-    },
-  } satisfies Env;
-  const marker = {
-    schemaVersion: 1,
-    status: "pending",
-    requestId: "request-1",
-    updatedAtMs: 100,
-  };
-  const store = memoryState({
-    "telegramProjectionOutbox/automatch/auto_bad": marker,
-    "telegramProjectionOutbox/automatch/auto_good": marker,
-  });
-  const getPath = store.client.getPath;
-  store.client.getPath = async (path, query) =>
-    path === "telegramProjectionOutbox/automatch"
-      ? { auto_bad: marker, auto_good: marker }
-      : getPath(path, query);
-  const transactPath = store.client.transactPath;
-  store.client.transactPath = async (path, updater, signal) => {
-    if (path.endsWith("/auto_bad")) {
-      throw new Error("claim-failed");
-    }
-    return transactPath(path, updater, signal);
-  };
-  const logs: string[] = [];
-  await assert.rejects(
-    () =>
-      sweepTelegramProjections(env, {
-        createStateRepository: () => store.client,
-        createRating: () => ratingRepository(null, []),
-        logger: { error: (message) => logs.push(message), info() {} },
-        now: () => 600_000,
-      }),
-    /telegram-projection-sweep-failed/,
-  );
-  assert.deepEqual(batches.flat(), [
-    {
-      kind: "automatch-telegram-projection",
-      inviteId: "auto_good",
+    } satisfies Env;
+    const marker = {
+      schemaVersion: 1,
+      status: "pending",
       requestId: "request-1",
-    },
-  ]);
-  assert.equal(
-    (
-      store.read("telegramProjectionOutbox/automatch/auto_good") as {
-        updatedAtMs: number;
-      }
-    ).updatedAtMs,
-    600_000,
-  );
-  assert.equal(logs.length, 1);
-  assert.match(logs[0], /claim-failed/);
+      updatedAtMs: 100,
+    };
+    const records = {
+      auto_broken_repair: { ...marker, requestId: 1 },
+      auto_bad: marker,
+      auto_later_broken_repair: { ...marker, requestId: 1 },
+      auto_good: marker,
+    };
+    const store = memoryState(
+      Object.fromEntries(
+        Object.entries(records).map(([id, record]) => [
+          `telegramProjectionOutbox/automatch/${id}`,
+          record,
+        ]),
+      ),
+    );
+    const getPath = store.client.getPath;
+    store.client.getPath = async (path, query) =>
+      path === "telegramProjectionOutbox/automatch"
+        ? records
+        : getPath(path, query);
+    const visited: string[] = [];
+    const transactPath = store.client.transactPath;
+    store.client.transactPath = async (path, updater, signal) => {
+      const id = path.split("/").at(-1) || "";
+      visited.push(id);
+      if (id === "auto_broken_repair") throw new Error("repair-failed");
+      if (id === "auto_later_broken_repair")
+        throw new Error("later-repair-failed");
+      if (id === "auto_bad" && failClaim) throw new Error("claim-failed");
+      return transactPath(path, updater, signal);
+    };
+    const logs: string[] = [];
+    await assert.rejects(
+      () =>
+        sweepTelegramProjections(env, {
+          createStateRepository: () => store.client,
+          createRating: () => ratingRepository(null, []),
+          logger: { error: (message) => logs.push(message), info() {} },
+          now: () => 600_000,
+        }),
+      /telegram-projection-sweep-failed/,
+    );
+    assert.deepEqual(visited, [
+      "auto_broken_repair",
+      "auto_later_broken_repair",
+      "auto_bad",
+      "auto_good",
+    ]);
+    assert.deepEqual(
+      batches.flat(),
+      [...(failClaim ? [] : ["auto_bad"]), "auto_good"].map((inviteId) => ({
+        kind: "automatch-telegram-projection",
+        inviteId,
+        requestId: "request-1",
+      })),
+    );
+    assert.equal(
+      (
+        store.read("telegramProjectionOutbox/automatch/auto_good") as {
+          updatedAtMs: number;
+        }
+      ).updatedAtMs,
+      600_000,
+    );
+    assert.equal(logs.length, 1);
+    assert.equal(
+      JSON.parse(logs[0]).code,
+      failSend ? "queue-failed" : failClaim ? "claim-failed" : "repair-failed",
+    );
+  }
 });
 
 test("recovery removes malformed markers from the timestamp index", async () => {

@@ -50,6 +50,7 @@ import {
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
 import {
   claimAndEnqueueProjectionTasks,
+  collectProjectionRepairs,
   sendQueueTasks,
 } from "./projectionSweep.ts";
 import {
@@ -559,17 +560,11 @@ async function sweepAutomatchProjections(
     const invalidInviteIds = entries.flatMap((entry) =>
       entry.kind === "invalid" ? [entry.inviteId] : [],
     );
-    let invalidFailure: Error | null = null;
-    for (const inviteId of invalidInviteIds) {
-      try {
-        await markInvalidAutomatchSweepEntry(state, inviteId, nowMs);
-      } catch (error) {
-        invalidFailure ||=
-          error instanceof Error
-            ? error
-            : new Error("projection-invalid-record-failed");
-      }
-    }
+    const { failures: repairFailures } = await collectProjectionRepairs(
+      invalidInviteIds,
+      (inviteId) => markInvalidAutomatchSweepEntry(state, inviteId, nowMs),
+      "projection-invalid-record-failed",
+    );
     const { sentCount, claimFailure } = await claimAndEnqueueProjectionTasks({
       candidates,
       claim: (candidate) =>
@@ -581,8 +576,8 @@ async function sweepAutomatchProjections(
     if (claimFailure) {
       throw claimFailure;
     }
-    if (invalidFailure) {
-      throw invalidFailure;
+    if (repairFailures.length > 0) {
+      throw repairFailures[0];
     }
     return sentCount;
   } catch (error) {

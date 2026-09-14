@@ -190,6 +190,9 @@ export type CanonicalRatingUpdateSnapshot = CanonicalRatingUpdateValue & {
   revision: number;
 };
 
+export type CanonicalRatingProjectionKind =
+  "event-progress" | "profile-game" | "telegram";
+
 export type CanonicalWagerSettlement = {
   appliedAtMs: number;
   count: number;
@@ -592,6 +595,11 @@ export type CanonicalMutation =
   | { kind: "delete-auth-recovery"; profileId: string }
   | { kind: "insert-rating-update"; value: CanonicalRatingUpdateValue }
   | { kind: "update-rating-update"; value: CanonicalRatingUpdateValue }
+  | {
+      kind: "update-rating-projection";
+      projection: CanonicalRatingProjectionKind;
+      value: CanonicalRatingUpdateValue;
+    }
   | { kind: "delete-rating-update"; operationId: string }
   | { kind: "insert-wager-settlement"; value: CanonicalWagerSettlement };
 

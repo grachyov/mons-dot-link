@@ -1,5 +1,7 @@
 import {
+  MATCH_TIMER_DURATION_MS,
   MATCH_TIMER_TERMINAL,
+  formatMatchTimer,
   parseStrictMatchTimer,
 } from "@mons/shared/timers";
 import { AuthApiFailure } from "./authErrors.ts";
@@ -20,6 +22,11 @@ export type TimerPair = {
   player: MatchTimerRecord;
   opponent: MatchTimerRecord;
   game: MatchTimerGameState;
+};
+
+export type MatchStateTimerStartPreparation = {
+  turnNumber: number;
+  existingTimer: string | null;
 };
 
 function fail(message: string): never {
@@ -58,6 +65,35 @@ export function assertTimerTurn(pair: TimerPair, claim = false): void {
         : "can't start a timer on your own turn.",
     );
   }
+}
+
+export function prepareMatchStateTimerStart(
+  pair: TimerPair,
+): MatchStateTimerStartPreparation {
+  assertTimerTurn(pair);
+  const stored = parseStrictMatchTimer(pair.player.timer);
+  if (stored && stored.turnNumber > pair.game.turnNumber)
+    fail("game state changed.");
+  return {
+    turnNumber: pair.game.turnNumber,
+    existingTimer:
+      stored?.turnNumber === pair.game.turnNumber ? pair.player.timer : null,
+  };
+}
+
+export function buildMatchStateTimerStartCandidate(
+  prepared: MatchStateTimerStartPreparation,
+  nowMs: number,
+): MatchTimerStartCandidate {
+  return {
+    timer:
+      prepared.existingTimer ??
+      formatMatchTimer(
+        prepared.turnNumber,
+        nowMs + MATCH_TIMER_DURATION_MS + 500,
+      ),
+    turnNumber: prepared.turnNumber,
+  };
 }
 
 export function decideMatchStateTimerStartCommit(
