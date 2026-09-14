@@ -68,6 +68,7 @@ import {
   socketSessionCurrent,
   SocketSessions,
 } from "./socketSession.ts";
+import { socketCapacityFull } from "./socketCapacity.ts";
 
 export type {
   MatchPresentationSeeds,
@@ -79,6 +80,12 @@ export const MAX_INVITE_REACTION_SPECTATORS = 248;
 export const MAX_INVITE_REACTION_SPECTATORS_PER_IP = 8;
 export const MAX_INVITE_REACTION_SOCKETS_PER_PARTICIPANT = 4;
 export const MAX_INVITE_ROOM_SOCKETS = 512;
+const INVITE_CHANNEL_SOCKET_LIMITS = {
+  sockets: MAX_INVITE_REACTION_SOCKETS,
+  spectators: MAX_INVITE_REACTION_SPECTATORS,
+  spectatorsPerIp: MAX_INVITE_REACTION_SPECTATORS_PER_IP,
+  socketsPerParticipant: MAX_INVITE_REACTION_SOCKETS_PER_PARTICIPANT,
+};
 const PARTICIPANT_SOCKET_TAGS = [
   "role:host",
   "role:guest",
@@ -138,12 +145,7 @@ export class InviteReactions
       scheduleAlarm: (atMs) => this.scheduleInviteAlarm(atMs),
       capacityFull: (role) => this.roomCapacityFull(role),
       socketSessions: this.socketSessions,
-      limits: {
-        sockets: MAX_INVITE_REACTION_SOCKETS,
-        spectators: MAX_INVITE_REACTION_SPECTATORS,
-        spectatorsPerIp: MAX_INVITE_REACTION_SPECTATORS_PER_IP,
-        socketsPerParticipant: MAX_INVITE_REACTION_SOCKETS_PER_PARTICIPANT,
-      },
+      limits: INVITE_CHANNEL_SOCKET_LIMITS,
     });
     this.presentations = new MatchPresentationStore(ctx.storage, {
       pinInvite: (inviteId) => this.inviteChannels.pinInvite(inviteId),
@@ -280,11 +282,16 @@ export class InviteReactions
     const ipCount = this.ctx.getWebSockets(`spectator-ip:${ip}`).length;
     if (
       this.roomCapacityFull(role) ||
-      reactionSockets.length >= MAX_INVITE_REACTION_SOCKETS ||
-      (role === "spectator"
-        ? spectatorCount >= MAX_INVITE_REACTION_SPECTATORS ||
-          ipCount >= MAX_INVITE_REACTION_SPECTATORS_PER_IP
-        : roleCount(role) >= MAX_INVITE_REACTION_SOCKETS_PER_PARTICIPANT)
+      socketCapacityFull(
+        role,
+        {
+          sockets: reactionSockets.length,
+          spectators: spectatorCount,
+          spectatorsPerIp: ipCount,
+          socketsForRole: roleCount(role),
+        },
+        INVITE_CHANNEL_SOCKET_LIMITS,
+      )
     ) {
       return new Response("Reaction room is full", {
         status: 429,
@@ -606,15 +613,16 @@ export class InviteReactions
   private matchRoomFull(role: string, ip: string): boolean {
     return (
       this.roomCapacityFull(role) ||
-      this.ctx.getWebSockets("channel:matches").length >=
-        MAX_INVITE_REACTION_SOCKETS ||
-      (role === "spectator"
-        ? this.ctx.getWebSockets("match-role:spectator").length >=
-            MAX_INVITE_REACTION_SPECTATORS ||
-          this.ctx.getWebSockets(`match-ip:${ip}`).length >=
-            MAX_INVITE_REACTION_SPECTATORS_PER_IP
-        : this.ctx.getWebSockets(`match-role:${role}`).length >=
-          MAX_INVITE_REACTION_SOCKETS_PER_PARTICIPANT)
+      socketCapacityFull(
+        role,
+        {
+          sockets: this.ctx.getWebSockets("channel:matches").length,
+          spectators: this.ctx.getWebSockets("match-role:spectator").length,
+          spectatorsPerIp: this.ctx.getWebSockets(`match-ip:${ip}`).length,
+          socketsForRole: this.ctx.getWebSockets(`match-role:${role}`).length,
+        },
+        INVITE_CHANNEL_SOCKET_LIMITS,
+      )
     );
   }
 

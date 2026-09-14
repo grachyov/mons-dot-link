@@ -13,7 +13,7 @@ import {
   parseCanonicalRatingUpdateRow,
   readCanonicalProfileOwnershipSnapshot,
   readCanonicalRatingUpdate,
-  readCanonicalProfileAggregateSnapshot,
+  readCanonicalProfileAggregateSnapshots,
   readCanonicalWagerSettlement,
   resolveCanonicalProfile,
   CanonicalProfileConflict,
@@ -985,10 +985,10 @@ export function createCanonicalRatingRepository(
         ) {
           return;
         }
-        const [player, opponent] = await Promise.all([
-          readCanonicalProfileAggregateSnapshot(db, resolvedPlayerProfileId),
-          readCanonicalProfileAggregateSnapshot(db, resolvedOpponentProfileId),
-        ]);
+        const [player, opponent] = await readCanonicalProfileAggregateSnapshots(
+          db,
+          [resolvedPlayerProfileId, resolvedOpponentProfileId],
+        );
         if (
           player.profile?.state !== "active" ||
           player.profile.profileId !== resolvedPlayerProfileId ||

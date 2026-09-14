@@ -255,9 +255,11 @@ test("durably defers pending and unclaimed wagers while writes are disabled", as
   for (const status of ["pending", "unclaimed"] as const) {
     const queued = queueMessage(recoverableWagerTask);
     const deferred: Array<{ body: unknown; options?: QueueSendOptions }> = [];
+    const logs: unknown[] = [];
     await handleWagerSettlementQueueMessage(
       queued.message,
       envWithQueue(async (body, options) => {
+        assert.equal(queued.acknowledgements(), 0);
         deferred.push({ body, options });
         return {
           metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
@@ -266,7 +268,14 @@ test("durably defers pending and unclaimed wagers while writes are disabled", as
       {
         classifySettlement: async () => status,
         createGameplay: () => unusedGameplayRepository,
-        logger: { error() {}, info() {} },
+        logger: {
+          error() {
+            assert.fail("unexpected deferral failure");
+          },
+          info(entry: string) {
+            logs.push(JSON.parse(entry));
+          },
+        },
         profileMutationsEnabled: async () => false,
       },
     );
@@ -276,6 +285,15 @@ test("durably defers pending and unclaimed wagers while writes are disabled", as
       {
         body: recoverableWagerTask,
         options: { delaySeconds: WAGER_SETTLEMENT_RETRY_DELAY_SECONDS },
+      },
+    ]);
+    assert.deepEqual(logs, [
+      {
+        event: "wager_settlement_queue_deferred",
+        operationId: recoverableWagerTask.operationId,
+        reason: "profile-writes-disabled",
+        messageId: queued.message.id,
+        attempts: 1,
       },
     ]);
   }

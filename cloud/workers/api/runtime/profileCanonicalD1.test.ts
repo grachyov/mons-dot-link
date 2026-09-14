@@ -10,15 +10,16 @@ import {
   CanonicalProfileConflict,
   CanonicalProfileCorruption,
   commitCanonicalPlan,
-  countCanonicalCommitStatements,
   materializeCanonicalProfile,
   readCanonicalAuthRecoveryJob,
   readCanonicalLeaderboard,
   readCanonicalMergeTarget,
   readCanonicalProfile,
   readCanonicalProfileAggregate,
+  readCanonicalProfileAggregates,
   readCanonicalProfileAggregateByLogin,
   readCanonicalProfileAggregateSnapshot,
+  readCanonicalProfileAggregateSnapshots,
   readCanonicalProfileOwnershipSnapshot,
   readCanonicalPublicProfileByLogin,
   readCanonicalRatingUpdate,
@@ -26,6 +27,7 @@ import {
   resolveCanonicalProfile,
   resolveCanonicalPublicProfile,
   type CanonicalAuthRecoveryValue,
+  type CanonicalCommitPlan,
   type CanonicalExpectation,
   type CanonicalMutation,
   type CanonicalProfileValue,
@@ -276,6 +278,73 @@ describe("canonical profile D1 store", () => {
   beforeEach(async () => {
     await resetCanonicalRows(testEnv.PROFILE_DB);
   });
+
+  it("enforces the actual statement budget before executing any writes", async () => {
+    const value = profileValue("canonical-budget-profile");
+    const loginUid = "canonical-budget-login";
+    const plan: CanonicalCommitPlan = {
+      expectations: [
+        { kind: "profile-absent", profileId: value.profile.id },
+        { kind: "login-owner-absent", loginUid },
+      ],
+      mutations: [
+        { kind: "insert-active-profile", value },
+        {
+          kind: "insert-login-owner",
+          value: {
+            loginUid,
+            profileId: value.profile.id,
+            createdAtMs: 1_000,
+            updatedAtMs: 1_000,
+          },
+        },
+      ],
+    };
+    const observed = observeAggregateDatabase();
+    await expect(
+      commitCanonicalPlan(observed.database, plan, { maxStatements: 6 }),
+    ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+    expect(observed.batches).toHaveLength(0);
+    expect(
+      await readCanonicalProfile(testEnv.PROFILE_DB, value.profile.id),
+    ).toBeNull();
+
+    await commitCanonicalPlan(observed.database, plan, { maxStatements: 7 });
+    expect(observed.batches.map((queries) => queries.length)).toEqual([7]);
+    const aggregate = await readCanonicalProfileAggregate(
+      testEnv.PROFILE_DB,
+      value.profile.id,
+    );
+    expect(aggregate.profile?.revision).toBe(1);
+    expect(aggregate.loginOwners.map((owner) => owner.loginUid)).toEqual([
+      loginUid,
+    ]);
+  });
+
+  it("allows an empty plan with a zero statement budget", async () => {
+    const observed = observeAggregateDatabase();
+    await commitCanonicalPlan(
+      observed.database,
+      { expectations: [], mutations: [] },
+      { maxStatements: 0 },
+    );
+    expect(observed.batches).toHaveLength(0);
+  });
+
+  it.each([-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects an invalid statement budget %s before calling D1",
+    async (maxStatements) => {
+      const observed = observeAggregateDatabase();
+      await expect(
+        commitCanonicalPlan(
+          observed.database,
+          { expectations: [], mutations: [] },
+          { maxStatements },
+        ),
+      ).rejects.toThrow("invalid-canonical-commit-budget");
+      expect(observed.batches).toHaveLength(0);
+    },
+  );
 
   describe("commit failure classification", () => {
     it("uses the runtime guard signature without diagnostic reads on success or conflict", async () => {
@@ -1996,7 +2065,6 @@ describe("canonical profile D1 store", () => {
         },
       ],
     };
-    expect(countCanonicalCommitStatements(plan)).toBe(6);
     await expect(
       commitCanonicalPlan(testEnv.PROFILE_DB, {
         expectations: [
@@ -2178,6 +2246,98 @@ describe("canonical profile D1 store", () => {
       (await readCanonicalProfile(testEnv.PROFILE_DB, value.profile.id))
         ?.revision,
     ).toBe(2);
+  });
+
+  it("reads aggregate groups in input order, including duplicates and missing profiles", async () => {
+    const first = profileValue("bulk-aggregate-first");
+    const second = profileValue("bulk-aggregate-second");
+    await commitCanonicalPlan(testEnv.PROFILE_DB, {
+      expectations: [first, second].map((value) => ({
+        kind: "profile-absent",
+        profileId: value.profile.id,
+      })),
+      mutations: [first, second].map((value) => ({
+        kind: "insert-active-profile",
+        value,
+      })),
+    });
+    const observed = observeAggregateDatabase();
+    const aggregates = await readCanonicalProfileAggregates(observed.database, [
+      second.profile.id,
+      "missing-bulk-profile",
+      first.profile.id,
+      second.profile.id,
+    ]);
+    expect(
+      aggregates.map((aggregate) => aggregate.profile?.profileId ?? null),
+    ).toEqual([second.profile.id, null, first.profile.id, second.profile.id]);
+    expect(aggregates[0]).toEqual(aggregates[3]);
+    expect(aggregates[0]).not.toBe(aggregates[3]);
+    expect(observed.batches.map((queries) => queries.length)).toEqual([24]);
+
+    const checked = observeAggregateDatabase();
+    await expect(
+      readCanonicalProfileAggregateSnapshots(checked.database, [
+        second.profile.id,
+        first.profile.id,
+      ]),
+    ).resolves.toEqual([aggregates[0], aggregates[2]]);
+    expect(checked.batches.map((queries) => queries.length)).toEqual([12]);
+  });
+
+  it("skips D1 for empty raw and checked aggregate groups", async () => {
+    const observed = observeAggregateDatabase();
+    await expect(
+      readCanonicalProfileAggregates(observed.database, []),
+    ).resolves.toEqual([]);
+    await expect(
+      readCanonicalProfileAggregateSnapshots(observed.database, []),
+    ).resolves.toEqual([]);
+    expect(observed.batches).toHaveLength(0);
+  });
+
+  it("checks every aggregate topology only in the checked bulk reader", async () => {
+    const first = profileValue("bulk-topology-first");
+    const second = profileValue("bulk-topology-second");
+    await commitCanonicalPlan(testEnv.PROFILE_DB, {
+      expectations: [first, second].map((value) => ({
+        kind: "profile-absent",
+        profileId: value.profile.id,
+      })),
+      mutations: [first, second].map((value) => ({
+        kind: "insert-active-profile",
+        value,
+      })),
+    });
+    const observed = observeAggregateDatabase({
+      mapResults: (_queries, results) =>
+        results.map((result) => ({
+          ...result,
+          results: result.results.map((row) =>
+            row.profile_id === second.profile.id && "payload_json" in row
+              ? {
+                  ...row,
+                  state: "retiring",
+                  merged_into_profile_id: first.profile.id,
+                  merged_at_ms: 2_000,
+                }
+              : row,
+          ),
+        })),
+    });
+    const profileIds = [first.profile.id, second.profile.id];
+    const raw = await readCanonicalProfileAggregates(
+      observed.database,
+      profileIds,
+    );
+    expect(raw[1]).toMatchObject({
+      profile: { state: "retiring" },
+      mergeTarget: null,
+    });
+    await expect(
+      readCanonicalProfileAggregateSnapshots(observed.database, profileIds),
+    ).rejects.toBeInstanceOf(CanonicalProfileCorruption);
+    expect(observed.batches.map((queries) => queries.length)).toEqual([12, 12]);
   });
 
   it("reads missing profiles and logins in one batch each", async () => {

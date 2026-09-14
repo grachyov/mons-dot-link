@@ -1,4 +1,5 @@
 import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
+import { ackQueueMessage, retryQueueMessage } from "./queueMessage.ts";
 import {
   buildHistoricalMatchPair,
   classifyTransitionHistoricalMatchPair,
@@ -913,12 +914,13 @@ export async function handleProfileGameProjectionMessage(
   const logger = dependencies.logger || console;
   const task = parseProfileGameProjectionTask(message.body);
   if (!task) {
-    message.ack();
-    logger.error(
-      JSON.stringify({
+    ackQueueMessage(message, {
+      entry: {
         event: "profile_game_projection_queue_invalid_message",
-      }),
-    );
+      },
+      level: "error",
+      logger,
+    });
     return;
   }
   const now = dependencies.now || Date.now;
@@ -935,14 +937,15 @@ export async function handleProfileGameProjectionMessage(
       dependencies.forwardEventTasks
     ) {
       await env.EVENT_PROFILE_GAME_PROJECTION_QUEUE.send(task);
-      message.ack();
-      logger.info(
-        JSON.stringify({
+      ackQueueMessage(message, {
+        entry: {
           event: "profile_game_projection_queue_processed",
           ...taskContext,
           status: "forwarded",
-        }),
-      );
+        },
+        level: "info",
+        logger,
+      });
       return;
     }
     const ownerId = crypto.randomUUID();
@@ -1035,28 +1038,32 @@ export async function handleProfileGameProjectionMessage(
         ownerId,
       );
     }
-    message.ack();
-    logger.info(
-      JSON.stringify({
+    ackQueueMessage(message, {
+      entry: {
         event: "profile_game_projection_queue_processed",
         ...taskContext,
         status,
-      }),
-    );
-  } catch (error) {
-    message.retry({
-      delaySeconds: profileGameProjectionRetryDelaySeconds(message.attempts),
+      },
+      level: "info",
+      logger,
     });
-    logger.error(
-      JSON.stringify({
-        event: "profile_game_projection_queue_failed",
-        ...taskContext,
-        status: "retrying",
-        ...(error instanceof ProfileGameProjectionLockFailure
-          ? { lockScope: error.scope }
-          : {}),
-        code: error instanceof Error ? error.message : "unknown",
-      }),
+  } catch (error) {
+    retryQueueMessage(
+      message,
+      profileGameProjectionRetryDelaySeconds(message.attempts),
+      {
+        entry: {
+          event: "profile_game_projection_queue_failed",
+          ...taskContext,
+          status: "retrying",
+          ...(error instanceof ProfileGameProjectionLockFailure
+            ? { lockScope: error.scope }
+            : {}),
+          code: error instanceof Error ? error.message : "unknown",
+        },
+        level: "error",
+        logger,
+      },
     );
   }
 }
@@ -1077,12 +1084,13 @@ async function handleProjectionQueue(
       parseProfileGameProjectionTask(message.body)?.kind !==
         "event-profile-game-projection"
     ) {
-      message.ack();
-      console.error(
-        JSON.stringify({
+      ackQueueMessage(message, {
+        entry: {
           event: "event_profile_game_projection_queue_invalid_message",
-        }),
-      );
+        },
+        level: "error",
+        logger: console,
+      });
       continue;
     }
     await handleProfileGameProjectionMessage(message, env, {

@@ -1,4 +1,5 @@
 import type { EventReads } from "../../../runtime/eventReads.js";
+import { ackQueueMessage, retryQueueMessage } from "./queueMessage.ts";
 import {} from "../../../runtime/telegram/automatchSource.js";
 import {
   buildTelegramEditDesired,
@@ -332,10 +333,11 @@ export async function handleTelegramProjectionMessage(
   const now = dependencies.now || Date.now;
   const task = parseTelegramProjectionTask(message.body);
   if (!task) {
-    message.ack();
-    logger.error(
-      JSON.stringify({ event: "telegram_projection_queue_invalid_message" }),
-    );
+    ackQueueMessage(message, {
+      entry: { event: "telegram_projection_queue_invalid_message" },
+      level: "error",
+      logger,
+    });
     return;
   }
   const createStateRepository =
@@ -353,8 +355,11 @@ export async function handleTelegramProjectionMessage(
     dependencies.readStorageMode || readTelegramStorageMode
   )(env.TELEGRAM_DB);
   if (storageMode === "frozen") {
-    message.retry({ delaySeconds: 60 });
-    logger.info(JSON.stringify({ event: "telegram_projection_queue_frozen" }));
+    retryQueueMessage(message, 60, {
+      entry: { event: "telegram_projection_queue_frozen" },
+      level: "info",
+      logger,
+    });
     return;
   }
   try {
@@ -396,25 +401,25 @@ export async function handleTelegramProjectionMessage(
         telegram,
       );
     }
-    message.ack();
-    logger.info(
-      JSON.stringify({
+    ackQueueMessage(message, {
+      entry: {
         event: "telegram_projection_queue_processed",
         kind: task.kind,
         status,
-      }),
-    );
-  } catch (error) {
-    message.retry({
-      delaySeconds: projectionRetryDelaySeconds(message.attempts),
+      },
+      level: "info",
+      logger,
     });
-    logger.error(
-      JSON.stringify({
+  } catch (error) {
+    retryQueueMessage(message, projectionRetryDelaySeconds(message.attempts), {
+      entry: {
         event: "telegram_projection_queue_failed",
         kind: task.kind,
         code: error instanceof Error ? error.message : "unknown",
-      }),
-    );
+      },
+      level: "error",
+      logger,
+    });
   }
 }
 

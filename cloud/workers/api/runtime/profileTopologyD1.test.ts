@@ -4,7 +4,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   CanonicalProfileCorruption,
   commitCanonicalPlan,
-  countCanonicalCommitStatements,
   materializeCanonicalProfile,
   readCanonicalProfile,
   readCanonicalProfileAggregate,
@@ -322,9 +321,7 @@ describe("scoped canonical profile topology", () => {
     ];
     const recorded = recordBatches();
     await commitCanonicalPlan(recorded.database, plan);
-    expect(recorded.batches[0].count).toBe(
-      countCanonicalCommitStatements(plan),
-    );
+    expect(recorded.batches).toHaveLength(1);
     const moved = await readCanonicalProfileAggregate(
       db,
       target.profile.profileId,
@@ -502,9 +499,6 @@ describe("scoped canonical profile topology", () => {
       const recorded = recordBatches();
       await commitCanonicalPlan(recorded.database, plan);
       expect(recorded.batches).toHaveLength(1);
-      expect(recorded.batches[0].count).toBe(
-        countCanonicalCommitStatements(plan),
-      );
       expect(recorded.batches[0].count).toBe(4);
     } finally {
       await restoreActive(source);

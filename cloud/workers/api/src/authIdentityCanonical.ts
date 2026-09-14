@@ -52,7 +52,6 @@ import {
   CanonicalProfileConflict,
   CanonicalProfileCorruption,
   commitCanonicalPlan,
-  countCanonicalCommitStatements,
   materializeCanonicalProfile,
   readCanonicalAuthMethod,
   readCanonicalAuthOperation,
@@ -1254,12 +1253,9 @@ export function createCanonicalAuthIdentityService(
       },
     ];
     const plan = { expectations, mutations };
-    if (
-      countCanonicalCommitStatements(plan) > CANONICAL_AUTH_COMMIT_QUERY_BUDGET
-    ) {
-      throw new CanonicalProfileCorruption();
-    }
-    await commitCanonicalPlan(db, plan);
+    await commitCanonicalPlan(db, plan, {
+      maxStatements: CANONICAL_AUTH_COMMIT_QUERY_BUDGET,
+    });
     return resolvedTargetProfileId;
   };
 

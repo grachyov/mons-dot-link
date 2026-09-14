@@ -5,7 +5,6 @@ import {
   CanonicalProfileConflict,
   CanonicalProfileCorruption,
   commitCanonicalPlan,
-  countCanonicalCommitStatements,
   materializeCanonicalProfile,
   readCanonicalLoginOwner,
   readCanonicalProfileAggregate,
@@ -215,8 +214,7 @@ describe("profile-link catch-up D1", () => {
         },
       ],
     };
-    expect(countCanonicalCommitStatements(plan)).toBe(6);
-    await commitCanonicalPlan(db, plan);
+    await commitCanonicalPlan(db, plan, { maxStatements: 6 });
     const jobs = await Promise.all(
       loginUids.map((loginUid) => store.read(loginUid)),
     );

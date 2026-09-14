@@ -877,29 +877,6 @@ function validateCanonicalCommitPlan(plan: CanonicalCommitPlan): void {
   }
 }
 
-export function countCanonicalCommitStatements(
-  plan: CanonicalCommitPlan,
-): number {
-  return plan.mutations.length === 0
-    ? 0
-    : 2 +
-        plan.expectations.length +
-        plan.mutations.reduce((count, mutation) => {
-          switch (mutation.kind) {
-            case "insert-login-owner":
-            case "update-login-owner":
-            case "move-login-owner-set":
-            case "update-active-profile":
-            case "delete-retired-profile":
-              return count + 2;
-            case "retire-profile-with-redirect":
-              return count + 3;
-            default:
-              return count + 1;
-          }
-        }, 0);
-}
-
 function canonicalTopologyProfileIds(plan: CanonicalCommitPlan): string[] {
   const profileIds = new Set<string>();
   for (const mutation of plan.mutations) {
@@ -1010,8 +987,15 @@ function canonicalTopologyGuardStatement(
 export async function commitCanonicalPlan(
   db: D1Database,
   plan: CanonicalCommitPlan,
+  { maxStatements }: { maxStatements?: number } = {},
 ): Promise<void> {
   validateCanonicalCommitPlan(plan);
+  if (
+    maxStatements !== undefined &&
+    (!Number.isSafeInteger(maxStatements) || maxStatements < 0)
+  ) {
+    throw new TypeError("invalid-canonical-commit-budget");
+  }
   if (plan.mutations.length === 0) return;
   const statements = [
     guardStatement(
@@ -1027,6 +1011,9 @@ export async function commitCanonicalPlan(
     ...plan.mutations.flatMap((mutation) => mutationStatements(db, mutation)),
     canonicalTopologyGuardStatement(db, plan),
   ];
+  if (maxStatements !== undefined && statements.length > maxStatements) {
+    throw new CanonicalProfileCorruption();
+  }
   try {
     await db.batch(statements);
   } catch (error) {

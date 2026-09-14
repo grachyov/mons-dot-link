@@ -259,6 +259,83 @@ describe("socket session lifetime", () => {
   }
 
   for (const channel of ["metadata", "wagers", "matches"] as const) {
+    it(`${channel} validates targets and admission before session or source reads`, async () => {
+      const { room, inviteId } = await fixture();
+      const expiry = Date.now() + 300_000;
+      const name =
+        channel === "metadata"
+          ? "Metadata"
+          : channel === "wagers"
+            ? "Wagers"
+            : "Match";
+      const invalid: Record<string, string | null>[] = [
+        { "Sec-WebSocket-Protocol": null },
+        { "Sec-WebSocket-Protocol": "another-protocol" },
+        { [`X-Mons-${name}-Role`]: "watch" },
+        { [`X-Mons-${name}-Actor`]: null },
+        { [`X-Mons-${name}-Actor`]: "%2F" },
+        { [`X-Mons-${name}-Role`]: "spectator" },
+        { [`X-Mons-${name}-IP`]: "a".repeat(65) },
+        { [`X-Mons-${name}-Revision`]: null },
+        { [`X-Mons-${name}-Revision`]: "0" },
+        { [`X-Mons-${name}-Revision`]: "01" },
+        { [`X-Mons-${name}-Revision`]: String(Number.MAX_SAFE_INTEGER + 1) },
+        { [`X-Mons-${name}-Protected`]: "true" },
+        { [`X-Mons-${name}-Authenticated`]: "true" },
+      ];
+      const result = await runInDurableObject(room, async (instance, state) => {
+        let sourceReads = 0;
+        const mutable = instance as unknown as {
+          inviteReader: () => Promise<unknown>;
+        };
+        mutable.inviteReader = async () => {
+          sourceReads++;
+          throw new Error("admission-read-source");
+        };
+        const responses: { status: number; message: string }[] = [];
+        for (const overrides of [
+          { [`X-Mons-${name}-Invite`]: "%" },
+          { [`X-Mons-${name}-Actor`]: "%" },
+          ...invalid,
+          {},
+        ]) {
+          const response = await instance.fetch(
+            request(channel, inviteId, expiry, {
+              "X-Mons-Session-Id": null,
+              ...overrides,
+            }),
+          );
+          responses.push({
+            status: response.status,
+            message: await response.text(),
+          });
+        }
+        return {
+          responses,
+          sourceReads,
+          sockets: state.getWebSockets().length,
+        };
+      });
+      const targetMessage =
+        channel === "matches"
+          ? "Invalid match target"
+          : `Invalid ${channel} invite`;
+      const admissionMessage =
+        channel === "matches"
+          ? "Invalid match admission"
+          : `Invalid ${channel} admission`;
+      expect(result).toEqual({
+        responses: [
+          { status: 400, message: targetMessage },
+          { status: 400, message: targetMessage },
+          ...invalid.map(() => ({ status: 400, message: admissionMessage })),
+          { status: 401, message: "Session expired" },
+        ],
+        sourceReads: 0,
+        sockets: 0,
+      });
+    });
+
     it(`${channel} admission rechecks expiry after the source read`, async () => {
       const { room, inviteId } = await fixture();
       const expiry = Date.now() + 300_000;

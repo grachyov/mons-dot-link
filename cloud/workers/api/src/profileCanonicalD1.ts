@@ -60,8 +60,10 @@ export {
   readCanonicalProfileByLogin,
   readCanonicalPublicProfileByLogin,
   readCanonicalProfileAggregate,
+  readCanonicalProfileAggregates,
   readCanonicalAuthRecoveryJob,
   readCanonicalProfileAggregateSnapshot,
+  readCanonicalProfileAggregateSnapshots,
   readCanonicalProfileOwnershipSnapshot,
   readCanonicalProfileAggregateByLogin,
   readCanonicalAuthOperation,
@@ -73,7 +75,4 @@ export {
   readCanonicalWagerSettlement,
 } from "./profileCanonical/accounting.ts";
 export { buildCanonicalGuardStatements } from "./profileCanonical/guards.ts";
-export {
-  countCanonicalCommitStatements,
-  commitCanonicalPlan,
-} from "./profileCanonical/commit.ts";
+export { commitCanonicalPlan } from "./profileCanonical/commit.ts";

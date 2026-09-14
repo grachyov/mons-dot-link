@@ -1,4 +1,5 @@
 import { infrastructureRetryDelaySeconds } from "./queueRetry.ts";
+import { ackQueueMessage, retryQueueMessage } from "./queueMessage.ts";
 import {
   createGameplayRepository,
   type GameplayRepository,
@@ -94,28 +95,27 @@ async function deferWagerSettlement(
     await env.WAGER_SETTLEMENT_QUEUE.send(task, {
       delaySeconds: WAGER_SETTLEMENT_RETRY_DELAY_SECONDS,
     });
-    message.ack();
-    const entry = JSON.stringify({
-      event: "wager_settlement_queue_deferred",
-      operationId: task.operationId,
-      reason,
-      ...(code ? { code } : {}),
+    ackQueueMessage(message, {
+      entry: {
+        event: "wager_settlement_queue_deferred",
+        operationId: task.operationId,
+        reason,
+        ...(code ? { code } : {}),
+      },
+      level: code ? "error" : "info",
+      logger,
     });
-    if (code) {
-      logger.error(entry);
-    } else {
-      logger.info(entry);
-    }
   } catch (error) {
-    message.retry({ delaySeconds: WAGER_SETTLEMENT_RETRY_DELAY_SECONDS });
-    logger.error(
-      JSON.stringify({
+    retryQueueMessage(message, WAGER_SETTLEMENT_RETRY_DELAY_SECONDS, {
+      entry: {
         event: "wager_settlement_queue_defer_failed",
         operationId: task.operationId,
         reason,
         code: error instanceof Error ? error.message : "unknown",
-      }),
-    );
+      },
+      level: "error",
+      logger,
+    });
   }
 }
 
@@ -145,10 +145,11 @@ export async function handleWagerSettlementQueueMessage(
 ): Promise<void> {
   const task = parseWagerSettlementRetryTask(message.body);
   if (!task) {
-    message.ack();
-    logger.error(
-      JSON.stringify({ event: "wager_settlement_queue_invalid_message" }),
-    );
+    ackQueueMessage(message, {
+      entry: { event: "wager_settlement_queue_invalid_message" },
+      level: "error",
+      logger,
+    });
     return;
   }
   let mutationsEnabled = false;
@@ -161,14 +162,15 @@ export async function handleWagerSettlementQueueMessage(
     try {
       const status = await classifySettlement(task, createGameplay(env));
       if (status === "completed" || status === "stale") {
-        message.ack();
-        logger.info(
-          JSON.stringify({
+        ackQueueMessage(message, {
+          entry: {
             event: "wager_settlement_queue_processed",
             operationId: task.operationId,
             status,
-          }),
-        );
+          },
+          level: "info",
+          logger,
+        });
         return;
       }
     } catch (error) {
@@ -207,14 +209,15 @@ export async function handleWagerSettlementQueueMessage(
           await admissionGuard();
         }),
     );
-    message.ack();
-    logger.info(
-      JSON.stringify({
+    ackQueueMessage(message, {
+      entry: {
         event: "wager_settlement_queue_processed",
         operationId: task.operationId,
         status,
-      }),
-    );
+      },
+      level: "info",
+      logger,
+    });
   } catch (error) {
     if (error instanceof WagerSettlementWritesDisabled) {
       await deferWagerSettlement(
@@ -226,15 +229,18 @@ export async function handleWagerSettlementQueueMessage(
       );
       return;
     }
-    message.retry({
-      delaySeconds: infrastructureRetryDelaySeconds(message.attempts),
-    });
-    logger.error(
-      JSON.stringify({
-        event: "wager_settlement_queue_failed",
-        operationId: task.operationId,
-        code: error instanceof Error ? error.message : "unknown",
-      }),
+    retryQueueMessage(
+      message,
+      infrastructureRetryDelaySeconds(message.attempts),
+      {
+        entry: {
+          event: "wager_settlement_queue_failed",
+          operationId: task.operationId,
+          code: error instanceof Error ? error.message : "unknown",
+        },
+        level: "error",
+        logger,
+      },
     );
   }
 }

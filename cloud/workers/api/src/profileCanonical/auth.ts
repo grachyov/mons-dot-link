@@ -279,10 +279,27 @@ export async function readCanonicalProfileAggregate(
   db: D1Database,
   profileId: string,
 ): Promise<CanonicalProfileAggregateSnapshot> {
-  const results = await db.batch(
+  const [aggregate] = await readCanonicalProfileAggregates(db, [profileId]);
+  return aggregate;
+}
+
+export async function readCanonicalProfileAggregates(
+  db: D1Database,
+  profileIds: readonly string[],
+): Promise<CanonicalProfileAggregateSnapshot[]> {
+  if (profileIds.length === 0) return [];
+  const groups = profileIds.map((profileId) =>
     canonicalProfileAggregateStatements(db, { profileId }),
   );
-  return parseCanonicalProfileAggregateResults(results);
+  const results = await db.batch(groups.flat());
+  let offset = 0;
+  return groups.map((statements) => {
+    const aggregate = parseCanonicalProfileAggregateResults(
+      results.slice(offset, offset + statements.length),
+    );
+    offset += statements.length;
+    return aggregate;
+  });
 }
 
 export async function readCanonicalAuthRecoveryJob(
@@ -337,9 +354,21 @@ export async function readCanonicalProfileAggregateSnapshot(
   db: D1Database,
   profileId: string,
 ): Promise<CanonicalProfileAggregateSnapshot> {
-  const aggregate = await readCanonicalProfileAggregate(db, profileId);
-  assertCanonicalAggregateTopology(profileId, aggregate);
+  const [aggregate] = await readCanonicalProfileAggregateSnapshots(db, [
+    profileId,
+  ]);
   return aggregate;
+}
+
+export async function readCanonicalProfileAggregateSnapshots(
+  db: D1Database,
+  profileIds: readonly string[],
+): Promise<CanonicalProfileAggregateSnapshot[]> {
+  const aggregates = await readCanonicalProfileAggregates(db, profileIds);
+  aggregates.forEach((aggregate, index) =>
+    assertCanonicalAggregateTopology(profileIds[index], aggregate),
+  );
+  return aggregates;
 }
 
 function canonicalOwnershipInputs(

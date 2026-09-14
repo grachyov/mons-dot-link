@@ -509,9 +509,14 @@ test("projection dispatch failures preserve pending recovery markers", async () 
 });
 
 test("projection queue acknowledges poison tasks and retries transient failures", async () => {
+  const errors: unknown[] = [];
+  const logger = {
+    error: (entry: string) => errors.push(JSON.parse(entry)),
+    info() {},
+  };
   const invalid = queueMessage({ nope: true });
   await handleTelegramProjectionMessage(invalid.message, PROJECTION_TEST_ENV, {
-    logger: { error() {}, info() {} },
+    logger,
   });
   assert.equal(invalid.acknowledgements(), 1);
   assert.deepEqual(invalid.retries, []);
@@ -528,11 +533,25 @@ test("projection queue acknowledges poison tasks and retries transient failures"
     createStateRepository: () => {
       throw new Error("temporary");
     },
-    logger: { error() {}, info() {} },
+    logger,
   });
   assert.equal(failed.acknowledgements(), 0);
   assert.deepEqual(failed.retries, [{ delaySeconds: 8 }]);
   assert.equal(projectionRetryDelaySeconds(100), 60);
+  assert.deepEqual(errors, [
+    {
+      event: "telegram_projection_queue_invalid_message",
+      messageId: invalid.message.id,
+      attempts: 1,
+    },
+    {
+      event: "telegram_projection_queue_failed",
+      kind: "automatch-telegram-projection",
+      code: "temporary",
+      messageId: failed.message.id,
+      attempts: 4,
+    },
+  ]);
 });
 
 test("scheduled recovery batches both pending outbox kinds", async () => {

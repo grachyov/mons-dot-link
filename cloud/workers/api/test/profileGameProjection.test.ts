@@ -1774,10 +1774,15 @@ test("rating projection dead-letters invalid records and retries uncommitted rat
 });
 
 test("profile game projection Queue acknowledges poison and retries transient work", async () => {
+  const errors: unknown[] = [];
+  const logger = {
+    error: (entry: string) => errors.push(JSON.parse(entry)),
+    info() {},
+  };
   const invalid = queueMessage({ invalid: true });
   await handleProfileGameProjectionMessage(invalid.message, TELEGRAM_TEST_ENV, {
     createLocks: () => locks,
-    logger: { error() {}, info() {} },
+    logger,
   });
   assert.equal(invalid.acknowledgements(), 1);
   assert.deepEqual(invalid.retries, []);
@@ -1791,11 +1796,27 @@ test("profile game projection Queue acknowledges poison and retries transient wo
     createRating: () => {
       throw new Error("temporary");
     },
-    logger: { error() {}, info() {} },
+    logger,
   });
   assert.equal(failed.acknowledgements(), 0);
   assert.deepEqual(failed.retries, [{ delaySeconds: 8 }]);
   assert.equal(profileGameProjectionRetryDelaySeconds(100), 60);
+  assert.deepEqual(errors, [
+    {
+      event: "profile_game_projection_queue_invalid_message",
+      messageId: invalid.message.id,
+      attempts: 1,
+    },
+    {
+      event: "profile_game_projection_queue_failed",
+      kind: "rating-profile-game-projection",
+      operationId,
+      status: "retrying",
+      code: "temporary",
+      messageId: failed.message.id,
+      attempts: 4,
+    },
+  ]);
 });
 
 test("automatch Queue retries transient work without settling its outbox", async () => {

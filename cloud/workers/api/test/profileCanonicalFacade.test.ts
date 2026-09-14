@@ -40,9 +40,12 @@ test("the canonical profile facade preserves its exact public exports and identi
     readCanonicalPublicProfileByLogin: auth.readCanonicalPublicProfileByLogin,
     readCanonicalLeaderboard: profiles.readCanonicalLeaderboard,
     readCanonicalProfileAggregate: auth.readCanonicalProfileAggregate,
+    readCanonicalProfileAggregates: auth.readCanonicalProfileAggregates,
     readCanonicalAuthRecoveryJob: auth.readCanonicalAuthRecoveryJob,
     readCanonicalProfileAggregateSnapshot:
       auth.readCanonicalProfileAggregateSnapshot,
+    readCanonicalProfileAggregateSnapshots:
+      auth.readCanonicalProfileAggregateSnapshots,
     readCanonicalProfileOwnershipSnapshot:
       auth.readCanonicalProfileOwnershipSnapshot,
     readCanonicalProfileAggregateByLogin:
@@ -51,7 +54,6 @@ test("the canonical profile facade preserves its exact public exports and identi
     readCanonicalRatingUpdate: accounting.readCanonicalRatingUpdate,
     readCanonicalWagerSettlement: accounting.readCanonicalWagerSettlement,
     buildCanonicalGuardStatements: guards.buildCanonicalGuardStatements,
-    countCanonicalCommitStatements: commit.countCanonicalCommitStatements,
     commitCanonicalPlan: commit.commitCanonicalPlan,
   };
   assert.deepEqual(Object.keys(facade).sort(), Object.keys(expected).sort());

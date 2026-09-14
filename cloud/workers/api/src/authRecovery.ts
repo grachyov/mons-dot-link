@@ -1,4 +1,5 @@
 import type { EventPrizeAssignmentRecord } from "../../../runtime/eventReads.js";
+import { ackQueueMessage, retryQueueMessage } from "./queueMessage.ts";
 import { STATE_FAILURE_MESSAGES } from "./stateCompatibility.ts";
 import {
   getEventPrizeDefinition,
@@ -34,7 +35,7 @@ import {
   parseCanonicalAuthRecoveryRow,
   readCanonicalAuthRecoveryJob,
   readCanonicalMergeTarget,
-  readCanonicalProfileAggregate,
+  readCanonicalProfileAggregates,
   type CanonicalAuthRecoverySnapshot,
   type CanonicalAuthRecoveryValue,
 } from "./profileCanonicalD1.ts";
@@ -647,8 +648,10 @@ function createCanonicalAuthRecoveryService(
       );
       return;
     }
-    const target = await readCanonicalProfileAggregate(db, job.profileId);
-    const source = await readCanonicalProfileAggregate(db, sourceProfileId);
+    const [target, source] = await readCanonicalProfileAggregates(db, [
+      job.profileId,
+      sourceProfileId,
+    ]);
     if (!target.profile || !target.recovery) return;
     const live = canonicalRecoveryJob(target.recovery);
     let currentProfileId = sourceProfileId;
@@ -993,20 +996,47 @@ export async function handleAuthRecoveryMessage(
   env: Env,
   recover = (profileId: string) =>
     createAuthRecoveryService(env).recoverProfile(profileId),
+  logger: Pick<Console, "error" | "info"> = console,
 ): Promise<void> {
   const task = parseAuthRecoveryTask(message.body);
   if (!task) {
-    message.ack();
+    ackQueueMessage(message, {
+      entry: { event: "auth_recovery_queue_invalid_message" },
+      level: "error",
+      logger,
+    });
     return;
   }
   try {
     if (await recover(task.profileId)) {
-      message.ack();
+      ackQueueMessage(message, {
+        entry: {
+          event: "auth_recovery_queue_processed",
+          profileId: task.profileId,
+        },
+        level: "info",
+        logger,
+      });
     } else {
-      message.retry({ delaySeconds: RETRY_DELAY_SECONDS });
+      retryQueueMessage(message, RETRY_DELAY_SECONDS, {
+        entry: {
+          event: "auth_recovery_queue_retrying",
+          profileId: task.profileId,
+        },
+        level: "info",
+        logger,
+      });
     }
-  } catch {
-    message.retry({ delaySeconds: RETRY_DELAY_SECONDS });
+  } catch (error) {
+    retryQueueMessage(message, RETRY_DELAY_SECONDS, {
+      entry: {
+        event: "auth_recovery_queue_failed",
+        profileId: task.profileId,
+        code: error instanceof Error ? error.message : "unknown",
+      },
+      level: "error",
+      logger,
+    });
   }
 }
 

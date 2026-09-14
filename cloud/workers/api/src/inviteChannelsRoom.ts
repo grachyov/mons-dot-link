@@ -10,7 +10,7 @@ import {
   type InviteWagersMessage,
   type InviteWagersSnapshot,
 } from "@mons/shared/invite-wagers";
-import { isCanonicalLoginUid, isSafeRecordKey } from "./recordKeys.ts";
+import { isSafeRecordKey } from "./recordKeys.ts";
 import {
   normalizeInviteMetadata,
   type InviteMetadataReadResult,
@@ -23,11 +23,15 @@ import {
 import { composeInviteWagerSource } from "./inviteWagerSource.ts";
 import type { WagerStateSnapshot } from "./wagerStateD1.ts";
 import {
-  readSocketSession,
   socketSessionCurrent,
   type SocketSession,
   type SocketSessions,
 } from "./socketSession.ts";
+import { readSocketAdmission } from "./socketAdmission.ts";
+import {
+  socketCapacityFull,
+  type SocketCapacityLimits,
+} from "./socketCapacity.ts";
 
 type InviteChannel = "metadata" | "wagers";
 
@@ -93,12 +97,7 @@ type InviteChannelsDependencies = {
   scheduleAlarm: (atMs: number) => Promise<void>;
   capacityFull: (role: string) => boolean;
   socketSessions: SocketSessions;
-  limits: {
-    sockets: number;
-    spectators: number;
-    spectatorsPerIp: number;
-    socketsPerParticipant: number;
-  };
+  limits: SocketCapacityLimits;
 };
 
 export class InviteChannelsRoom {
@@ -481,12 +480,16 @@ export class InviteChannelsRoom {
       this.ctx.getWebSockets(`${channel}-role:${value}`).length;
     return (
       this.dependencies.capacityFull(role) ||
-      sockets.length >= this.dependencies.limits.sockets ||
-      (role === "spectator"
-        ? roleCount("spectator") >= this.dependencies.limits.spectators ||
-          this.ctx.getWebSockets(`${channel}-ip:${ip}`).length >=
-            this.dependencies.limits.spectatorsPerIp
-        : roleCount(role) >= this.dependencies.limits.socketsPerParticipant)
+      socketCapacityFull(
+        role,
+        {
+          sockets: sockets.length,
+          spectators: roleCount("spectator"),
+          spectatorsPerIp: this.ctx.getWebSockets(`${channel}-ip:${ip}`).length,
+          socketsForRole: roleCount(role),
+        },
+        this.dependencies.limits,
+      )
     );
   }
 
@@ -508,28 +511,17 @@ export class InviteChannelsRoom {
     } catch {
       return new Response(`Invalid ${channel} invite`, { status: 400 });
     }
-    const role = header("Role");
-    const ip = header("IP") || "unknown";
-    const expectedRevision = header("Revision");
-    const protectedHeader = header("Protected");
-    const authenticated = header("Authenticated");
-    if (
-      request.headers.get("Sec-WebSocket-Protocol") !== protocol ||
-      (role !== "host" && role !== "guest" && role !== "spectator") ||
-      ip.length > 64 ||
-      !expectedRevision ||
-      !/^[1-9]\d*$/.test(expectedRevision) ||
-      !Number.isSafeInteger(Number(expectedRevision)) ||
-      (protectedHeader !== "0" && protectedHeader !== "1") ||
-      (authenticated !== "0" && authenticated !== "1") ||
-      (role === "spectator"
-        ? actorUid !== null
-        : !isCanonicalLoginUid(actorUid))
-    ) {
+    const parsed = readSocketAdmission(request, {
+      headerPrefix: name,
+      protocol,
+      actorUid,
+    });
+    if (parsed.status === "invalid") {
       return new Response(`Invalid ${channel} admission`, { status: 400 });
     }
-    const session = readSocketSession(request, authenticated === "1");
-    if (!session) return new Response("Session expired", { status: 401 });
+    if (parsed.status === "expired")
+      return new Response("Session expired", { status: 401 });
+    const { role, ip, revision, passwordProtected, session } = parsed.admission;
     const attachment: InviteSocketAttachment = {
       channel,
       schemaVersion: 1,
@@ -571,8 +563,8 @@ export class InviteChannelsRoom {
         });
       }
       if (
-        source.snapshot.revision !== Number(expectedRevision) ||
-        latest.metadata.passwordProtected !== (protectedHeader === "1")
+        source.snapshot.revision !== revision ||
+        latest.metadata.passwordProtected !== passwordProtected
       ) {
         return new Response(`Invite ${channel} changed`, { status: 409 });
       }

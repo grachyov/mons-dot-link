@@ -3,7 +3,7 @@ import {
   MATCH_SYNC_SOCKET_PROTOCOL,
   type MatchSyncSnapshot,
 } from "@mons/shared/match-sync";
-import { isCanonicalLoginUid, isSafeRecordKey } from "./recordKeys.ts";
+import { isSafeRecordKey } from "./recordKeys.ts";
 import type { InviteMetadataReadResult } from "./inviteMetadata.ts";
 import {
   assertMatchSyncEnvelope,
@@ -13,11 +13,11 @@ import {
   type MatchSyncReadResult,
 } from "./matchSync.ts";
 import {
-  readSocketSession,
   socketSessionCurrent,
   type SocketSession,
   type SocketSessions,
 } from "./socketSession.ts";
+import { readSocketAdmission } from "./socketAdmission.ts";
 
 export const MATCH_SYNC_REPAIR_MS = 5_000;
 
@@ -324,28 +324,16 @@ export class MatchSyncRoom {
     } catch {
       return new Response("Invalid match target", { status: 400 });
     }
-    const role = header("Role");
-    const ip = header("IP") || "unknown";
-    const revision = header("Revision");
-    const protectedHeader = header("Protected");
-    const authenticated = header("Authenticated");
-    if (
-      request.headers.get("Sec-WebSocket-Protocol") !==
-        MATCH_SYNC_SOCKET_PROTOCOL ||
-      (role !== "host" && role !== "guest" && role !== "spectator") ||
-      ip.length > 64 ||
-      !revision ||
-      !/^[1-9]\d*$/.test(revision) ||
-      !Number.isSafeInteger(Number(revision)) ||
-      (protectedHeader !== "0" && protectedHeader !== "1") ||
-      (authenticated !== "0" && authenticated !== "1") ||
-      (role === "spectator"
-        ? actorUid !== null
-        : !isCanonicalLoginUid(actorUid))
-    )
+    const parsed = readSocketAdmission(request, {
+      headerPrefix: "Match",
+      protocol: MATCH_SYNC_SOCKET_PROTOCOL,
+      actorUid,
+    });
+    if (parsed.status === "invalid")
       return new Response("Invalid match admission", { status: 400 });
-    const session = readSocketSession(request, authenticated === "1");
-    if (!session) return new Response("Session expired", { status: 401 });
+    if (parsed.status === "expired")
+      return new Response("Session expired", { status: 401 });
+    const { role, ip, revision, passwordProtected, session } = parsed.admission;
     if (this.dependencies.capacityFull(role, ip))
       return new Response("Match room is full", {
         status: 429,
@@ -373,8 +361,8 @@ export class MatchSyncRoom {
           status: latest.status === "missing" ? 404 : 409,
         });
       if (
-        latest.snapshot.revision !== Number(revision) ||
-        latest.metadata.passwordProtected !== (protectedHeader === "1")
+        latest.snapshot.revision !== revision ||
+        latest.metadata.passwordProtected !== passwordProtected
       )
         return new Response("Match admission changed", { status: 409 });
       if (!socketSessionCurrent(session))
