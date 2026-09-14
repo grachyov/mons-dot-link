@@ -2,7 +2,6 @@ import {
   createEventGameplayRepository,
   type EventGameplayRepository,
 } from "./eventRepository.ts";
-import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
 import {
   isCreateEventResponse,
   isDisqualifyEventMatchWinnersResponse,
@@ -17,18 +16,12 @@ import {
   type SyncEventStateRequest,
   type SyncEventStateResponse,
 } from "@mons/shared/events";
-import { createEventRuntime } from "../../../runtime/events.js";
-import { createEventLockManagerCore } from "../../../runtime/events/lockManagerCore.js";
 import { AuthApiFailure, type AuthErrorCode } from "./authErrors.ts";
 import { createGameplayRepository } from "./gameplayRepository.ts";
-import {
-  buildEventProgressPlan,
-  createEventRuntimeStore,
-  ensureEventProgressWorkflow,
-} from "./eventProgress.ts";
-import { createD1EventPrizeWithdrawalReader } from "./eventPrizeWithdrawalD1.ts";
+import { buildEventProgressPlan } from "./eventProgressCodec.ts";
+import { ensureEventProgressWorkflow } from "./eventProgressDispatch.ts";
+import { createWorkerEventRuntime } from "./workerEventRuntime.ts";
 import type { RequestIdentity } from "./requestIdentity.ts";
-import { requireProfileOwnershipSnapshot } from "./profileOwnership.ts";
 
 export const EVENT_CONTROL_TIMEOUT_MS = 30_000;
 
@@ -39,12 +32,6 @@ export type EventControlDependencies = {
   signal?: AbortSignal;
   sleep?: (milliseconds: number) => Promise<void>;
 };
-
-function secureRandom(): number {
-  const values = new Uint32Array(1);
-  crypto.getRandomValues(values);
-  return values[0] / 0x1_0000_0000;
-}
 
 function statusForCode(code: string): number {
   if (code === "unauthenticated") {
@@ -106,29 +93,11 @@ function createRuntime(env: Env, dependencies: EventControlDependencies) {
       env,
       createGameplayRepository(env, { timeoutMs: EVENT_CONTROL_TIMEOUT_MS }),
     );
-  const lockManager = createEventLockManagerCore({
-    createLockId: () => crypto.randomUUID(),
-    transactEventLease: (key, updater) =>
-      repository.transactEventLease(key, updater, signal),
-    releaseTransactEventLease: (key, updater) =>
-      repository.transactEventLease(key, updater),
-    sleep:
-      dependencies.sleep ||
-      ((milliseconds) => scheduler.wait(milliseconds, { signal })),
-    logger: {
-      error: (_message, error) => {
-        console.error(
-          JSON.stringify({
-            event: "event_control_lock_failure",
-            kind: error instanceof Error ? error.name : typeof error,
-          }),
-        );
-      },
-    },
-  });
-  return createEventRuntime({
-    state: createEventRuntimeStore(repository, signal),
-    readMatchPair: (input) => readGameplayMatchPair(repository, input, signal),
+  return createWorkerEventRuntime({
+    repository,
+    signal,
+    withdrawalDb: env.EVENT_PRIZE_WITHDRAWALS_DB,
+    lockFailureEvent: "event_control_lock_failure",
     enqueueEventProgressTask: async ({
       eventId,
       sourceKey,
@@ -147,17 +116,9 @@ function createRuntime(env: Env, dependencies: EventControlDependencies) {
       await ensureEventProgressWorkflow(env, plan);
       return { outboxId: plan.outboxId, outbox: plan.outbox };
     },
-    eventLockManager: lockManager,
-    readProfileOwnershipSnapshot: (query) =>
-      requireProfileOwnershipSnapshot(repository, query),
-    readEventPrizeWithdrawals: createD1EventPrizeWithdrawalReader(
-      env.EVENT_PRIZE_WITHDRAWALS_DB,
-    ),
     now: dependencies.now,
-    random: dependencies.random || secureRandom,
-    sleep:
-      dependencies.sleep ||
-      ((milliseconds) => scheduler.wait(milliseconds, { signal })),
+    random: dependencies.random,
+    sleep: dependencies.sleep,
   });
 }
 

@@ -152,13 +152,7 @@ async function mineRock(
       lastRockDate: request.date,
       materials: sumMaterials(profile.mining.materials, expected.delta),
     };
-    if (
-      (await repository.updateMining(
-        profile.profileId,
-        mining,
-        profile.updateTime,
-      )) === "updated"
-    ) {
+    if ((await profile.commitMining(mining)) === "updated") {
       return { ok: true, mining };
     }
   }

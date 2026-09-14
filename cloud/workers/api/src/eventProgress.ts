@@ -3,7 +3,6 @@ import {
   parseEventProgressOutbox,
   parseEventProgressParams,
   workflowIdFromOutboxId,
-  type EventProgressPlan,
   type EventProgressWorkflowParams,
 } from "./eventProgressCodec.ts";
 import { isSafeRecordKey } from "./recordKeys.ts";
@@ -12,17 +11,13 @@ import type {
   WorkflowStep,
   WorkflowStepConfig,
 } from "cloudflare:workers";
-import { readGameplayMatchPair } from "./gameplayMatchReads.ts";
 import { requireActiveDurableMatchState } from "./matchStateAuthority.ts";
 import {
   createRatingRepository,
   type RatingEventProgressRepository,
 } from "./gameplayRepository.ts";
-import { createD1EventPrizeWithdrawalReader } from "./eventPrizeWithdrawalD1.ts";
-import { createEventRuntime } from "../../../runtime/events.js";
-import { createEventLockManagerCore } from "../../../runtime/events/lockManagerCore.js";
 import { PROFILE_BACKGROUND_SWEEP_LIMIT } from "./profileBackgroundLimits.ts";
-import { requireProfileOwnershipSnapshot } from "./profileOwnership.ts";
+import { createWorkerEventRuntime } from "./workerEventRuntime.ts";
 import {
   createEventGameplayRepository,
   type EventGameplayRepository,
@@ -51,6 +46,8 @@ export {
   ensureEventProgressWorkflow,
   removeOutbox,
 } from "./eventProgressDispatch.ts";
+
+export { createEventRuntimeStore } from "./workerEventRuntime.ts";
 
 export {
   buildEventProgressPlan,
@@ -114,24 +111,6 @@ export class EventProgressRetryableError extends Error {
     super(code);
     this.code = code;
   }
-}
-
-export function createEventRuntimeStore(
-  repository: EventGameplayRepository,
-  signal?: AbortSignal,
-): import("../../../runtime/eventCommands.js").EventRuntimeStore {
-  return {
-    ...repository,
-    readEvent: (id) => repository.readEvent(id, signal),
-    readEventPrizeSelections: (id) =>
-      repository.readEventPrizeSelections(id, signal),
-    readEventSnapshot: (id) => repository.readEventSnapshot(id, signal),
-    commitEventPlan: (plan) => repository.commitEventPlan(plan, signal),
-    transactEventSyncThrottle: (id, updater) =>
-      repository.transactEventSyncThrottle(id, updater, signal),
-    transactProfileEventPrize: (profileId, eventId, updater) =>
-      repository.transactProfileEventPrize(profileId, eventId, updater, signal),
-  };
 }
 
 async function deadLetterOutbox(
@@ -542,50 +521,18 @@ export function createWorkflowEventRuntime(
   eventRepository = createEventGameplayRepository(env),
 ) {
   const repository = createEventMutationRepository(env, { eventRepository });
-  const lockManager = createEventLockManagerCore({
-    createLockId: () => crypto.randomUUID(),
-    transactEventLease: (key, updater) =>
-      repository.transactEventLease(key, updater, signal),
-    releaseTransactEventLease: (key, updater) =>
-      repository.transactEventLease(key, updater),
-    sleep: (milliseconds) => scheduler.wait(milliseconds, { signal }),
-    logger: {
-      error: (_message, error) => {
-        console.error(
-          JSON.stringify({
-            event: "event_progress_lock_failure",
-            kind: error instanceof Error ? error.name : typeof error,
-          }),
-        );
-      },
-    },
-  });
-  const readEventPrizeWithdrawals = createD1EventPrizeWithdrawalReader(
-    env.EVENT_PRIZE_WITHDRAWALS_DB,
-  );
   return {
     repository,
-    runtime: createEventRuntime({
-      state: createEventRuntimeStore(repository, signal),
-      readMatchPair: (input) =>
-        readGameplayMatchPair(repository, input, signal),
+    runtime: createWorkerEventRuntime({
+      repository,
+      signal,
+      withdrawalDb: env.EVENT_PRIZE_WITHDRAWALS_DB,
+      lockFailureEvent: "event_progress_lock_failure",
       enqueueEventProgressTask: async () => {
         throw new Error("workflow-cannot-schedule-event-progress");
       },
-      eventLockManager: lockManager,
-      readProfileOwnershipSnapshot: (query) =>
-        requireProfileOwnershipSnapshot(repository, query),
-      readEventPrizeWithdrawals,
-      random: secureRandom,
-      sleep: (milliseconds) => scheduler.wait(milliseconds, { signal }),
     }),
   };
-}
-
-function secureRandom(): number {
-  const values = new Uint32Array(1);
-  crypto.getRandomValues(values);
-  return values[0] / 0x1_0000_0000;
 }
 
 export {

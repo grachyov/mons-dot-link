@@ -60,9 +60,9 @@ function profile(
     lastRockDate: null,
     materials: createEmptyMaterials(),
   },
-  updateTime = "2026-08-18T10:00:00Z",
+  commitMining: MiningProfile["commitMining"] = async () => "updated",
 ): MiningProfile {
-  return { profileId: "profile-1", mining, updateTime };
+  return { profileId: "profile-1", mining, commitMining };
 }
 
 function ownershipSnapshot(
@@ -106,7 +106,6 @@ function repository(
   return {
     getProfileSnapshot: async () => profile(),
     readProfileOwnershipSnapshot: async () => ownershipSnapshot(),
-    updateMining: async () => "updated",
     ...overrides,
   };
 }
@@ -299,10 +298,11 @@ test("preserves numeric material normalization", async () => {
     {
       now: () => NOW_MS,
       repository: repository({
-        updateMining: async (_profileId, mining) => {
-          written = mining;
-          return "updated";
-        },
+        getProfileSnapshot: async () =>
+          profile(undefined, async (mining) => {
+            written = mining;
+            return "updated";
+          }),
       }),
       verifyIdentity,
     },
@@ -354,6 +354,21 @@ test("preserves every business failure response", async () => {
     reason: "profile-not-found",
   });
 
+  const missingSnapshot = await handleMiningRoute(
+    request(mineRequest()),
+    envWithRateLimit(),
+    ctx,
+    {
+      now: () => NOW_MS,
+      repository: repository({ getProfileSnapshot: async () => null }),
+      verifyIdentity,
+    },
+  );
+  assert.deepEqual(await responseJson(missingSnapshot), {
+    ok: false,
+    reason: "profile-not-found",
+  });
+
   const alreadyMinedState = {
     lastRockDate: "2026-08-18",
     materials: materials(3),
@@ -397,11 +412,7 @@ test("writes exact first and subsequent mining snapshots", async () => {
     { lastRockDate: "2026-08-17", materials: materials(4, 3, 2, 1, 0) },
   ];
   for (const state of states) {
-    const updates: Array<{
-      profileId: string;
-      mining: MiningSnapshot;
-      updateTime: string;
-    }> = [];
+    const updates: MiningSnapshot[] = [];
     const input = mineRequest(state);
     const response = await handleMiningRoute(
       request(input),
@@ -410,10 +421,12 @@ test("writes exact first and subsequent mining snapshots", async () => {
       {
         now: () => NOW_MS,
         repository: repository({
-          getProfileSnapshot: async () => profile(state),
-          updateMining: async (profileId, mining, updateTime) => {
-            updates.push({ profileId, mining, updateTime });
-            return "updated";
+          getProfileSnapshot: async (profileId) => {
+            assert.equal(profileId, "profile-1");
+            return profile(state, async (mining) => {
+              updates.push(mining);
+              return "updated";
+            });
           },
         }),
         verifyIdentity,
@@ -434,13 +447,7 @@ test("writes exact first and subsequent mining snapshots", async () => {
       ok: true,
       mining: expectedMining,
     });
-    assert.deepEqual(updates, [
-      {
-        profileId: "profile-1",
-        mining: expectedMining,
-        updateTime: "2026-08-18T10:00:00Z",
-      },
-    ]);
+    assert.deepEqual(updates, [expectedMining]);
   }
 });
 
@@ -470,16 +477,15 @@ test("re-reads after conflicts and bounds optimistic retries", async () => {
                 dust: state.materials.dust + reads - 1,
               },
             },
-            `2026-08-18T10:00:0${reads}Z`,
+            async () => {
+              writes++;
+              return writes < 3 ? "conflict" : "updated";
+            },
           );
         },
         readProfileOwnershipSnapshot: async () => {
           ownershipReads++;
           return ownershipSnapshot();
-        },
-        updateMining: async () => {
-          writes++;
-          return writes < 3 ? "conflict" : "updated";
         },
       }),
       verifyIdentity,
@@ -504,8 +510,7 @@ test("re-reads after conflicts and bounds optimistic retries", async () => {
       logFailure: (kind) => logged.push(kind),
       now: () => NOW_MS,
       repository: repository({
-        getProfileSnapshot: async () => profile(state),
-        updateMining: async () => "conflict",
+        getProfileSnapshot: async () => profile(state, async () => "conflict"),
       }),
       verifyIdentity,
     },

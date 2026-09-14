@@ -1427,14 +1427,10 @@ describe("canonical auth and profile runtime", () => {
     const miningProfile = await mining.getProfileSnapshot(miningProfileId);
     expect(miningProfile).not.toBeNull();
     expect(
-      await mining.updateMining(
-        linked.profileId,
-        {
-          lastRockDate: "2026-08-28",
-          materials: { dust: 1, slime: 2, gum: 3, metal: 4, ice: 5 },
-        },
-        miningProfile?.updateTime || "",
-      ),
+      await miningProfile!.commitMining({
+        lastRockDate: "2026-08-28",
+        materials: { dust: 1, slime: 2, gum: 3, metal: 4, ice: 5 },
+      }),
     ).toBe("updated");
 
     const repository = createProfileRepository(d1Env);

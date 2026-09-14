@@ -288,13 +288,16 @@ test("profile-link job coordination cannot use the retired Firebase outbox", () 
   assert.deepEqual(violations, []);
 });
 
-test("event progress installs the shared ownership snapshot", () => {
-  const source = readFileSync(
-    resolve(import.meta.dirname, "../src/eventProgress.ts"),
-    "utf8",
-  );
+test("event runtimes install the shared ownership snapshot through an independent factory", () => {
+  const factory = resolve(import.meta.dirname, "../src/workerEventRuntime.ts");
+  const source = readFileSync(factory, "utf8");
   assert.match(source, /readProfileOwnershipSnapshot:\s*\(query\)\s*=>/);
   assert.match(source, /requireProfileOwnershipSnapshot\(repository, query\)/);
+  for (const filename of ["eventOperations.ts", "eventProgress.ts"]) {
+    const consumer = resolve(import.meta.dirname, "../src", filename);
+    assert.ok(reachableRuntimeFiles(consumer).includes(factory));
+    assert.ok(!reachableRuntimeFiles(factory).includes(consumer));
+  }
 });
 
 test("ownership consumers cannot restore legacy APIs or final fences", () => {

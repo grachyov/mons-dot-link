@@ -17,6 +17,7 @@ import {
 import { createProfileCustomizationRepository } from "../src/profileCustomizationRepository.ts";
 import { createMiningRepository } from "../src/miningRepository.ts";
 import { createUsernameRepository } from "../src/usernameRepository.ts";
+import { ProfileWritesDisabledFailure } from "../src/authErrors.ts";
 import { applyRetiredProfileMigrations } from "./profileTestMigrations.ts";
 
 const testEnv = env as Env & { TEST_PROFILE_D1_MIGRATIONS: D1Migration[] };
@@ -95,6 +96,7 @@ function observeDatabase(
   } = {},
 ) {
   const firstQueries: string[] = [];
+  const allQueries: string[] = [];
   const batchQueries: string[][] = [];
   const nativeStatements = new WeakMap<object, D1PreparedStatement>();
   const statementQueries = new WeakMap<object, string>();
@@ -124,6 +126,12 @@ function observeDatabase(
               options.mapMutationRow
               ? options.mapMutationRow(row)
               : row;
+          };
+        }
+        if (property === "all") {
+          return () => {
+            allQueries.push(query);
+            return target.all();
           };
         }
         const member = Reflect.get(target, property, target);
@@ -160,7 +168,7 @@ function observeDatabase(
       return typeof member === "function" ? member.bind(target) : member;
     },
   });
-  return { database, firstQueries, batchQueries };
+  return { database, firstQueries, allQueries, batchQueries };
 }
 
 async function mergeOwner(
@@ -659,13 +667,16 @@ describe("canonical profile mutation reads", () => {
       lastRockDate: "2026-09-11",
       materials: { dust: 0, slime: 3, gum: 4, metal: 5, ice: 6 },
     };
-    await expect(
-      createMiningRepository(testEnv, { now: () => 4_000 }).updateMining(
-        initial.profile.profileId,
-        mining,
-        `d1:${initial.profile.revision}`,
-      ),
-    ).resolves.toBe("updated");
+    const observed = observeDatabase();
+    const snapshot = await createMiningRepository(testEnv, {
+      d1: observed.database,
+      now: () => 4_000,
+    }).getProfileSnapshot(initial.profile.profileId);
+    expect(snapshot).not.toBeNull();
+    await expect(snapshot!.commitMining(mining)).resolves.toBe("updated");
+    expect(observed.allQueries).toHaveLength(1);
+    expect(observed.firstQueries).toHaveLength(0);
+    expect(observed.batchQueries).toHaveLength(1);
     await expect(
       readCanonicalProfile(db, initial.profile.profileId),
     ).resolves.toEqual({
@@ -698,18 +709,16 @@ describe("canonical profile mutation reads", () => {
         );
       },
     });
+    const snapshot = await createMiningRepository(testEnv, {
+      d1: observed.database,
+      now: () => 4_000,
+    }).getProfileSnapshot(initial.profile.profileId);
+    expect(snapshot).not.toBeNull();
     await expect(
-      createMiningRepository(testEnv, {
-        d1: observed.database,
-        now: () => 4_000,
-      }).updateMining(
-        initial.profile.profileId,
-        {
-          lastRockDate: "2026-09-11",
-          materials: { dust: 0, slime: 3, gum: 4, metal: 5, ice: 6 },
-        },
-        `d1:${initial.profile.revision}`,
-      ),
+      snapshot!.commitMining({
+        lastRockDate: "2026-09-11",
+        materials: { dust: 0, slime: 3, gum: 4, metal: 5, ice: 6 },
+      }),
     ).resolves.toBe("conflict");
     await expect(
       readCanonicalProfile(db, initial.profile.profileId),
@@ -719,8 +728,39 @@ describe("canonical profile mutation reads", () => {
       revision: 2,
       updatedAtMs: 3_000,
     });
-    expect(observed.firstQueries).toHaveLength(1);
+    expect(observed.allQueries).toHaveLength(1);
+    expect(observed.firstQueries).toHaveLength(0);
     expect(observed.batchQueries).toHaveLength(1);
+  });
+
+  it("rejects a mining commit when writes freeze after reading its snapshot", async () => {
+    const initial = await createProfile();
+    const snapshot = await createMiningRepository(testEnv, {
+      now: () => 4_000,
+    }).getProfileSnapshot(initial.profile.profileId);
+    expect(snapshot).not.toBeNull();
+    await db
+      .prepare(
+        "UPDATE profile_canonical_control SET state = 'frozen' WHERE singleton = 1",
+      )
+      .run();
+    try {
+      await expect(
+        snapshot!.commitMining({
+          lastRockDate: "2026-09-11",
+          materials: { dust: 0, slime: 3, gum: 4, metal: 5, ice: 6 },
+        }),
+      ).rejects.toBeInstanceOf(ProfileWritesDisabledFailure);
+      await expect(
+        readCanonicalProfile(db, initial.profile.profileId),
+      ).resolves.toEqual(initial.profile);
+    } finally {
+      await db
+        .prepare(
+          "UPDATE profile_canonical_control SET state = 'active' WHERE singleton = 1",
+        )
+        .run();
+    }
   });
 
   it("never writes when customization authorization fails", async () => {

@@ -6,7 +6,6 @@ import {
 import {
   CanonicalProfileConflict,
   readCanonicalProfileOwnershipSnapshot,
-  readCanonicalProfile,
   resolveCanonicalProfile,
 } from "./profileCanonicalD1.ts";
 import {
@@ -17,31 +16,19 @@ import type { ProfileOwnershipReader } from "./profileOwnership.ts";
 import { mapCanonicalOwnershipSnapshot } from "./profileOwnershipMapping.ts";
 
 export type MiningProfile = {
-  mining: MiningSnapshot;
-  profileId: string;
-  updateTime: string;
+  readonly mining: MiningSnapshot;
+  readonly profileId: string;
+  commitMining: (mining: MiningSnapshot) => Promise<"conflict" | "updated">;
 };
 
 export type MiningRepository = ProfileOwnershipReader & {
   getProfileSnapshot: (profileId: string) => Promise<MiningProfile | null>;
-  updateMining: (
-    profileId: string,
-    mining: MiningSnapshot,
-    updateTime: string,
-  ) => Promise<"conflict" | "updated">;
 };
 
 type MiningRepositoryDependencies = {
   d1?: D1Database;
   now?: () => number;
 };
-
-function canonicalRevision(value: string): number | null {
-  const match = /^d1:(\d+)$/.exec(value);
-  if (!match) return null;
-  const revision = Number(match[1]);
-  return Number.isSafeInteger(revision) && revision > 0 ? revision : null;
-}
 
 export function createMiningRepository(
   env: Env,
@@ -60,38 +47,26 @@ export function createMiningRepository(
       return {
         profileId: profile.profileId,
         mining: normalizeMiningSnapshot(profile.profile.mining),
-        updateTime: `d1:${profile.revision}`,
-      };
-    },
-
-    async updateMining(profileId, mining, updateTime) {
-      const revision = canonicalRevision(updateTime);
-      if (revision === null) return "conflict";
-      const profile = await readCanonicalProfile(d1, profileId);
-      if (
-        !profile ||
-        profile.state !== "active" ||
-        profile.revision !== revision
-      ) {
-        return "conflict";
-      }
-      const value = materializeCanonicalProfileUpdate(
-        profile,
-        { ...profile.profile, mining },
-        now(),
-        {
-          sortUpdates: Object.fromEntries(
-            MATERIAL_KEYS.map((key) => [key, mining.materials[key]]),
-          ),
+        async commitMining(mining) {
+          const value = materializeCanonicalProfileUpdate(
+            profile,
+            { ...profile.profile, mining },
+            now(),
+            {
+              sortUpdates: Object.fromEntries(
+                MATERIAL_KEYS.map((key) => [key, mining.materials[key]]),
+              ),
+            },
+          );
+          try {
+            await commitCanonicalProfileUpdate(d1, profile, value);
+            return "updated";
+          } catch (error) {
+            if (error instanceof CanonicalProfileConflict) return "conflict";
+            throw error;
+          }
         },
-      );
-      try {
-        await commitCanonicalProfileUpdate(d1, profile, value);
-        return "updated";
-      } catch (error) {
-        if (error instanceof CanonicalProfileConflict) return "conflict";
-        throw error;
-      }
+      };
     },
   };
 }
