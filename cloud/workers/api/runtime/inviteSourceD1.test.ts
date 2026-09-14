@@ -16,6 +16,7 @@ import {
 } from "vitest";
 import {
   acquireInviteSourceAdmission,
+  createInviteSourceD1Store as createProductionInviteSourceD1Store,
   inviteSourceAdmissionGuardStatements,
   isInviteSourceRevisionConflict,
   normalizeInviteSource,
@@ -124,6 +125,50 @@ async function activate() {
     .run();
 }
 
+function observePreparationReads(
+  afterBatch?: (results: D1Result<Record<string, unknown>>[]) => void,
+) {
+  const sessions: (D1SessionConstraint | D1SessionBookmark | undefined)[] = [];
+  const queries: string[] = [];
+  const batches: number[] = [];
+  const database = new Proxy(db, {
+    get(target, property) {
+      if (property === "prepare" || property === "batch")
+        return () => {
+          throw new Error("unexpected-unscoped-read");
+        };
+      if (property === "withSession") {
+        return (constraint?: D1SessionConstraint | D1SessionBookmark) => {
+          sessions.push(constraint);
+          const session = target.withSession(constraint);
+          return {
+            prepare(query: string) {
+              queries.push(query);
+              return session.prepare(query);
+            },
+            async batch(statements: D1PreparedStatement[]) {
+              batches.push(statements.length);
+              const results =
+                await session.batch<Record<string, unknown>>(statements);
+              afterBatch?.(results);
+              return results;
+            },
+            getBookmark: session.getBookmark.bind(session),
+          };
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    store: createProductionInviteSourceD1Store(database),
+    sessions,
+    queries,
+    batches,
+  };
+}
+
 describe("canonical invite source", () => {
   beforeAll(() => applyD1Migrations(db, testEnv.TEST_D1_MIGRATIONS));
   afterEach(() => vi.restoreAllMocks());
@@ -142,6 +187,224 @@ describe("canonical invite source", () => {
         "UPDATE automatch_runtime_control SET backend = 'd1', state = 'active' WHERE singleton = 1",
       ),
     ]);
+  });
+
+  it("preloads control and unique invites in one primary batch while preserving change order", async () => {
+    await activate();
+    const original = {
+      hostId: "host",
+      count: 5,
+      password: "",
+      removable: true,
+      sessionTransition: { sequence: 7 },
+      automatchOperationIds: { host: "first" },
+    };
+    await db
+      .prepare("INSERT INTO invite_sources VALUES ('z-existing', ?, 4, 1)")
+      .bind(JSON.stringify(original))
+      .run();
+    const observed = observePreparationReads();
+    const prepared = await observed.store.prepareChanges(
+      [
+        {
+          inviteId: "z-existing",
+          value: {
+            count: { ".sv": { increment: 2 } },
+            touchedAt: { ".sv": "timestamp" },
+            removable: null,
+          },
+          operationIds: { host: "second" },
+        },
+        {
+          inviteId: "a-missing",
+          value: {
+            count: { ".sv": { increment: 3 } },
+            touchedAt: { ".sv": "timestamp" },
+          },
+        },
+        {
+          inviteId: "z-existing",
+          value: { count: { ".sv": { increment: 4 } } },
+          operationIds: { host: "third", guest: "joined" },
+        },
+        {
+          inviteId: "a-missing",
+          value: { count: { ".sv": { increment: 1 } } },
+        },
+      ],
+      345,
+    );
+    expect(observed.sessions).toEqual(["first-primary"]);
+    expect(observed.batches).toEqual([3]);
+    expect(observed.queries).toHaveLength(3);
+    expect(observed.queries[0]).toContain("FROM invite_source_control");
+    expect(
+      observed.queries
+        .slice(1)
+        .every((query) =>
+          query.includes("FROM invite_sources WHERE invite_id = ?"),
+        ),
+    ).toBe(true);
+    expect(prepared).toEqual([
+      {
+        current: { inviteId: "z-existing", value: original, revision: 4 },
+        value: {
+          hostId: "host",
+          count: 11,
+          password: "",
+          sessionTransition: { sequence: 7 },
+          automatchOperationIds: { host: "third", guest: "joined" },
+          touchedAt: 345,
+        },
+      },
+      {
+        current: { inviteId: "a-missing", value: null, revision: 0 },
+        value: { count: 4, touchedAt: 345 },
+      },
+    ]);
+  });
+
+  it.each(["retired", "missing", "invalid activation"])(
+    "validates %s control before decoding preloaded records",
+    async (control) => {
+      await activate();
+      await db
+        .prepare("INSERT INTO invite_sources VALUES ('one', ?, 1, 1)")
+        .bind(JSON.stringify({ wagers: { retired: true } }))
+        .run();
+      const observed = observePreparationReads((results) => {
+        if (control === "missing") results[0].results = [];
+        else if (control === "retired") {
+          results[0].results[0].backend = "rtdb";
+          results[0].results[0].epoch = 0;
+        } else results[0].results[0].verified_at_ms = null;
+      });
+      await expect(
+        observed.store.prepareChanges([{ inviteId: "one", value: {} }], 10),
+      ).rejects.toThrow(
+        control === "retired"
+          ? "invite-source-not-activated"
+          : "invite-source-control-unavailable",
+      );
+      expect(observed.batches).toEqual([2]);
+    },
+  );
+
+  it.each([
+    { name: "retired fields", value: { wagers: {} }, revision: 1 },
+    {
+      name: "invalid nested keys",
+      value: { settings: { "bad/key": true } },
+      revision: 1,
+    },
+    { name: "fractional revisions", value: { hostId: "host" }, revision: 1.5 },
+  ])("rejects preloaded records with $name", async ({ value, revision }) => {
+    await activate();
+    await db
+      .prepare("INSERT INTO invite_sources VALUES ('one', ?, ?, 1)")
+      .bind(JSON.stringify(value), revision)
+      .run();
+    const store = createProductionInviteSourceD1Store(db);
+    await expect(
+      store.prepareChanges([{ inviteId: "one", value: {} }], 10),
+    ).rejects.toThrow("invite-source-corrupt");
+    await expect(store.read("one")).rejects.toThrow("invite-source-corrupt");
+  });
+
+  it("does no preparation I/O for empty changes or an already aborted request", async () => {
+    const observed = observePreparationReads();
+    const reason = new Error("preparation-canceled");
+    const signal = AbortSignal.abort(reason);
+    expect(await observed.store.prepareChanges([], 1, signal)).toEqual([]);
+    await expect(
+      observed.store.prepareChanges(
+        [{ inviteId: "one", value: {} }],
+        1,
+        signal,
+      ),
+    ).rejects.toBe(reason);
+    expect(observed.sessions).toEqual([]);
+    expect(observed.queries).toEqual([]);
+    expect(observed.batches).toEqual([]);
+  });
+
+  it("honors cancellation after the batch before validating its results", async () => {
+    const controller = new AbortController();
+    const reason = new Error("preparation-canceled-after-read");
+    const observed = observePreparationReads(() => controller.abort(reason));
+    await expect(
+      observed.store.prepareChanges(
+        [{ inviteId: "one", value: {} }],
+        10,
+        controller.signal,
+      ),
+    ).rejects.toBe(reason);
+    expect(observed.sessions).toEqual(["first-primary"]);
+    expect(observed.batches).toEqual([2]);
+  });
+
+  it("rejects stale preloaded revisions without committing another invite", async () => {
+    await activate();
+    const store = createProductionInviteSourceD1Store(db);
+    const first = await store.prepareChanges(
+      [{ inviteId: "one", value: { hostId: "first" } }],
+      1,
+    );
+    const stale = await store.prepareChanges(
+      [
+        { inviteId: "two", value: { hostId: "two" } },
+        { inviteId: "one", value: { hostId: "loser" } },
+      ],
+      1,
+    );
+    await db.batch(store.buildCommitStatements(first, 1));
+    let failure: unknown;
+    try {
+      await db.batch(store.buildCommitStatements(stale, 2));
+    } catch (error) {
+      failure = error;
+    }
+    expect(isInviteSourceRevisionConflict(failure)).toBe(true);
+    expect(await store.read("one")).toEqual({
+      inviteId: "one",
+      value: { hostId: "first" },
+      revision: 1,
+    });
+    expect(await store.read("two")).toEqual({
+      inviteId: "two",
+      value: null,
+      revision: 0,
+    });
+  });
+
+  it("permits frozen preparation while fencing a stale write admission", async () => {
+    await activate();
+    const admission = await acquireInviteSourceAdmission(db, "preparation", {
+      now: () => 10,
+    });
+    const store = createProductionInviteSourceD1Store(db, {
+      writeGuards: () => inviteSourceAdmissionGuardStatements(db, admission),
+    });
+    const prepared = await store.prepareChanges(
+      [{ inviteId: "one", value: { hostId: "host" } }],
+      10,
+    );
+    await db
+      .prepare(
+        "UPDATE invite_source_control SET state = 'frozen', freeze_generation = 1 WHERE singleton = 1",
+      )
+      .run();
+    expect(
+      await store.prepareChanges(
+        [{ inviteId: "one", value: { hostId: "host" } }],
+        10,
+      ),
+    ).toEqual(prepared);
+    await expect(
+      db.batch(store.buildCommitStatements(prepared, 11)),
+    ).rejects.toThrow();
+    expect((await store.read("one")).value).toBeNull();
+    await releaseInviteSourceAdmission(db, admission);
   });
 
   it("preserves private and unknown metadata while excluding retired sources", () => {

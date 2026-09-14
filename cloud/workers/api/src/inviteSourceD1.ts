@@ -453,8 +453,20 @@ export async function readInviteSourceSnapshot(
     .bind(inviteId)
     .first<{ source_json: string; revision: number }>();
   signal?.throwIfAborted();
+  return decodeInviteSourceSnapshot(inviteId, row);
+}
+
+function decodeInviteSourceSnapshot(
+  inviteId: string,
+  row: unknown,
+): InviteSourceSnapshot {
   if (!row) return { inviteId, value: null, revision: 0 };
-  if (!integer(row.revision) || row.revision < 1)
+  if (
+    !record(row) ||
+    typeof row.source_json !== "string" ||
+    !integer(row.revision) ||
+    row.revision < 1
+  )
     throw new InviteSourceFailure("invite-source-corrupt");
   try {
     const decoded: unknown = JSON.parse(row.source_json);
@@ -494,6 +506,32 @@ export function createInviteSourceD1Store(
       throw new InviteSourceFailure("invite-source-not-activated");
     return readInviteSourceSnapshot(db, inviteId, signal);
   };
+
+  async function readMutationSnapshots(
+    inviteIds: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<InviteSourceSnapshot[]> {
+    if (!inviteIds.length) return [];
+    signal?.throwIfAborted();
+    const session = db.withSession("first-primary");
+    const [controlRows, ...snapshots] = await session.batch([
+      prepareInviteSourceControlRead(session),
+      ...inviteIds.map((inviteId) =>
+        session
+          .prepare(
+            "SELECT source_json, revision FROM invite_sources WHERE invite_id = ?",
+          )
+          .bind(inviteId),
+      ),
+    ]);
+    signal?.throwIfAborted();
+    const control = parseInviteSourceControlRow(controlRows.results[0]);
+    if (control.backend !== "d1")
+      throw new InviteSourceFailure("invite-source-not-activated");
+    return inviteIds.map((inviteId, index) =>
+      decodeInviteSourceSnapshot(inviteId, snapshots[index].results[0]),
+    );
+  }
 
   const buildRevisionGuardStatements = (
     mutations: readonly InviteSourceMutation[],
@@ -571,11 +609,14 @@ export function createInviteSourceD1Store(
         group.push(change);
         grouped.set(change.inviteId, group);
       }
-      const mutations: InviteSourceMutation[] = [];
-      for (const [inviteId, group] of grouped) {
-        const current = await read(inviteId, signal);
+      const groups = [...grouped.values()];
+      const snapshots = await readMutationSnapshots(
+        [...grouped.keys()],
+        signal,
+      );
+      return snapshots.map((current, index) => {
         const next = structuredClone(current.value || {});
-        for (const change of group) {
+        for (const change of groups[index]) {
           for (const [key, value] of Object.entries(change.value)) {
             requireId(key);
             setNested(
@@ -591,9 +632,8 @@ export function createInviteSourceD1Store(
             setNested(next, ["automatchOperationIds", loginUid], operationId);
           }
         }
-        mutations.push({ current, value: normalizeInviteSource(next) });
-      }
-      return mutations;
+        return { current, value: normalizeInviteSource(next) };
+      });
     },
   };
 }
