@@ -1,26 +1,40 @@
-import { readAutomatchRuntimeControl } from "./automatchD1.ts";
-import { assertGameSessionResourceAvailable } from "./gameSessionTransitions.ts";
 import {
-  createInviteSourceD1Store,
+  parseAutomatchRuntimeControlRow,
+  prepareAutomatchRuntimeControlRead,
+} from "./automatchD1.ts";
+import {
+  assertGameSessionResourceAvailable,
+  assertNoGameSessionResourceTransition,
+  prepareGameSessionResourceTransitionRead,
+} from "./gameSessionTransitions.ts";
+import {
   InviteSourceFailure,
-  readInviteSourceControl,
+  parseInviteSourceControlRow,
+  prepareInviteSourceControlRead,
+  readInviteSourceSnapshot,
 } from "./inviteSourceD1.ts";
 export function createInviteSourceReader(
   env: Pick<Env, "PROFILE_GAMES_DB">,
 ): (inviteId: string) => Promise<unknown> {
-  const source = createInviteSourceD1Store(env.PROFILE_GAMES_DB);
+  const db = env.PROFILE_GAMES_DB;
   return async (inviteId) => {
-    const mode = await readAutomatchRuntimeControl(env.PROFILE_GAMES_DB);
-    const control = await readInviteSourceControl(env.PROFILE_GAMES_DB);
+    const session = db.withSession("first-primary");
+    const [modeRows, controlRows, transitionRows] = await session.batch([
+      prepareAutomatchRuntimeControlRead(session),
+      prepareInviteSourceControlRead(session),
+      prepareGameSessionResourceTransitionRead(session, inviteId),
+    ]);
+    const mode = parseAutomatchRuntimeControlRow(modeRows.results[0]);
+    const control = parseInviteSourceControlRow(controlRows.results[0]);
     if (mode.backend !== "d1" && control.backend === "d1") {
       throw new InviteSourceFailure("invite-source-session-backend-conflict");
     }
     if (control.backend !== "d1") {
       throw new InviteSourceFailure("invite-source-not-activated");
     }
-    await assertGameSessionResourceAvailable(env.PROFILE_GAMES_DB, inviteId);
-    const snapshot = await source.read(inviteId);
-    await assertGameSessionResourceAvailable(env.PROFILE_GAMES_DB, inviteId);
+    assertNoGameSessionResourceTransition(transitionRows.results[0]);
+    const snapshot = await readInviteSourceSnapshot(db, inviteId);
+    await assertGameSessionResourceAvailable(db, inviteId);
     return snapshot.value;
   };
 }

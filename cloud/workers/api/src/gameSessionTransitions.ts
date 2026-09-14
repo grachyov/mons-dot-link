@@ -177,29 +177,41 @@ function readPayload(row: TransitionRow): TransitionPayload {
   return payload;
 }
 
-function readGameSessionResourceTransition(
-  db: D1Database,
+export function prepareGameSessionResourceTransitionRead(
+  db: Pick<D1Database, "prepare">,
   resourceKey: string,
-): Promise<TransitionRow | null> {
+): D1PreparedStatement {
   return db
-    .withSession("first-primary")
     .prepare(
       `SELECT t.transition_id, t.invite_id, t.payload_json, t.status
         FROM game_session_transition_resources r
         JOIN game_session_transitions t ON t.transition_id = r.transition_id
         WHERE r.resource_key = ?`,
     )
-    .bind(resourceKey)
-    .first<TransitionRow>();
+    .bind(resourceKey);
+}
+
+function readGameSessionResourceTransition(
+  db: D1Database,
+  resourceKey: string,
+): Promise<TransitionRow | null> {
+  return prepareGameSessionResourceTransitionRead(
+    db.withSession("first-primary"),
+    resourceKey,
+  ).first<TransitionRow>();
+}
+
+export function assertNoGameSessionResourceTransition(row: unknown): void {
+  if (row) fail("resource-pending");
 }
 
 export async function assertGameSessionResourceAvailable(
   db: D1Database,
   resourceKey: string,
 ): Promise<void> {
-  if (await readGameSessionResourceTransition(db, resourceKey)) {
-    fail("resource-pending");
-  }
+  assertNoGameSessionResourceTransition(
+    await readGameSessionResourceTransition(db, resourceKey),
+  );
 }
 
 export function createGameSessionTransitions({

@@ -125,13 +125,16 @@ export function normalizeInviteSource(value: unknown): Record<string, unknown> {
   );
 }
 
-export async function readInviteSourceControl(
-  db: D1Database,
-): Promise<InviteSourceControl> {
-  const row = await db
-    .withSession("first-primary")
-    .prepare("SELECT * FROM invite_source_control WHERE singleton = 1")
-    .first<ControlRow>();
+export function prepareInviteSourceControlRead(
+  db: Pick<D1Database, "prepare">,
+): D1PreparedStatement {
+  return db.prepare("SELECT * FROM invite_source_control WHERE singleton = 1");
+}
+
+export function parseInviteSourceControlRow(
+  value: unknown,
+): InviteSourceControl {
+  const row = value as ControlRow | null | undefined;
   if (
     !row ||
     (row.backend !== RETIRED_STATE_BACKEND && row.backend !== "d1") ||
@@ -170,6 +173,15 @@ export async function readInviteSourceControl(
     activatedAtMs: row.activated_at_ms,
     metadata,
   };
+}
+
+export async function readInviteSourceControl(
+  db: D1Database,
+): Promise<InviteSourceControl> {
+  const row = await prepareInviteSourceControlRead(
+    db.withSession("first-primary"),
+  ).first<ControlRow>();
+  return parseInviteSourceControlRow(row);
 }
 
 export function inviteSourceControlGuardStatements(
@@ -427,6 +439,40 @@ export function isInviteSourceRevisionConflict(error: unknown): boolean {
   );
 }
 
+export async function readInviteSourceSnapshot(
+  db: D1Database,
+  inviteId: string,
+  signal?: AbortSignal,
+): Promise<InviteSourceSnapshot> {
+  requireId(inviteId);
+  const row = await db
+    .withSession("first-primary")
+    .prepare(
+      "SELECT source_json, revision FROM invite_sources WHERE invite_id = ?",
+    )
+    .bind(inviteId)
+    .first<{ source_json: string; revision: number }>();
+  signal?.throwIfAborted();
+  if (!row) return { inviteId, value: null, revision: 0 };
+  if (!integer(row.revision) || row.revision < 1)
+    throw new InviteSourceFailure("invite-source-corrupt");
+  try {
+    const decoded: unknown = JSON.parse(row.source_json);
+    if (
+      !record(decoded) ||
+      Object.keys(decoded).some((key) => RETIRED_FIELDS.has(key))
+    )
+      throw new TypeError("invalid-invite-source-json");
+    return {
+      inviteId,
+      value: normalizeInviteSource(decoded),
+      revision: row.revision,
+    };
+  } catch (error) {
+    throw new InviteSourceFailure("invite-source-corrupt", { cause: error });
+  }
+}
+
 export function createInviteSourceD1Store(
   db: D1Database,
   {
@@ -446,32 +492,7 @@ export function createInviteSourceD1Store(
     const control = await readInviteSourceControl(db);
     if (control.backend !== "d1")
       throw new InviteSourceFailure("invite-source-not-activated");
-    const row = await db
-      .withSession("first-primary")
-      .prepare(
-        "SELECT source_json, revision FROM invite_sources WHERE invite_id = ?",
-      )
-      .bind(inviteId)
-      .first<{ source_json: string; revision: number }>();
-    signal?.throwIfAborted();
-    if (!row) return { inviteId, value: null, revision: 0 };
-    if (!integer(row.revision) || row.revision < 1)
-      throw new InviteSourceFailure("invite-source-corrupt");
-    try {
-      const decoded: unknown = JSON.parse(row.source_json);
-      if (
-        !record(decoded) ||
-        Object.keys(decoded).some((key) => RETIRED_FIELDS.has(key))
-      )
-        throw new TypeError("invalid-invite-source-json");
-      return {
-        inviteId,
-        value: normalizeInviteSource(decoded),
-        revision: row.revision,
-      };
-    } catch (error) {
-      throw new InviteSourceFailure("invite-source-corrupt", { cause: error });
-    }
+    return readInviteSourceSnapshot(db, inviteId, signal);
   };
 
   const buildRevisionGuardStatements = (

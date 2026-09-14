@@ -145,13 +145,18 @@ function nullableTimestamp(value: number | null): number | null {
   return value === null ? null : timestamp(value);
 }
 
-export async function readAutomatchRuntimeControl(
-  db: D1Database,
-): Promise<AutomatchRuntimeControl> {
-  const row = await db
-    .withSession("first-primary")
-    .prepare("SELECT * FROM automatch_runtime_control WHERE singleton = 1")
-    .first<ControlRow>();
+export function prepareAutomatchRuntimeControlRead(
+  db: Pick<D1Database, "prepare">,
+): D1PreparedStatement {
+  return db.prepare(
+    "SELECT * FROM automatch_runtime_control WHERE singleton = 1",
+  );
+}
+
+export function parseAutomatchRuntimeControlRow(
+  value: unknown,
+): AutomatchRuntimeControl {
+  const row = value as ControlRow | null | undefined;
   if (
     !row ||
     (row.backend !== RETIRED_STATE_BACKEND && row.backend !== "d1") ||
@@ -181,6 +186,15 @@ export async function readAutomatchRuntimeControl(
   } catch (error) {
     throw new AutomatchD1Failure("automatch-control-corrupt", { cause: error });
   }
+}
+
+export async function readAutomatchRuntimeControl(
+  db: D1Database,
+): Promise<AutomatchRuntimeControl> {
+  const row = await prepareAutomatchRuntimeControlRead(
+    db.withSession("first-primary"),
+  ).first<ControlRow>();
+  return parseAutomatchRuntimeControlRow(row);
 }
 
 function admissionFromRow(row: AdmissionRow): AutomatchWriteAdmission {
