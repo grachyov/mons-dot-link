@@ -257,9 +257,13 @@ describe("canonical match room integration", () => {
     };
     await runInDurableObject(room, (instance) => {
       const target = instance as unknown as {
-        deliverMatchEffect: (effect: MatchStateEffect) => Promise<void>;
+        matchEffects: {
+          dependencies: {
+            deliver: (effect: MatchStateEffect) => Promise<void>;
+          };
+        };
       };
-      target.deliverMatchEffect = failDelivery;
+      target.matchEffects.dependencies.deliver = failDelivery;
     });
     expect(
       unwrapMatchStateRpc(
@@ -286,9 +290,13 @@ describe("canonical match room integration", () => {
     await evictDurableObject(room);
     await runInDurableObject(room, (instance) => {
       const target = instance as unknown as {
-        deliverMatchEffect: (effect: MatchStateEffect) => Promise<void>;
+        matchEffects: {
+          dependencies: {
+            deliver: (effect: MatchStateEffect) => Promise<void>;
+          };
+        };
       };
-      target.deliverMatchEffect = failDelivery;
+      target.matchEffects.dependencies.deliver = failDelivery;
     });
     expect(await runDurableObjectAlarm(room)).toBe(true);
     expect(attempts).toBe(1);
@@ -319,9 +327,13 @@ describe("canonical match room integration", () => {
     await evictDurableObject(room);
     await runInDurableObject(room, (instance) => {
       const target = instance as unknown as {
-        deliverMatchEffect: (effect: MatchStateEffect) => Promise<void>;
+        matchEffects: {
+          dependencies: {
+            deliver: (effect: MatchStateEffect) => Promise<void>;
+          };
+        };
       };
-      target.deliverMatchEffect = async (effect) => {
+      target.matchEffects.dependencies.deliver = async (effect) => {
         attempts++;
         expect(effect).toMatchObject({
           inviteId,

@@ -37,7 +37,6 @@ import { captureMatchStateRpc, type MatchStateRpc } from "./matchStateRpc.ts";
 import type {
   MatchStateClaimTimerRequest,
   MatchStateCreateRequest,
-  MatchStateEffect,
   MatchStateEventEffectsRequest,
   MatchStateMoveRequest,
   MatchStatePairRequest,
@@ -47,15 +46,9 @@ import type {
 } from "./matchStateTypes.ts";
 import { createMatchTimerStartStore } from "./gameplayCoordinationD1.ts";
 import {
-  acquireEventWriteAdmission,
-  commitEventMutations,
-  releaseEventWriteAdmission,
-} from "./eventD1.ts";
-import {
-  buildEventProgressPlan,
-  ensureEventProgressWorkflow,
-} from "./eventProgress.ts";
-import { assertProfileBackgroundMutationsEnabled } from "./profileCanonicalActivation.ts";
+  createMatchEffectDelivery,
+  MatchEffectsDispatcher,
+} from "./matchEffectsDispatcher.ts";
 import {
   listMatchPresentationRegistrations,
   selectRegisteredPresentations,
@@ -124,7 +117,7 @@ export class InviteReactions
   private readonly matchSync: MatchSyncRoom;
   private readonly matchState: MatchStateStore;
   private readonly socketSessions: SocketSessions;
-  private matchEffectsPending: Promise<void> | null = null;
+  private readonly matchEffects: MatchEffectsDispatcher;
   private inviteReader: (inviteId: string) => Promise<unknown>;
   private wagerReader: (inviteId: string) => Promise<WagerStateSnapshot[]>;
   private inviteAlarmSequence: Promise<void> = Promise.resolve();
@@ -154,6 +147,10 @@ export class InviteReactions
       timerStarts: createMatchTimerStartStore(env.PROFILE_GAMES_DB),
       scheduleAlarm: (atMs, transaction) =>
         this.scheduleInviteAlarm(atMs, transaction),
+    });
+    this.matchEffects = new MatchEffectsDispatcher(this.matchState, {
+      deliver: createMatchEffectDelivery(env),
+      scheduleAlarm: (atMs) => this.scheduleInviteAlarm(atMs),
     });
     this.matchSync = new MatchSyncRoom(ctx, {
       pinInvite: (inviteId) => {
@@ -483,75 +480,6 @@ export class InviteReactions
     }
   }
 
-  private async deliverMatchEffect(effect: MatchStateEffect): Promise<void> {
-    await assertProfileBackgroundMutationsEnabled(this.env);
-    await createMatchTimerStartStore(this.env.PROFILE_GAMES_DB).deletePair(
-      effect.playerId,
-      effect.opponentId,
-      effect.matchId,
-    );
-    if (!effect.eventId) return;
-    const plan = await buildEventProgressPlan(
-      {
-        eventId: effect.eventId,
-        sourceKey: effect.sourceKey,
-        reason: effect.reason,
-      },
-      effect.claimedAtMs,
-    );
-    const admission = await acquireEventWriteAdmission(this.env.EVENT_DB);
-    let released = false;
-    try {
-      await commitEventMutations(
-        this.env.EVENT_DB,
-        [
-          {
-            kind: "progress-outbox",
-            outboxId: plan.outboxId,
-            value: plan.outbox,
-          },
-        ],
-        { admission },
-      );
-    } finally {
-      released = await releaseEventWriteAdmission(this.env.EVENT_DB, admission);
-    }
-    if (!released) throw new Error("match-event-admission-release-unconfirmed");
-    await ensureEventProgressWorkflow(this.env, plan);
-  }
-
-  private dispatchMatchEffects(): Promise<void> {
-    if (this.matchEffectsPending) return this.matchEffectsPending;
-    const pending = this.flushMatchEffects();
-    this.matchEffectsPending = pending;
-    void pending
-      .finally(() => {
-        if (this.matchEffectsPending === pending)
-          this.matchEffectsPending = null;
-      })
-      .catch(() => undefined);
-    return pending;
-  }
-
-  private async flushMatchEffects(): Promise<void> {
-    for (const effect of this.matchState.listDueEffects(Date.now(), 20)) {
-      try {
-        await this.deliverMatchEffect(effect);
-        this.matchState.completeEffect(effect.effectId);
-      } catch (error) {
-        await this.matchState.retryEffect(effect.effectId, Date.now() + 60_000);
-        console.error({
-          event: "canonical_match_effect_retry",
-          inviteId: effect.inviteId,
-          matchId: effect.matchId,
-          kind: error instanceof Error ? error.name : "unknown",
-        });
-      }
-    }
-    const next = this.matchState.nextEffectAt();
-    if (next !== null) await this.scheduleInviteAlarm(next);
-  }
-
   async notifyMatchesChanged(
     inviteId: string,
     matchIds?: string[],
@@ -578,7 +506,7 @@ export class InviteReactions
         () => this.inviteChannels.alarm(),
         () => this.matchSync.alarm(),
         () => this.socketSessions.nextExpiry(),
-        () => this.dispatchMatchEffects(),
+        () => this.matchEffects.dispatch(),
       ]) {
         try {
           await work();

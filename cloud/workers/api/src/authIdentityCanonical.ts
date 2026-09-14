@@ -19,6 +19,16 @@ import {
 } from "@mons/shared/usernames";
 import { AuthApiFailure } from "./authErrors.ts";
 import {
+  assertAuthOperationContext,
+  canCompleteVerifyOperation,
+  createVerifyOperationMeta,
+  isAuthOperationReplayExpired,
+  matchesVerifiedAuthMethod,
+  readVerifyOperationMeta,
+  verifyReplayState,
+  type VerifyOperationMeta,
+} from "./authOperationReplay.ts";
+import {
   createAuthStateRepository,
   type AuthIntentRecord,
 } from "./authStateD1.ts";
@@ -74,7 +84,6 @@ import {
 } from "./profileCanonicalD1.ts";
 import { createUsernameRepository } from "./usernameRepository.ts";
 
-const AUTH_OP_REPLAY_TTL_MS = 10 * 60 * 1_000;
 const LINK_METHOD_MAX_ATTEMPTS = 3;
 const AUTO_NAME_MAX_ATTEMPTS = 30;
 const CANONICAL_AUTH_COMMIT_QUERY_BUDGET = 500;
@@ -637,51 +646,25 @@ export function createCanonicalAuthIdentityService(
     };
   };
 
-  const operationContext = (
-    operation: CanonicalAuthOperationSnapshot,
-    kind: "unlink" | "verify",
-    method: AuthMethodKey,
-    uid: string,
-    expectedMeta?: Record<string, unknown> | null,
-  ): void => {
-    if (
-      operation.loginUid !== uid ||
-      operation.kind !== kind ||
-      operation.method !== method
-    ) {
-      authFailure(403, "permission-denied", "op-context-mismatch");
-    }
-    if (kind === "verify" && expectedMeta !== undefined) {
-      const stored = record(operation.meta);
-      const expected = record(expectedMeta);
-      if (
-        cleanString(stored.methodValueHash) !==
-          cleanString(expected.methodValueHash) ||
-        cleanString(stored.intentId) !== cleanString(expected.intentId)
-      ) {
-        authFailure(403, "permission-denied", "op-context-mismatch");
-      }
-    }
-  };
-
   const liveResponse = async (
     operation: CanonicalAuthOperationSnapshot,
   ): Promise<AuthProfileResponse | LinkedAuthMethodsResponse | null> => {
     if (
       operation.status !== "success" ||
-      now() - operation.updatedAtMs > AUTH_OP_REPLAY_TTL_MS ||
+      isAuthOperationReplayExpired(operation, now()) ||
       !operation.result
     )
       return null;
     const profile = await profileByLogin(operation.loginUid);
     if (!profile) return null;
     if (operation.kind === "verify") {
-      const expectedHash = cleanString(record(operation.meta).methodValueHash);
+      const expectedHash = readVerifyOperationMeta(
+        operation.meta,
+      ).methodValueHash;
       const current = methodValue(profile.aggregate, operation.method);
       if (
         !current ||
-        !expectedHash ||
-        hashMethodValue(operation.method, current) !== expectedHash
+        !matchesVerifiedAuthMethod(operation.method, current, expectedHash)
       )
         return null;
       return isAuthProfileResponse(operation.result)
@@ -704,12 +687,17 @@ export function createCanonicalAuthIdentityService(
     kind: "unlink" | "verify",
     method: AuthMethodKey,
     uid: string,
-    meta: Record<string, unknown> | null,
+    meta: VerifyOperationMeta | null,
   ) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const existing = await readCanonicalAuthOperation(db, operationId);
       if (existing) {
-        operationContext(existing, kind, method, uid, meta);
+        assertAuthOperationContext(existing, {
+          kind,
+          method,
+          loginUid: uid,
+          meta,
+        });
         const replay = await liveResponse(existing);
         if (replay) return { operation: existing, replay };
         if (existing.status === "success")
@@ -1451,8 +1439,11 @@ export function createCanonicalAuthIdentityService(
   ): CanonicalAuthMethodSnapshot | null => {
     const current = methodFromAggregate(profile.aggregate, method);
     return current &&
-      methodValueHash &&
-      hashMethodValue(method, current.normalizedValue) === methodValueHash
+      matchesVerifiedAuthMethod(
+        method,
+        current.normalizedValue,
+        methodValueHash,
+      )
       ? current
       : null;
   };
@@ -1476,13 +1467,7 @@ export function createCanonicalAuthIdentityService(
     verified: RepairedVerifiedCaller,
     result: AuthProfileResponse,
   ): Promise<boolean> => {
-    if (
-      operation.kind !== "verify" ||
-      (operation.status !== "started" && operation.status !== "failed") ||
-      operation.method !== verified.method.method ||
-      cleanString(record(operation.meta).methodValueHash) !==
-        hashMethodValue(verified.method.method, verified.method.normalizedValue)
-    ) {
+    if (!canCompleteVerifyOperation(operation, verified.method)) {
       return false;
     }
     const value: CanonicalAuthOperationValue = {
@@ -1573,8 +1558,8 @@ export function createCanonicalAuthIdentityService(
       operation.loginUid !== uid ||
       operation.kind !== "verify" ||
       operation.method !== method ||
-      cleanString(record(operation.meta).intentId) !== intentId ||
-      now() - operation.updatedAtMs > AUTH_OP_REPLAY_TTL_MS
+      readVerifyOperationMeta(operation.meta).intentId !== intentId ||
+      isAuthOperationReplayExpired(operation, now())
     )
       return parseIntent(intent, uid, method);
     return parsed;
@@ -1618,14 +1603,19 @@ export function createCanonicalAuthIdentityService(
     };
   };
 
-  const verifyMeta = (input: LinkInput) => ({
-    methodValue:
-      input.method === "apple" || input.method === "x"
-        ? "redacted"
-        : input.methodValueRaw,
-    methodValueHash: hashMethodValue(input.method, input.normalizedMethodValue),
-    ...(input.intentId ? { intentId: input.intentId } : {}),
-  });
+  const repairCompletedVerifyReplay = async (
+    input: LinkInput,
+    replay: AuthProfileResponse | LinkedAuthMethodsResponse | null,
+  ): Promise<AuthProfileResponse | null> => {
+    if (!replay || !isAuthProfileResponse(replay)) return null;
+    const completed = await repairVerifiedCaller(
+      input.uid,
+      input.method,
+      hashMethodValue(input.method, input.normalizedMethodValue),
+    );
+    if (!completed) authFailure(409, "aborted", "method-index-race-retry");
+    return profileResponse(completed.identity, input.uid, input.opId);
+  };
 
   return {
     consumeIntent,
@@ -1638,17 +1628,10 @@ export function createCanonicalAuthIdentityService(
         "verify",
         input.method,
         input.uid,
-        verifyMeta(input),
+        createVerifyOperationMeta(input),
       );
-      if (started.replay && isAuthProfileResponse(started.replay)) {
-        const completed = await repairVerifiedCaller(
-          input.uid,
-          input.method,
-          hashMethodValue(input.method, input.normalizedMethodValue),
-        );
-        if (!completed) authFailure(409, "aborted", "method-index-race-retry");
-        return profileResponse(completed.identity, input.uid, input.opId);
-      }
+      const replay = await repairCompletedVerifyReplay(input, started.replay);
+      if (replay) return replay;
       if (intent.consumedAtMs > 0) return null;
       try {
         await consumeIntent(
@@ -1673,17 +1656,10 @@ export function createCanonicalAuthIdentityService(
         "verify",
         input.method,
         input.uid,
-        verifyMeta(input),
+        createVerifyOperationMeta(input),
       );
-      if (started.replay && isAuthProfileResponse(started.replay)) {
-        const completed = await repairVerifiedCaller(
-          input.uid,
-          input.method,
-          hashMethodValue(input.method, input.normalizedMethodValue),
-        );
-        if (!completed) authFailure(409, "aborted", "method-index-race-retry");
-        return profileResponse(completed.identity, input.uid, input.opId);
-      }
+      const replay = await repairCompletedVerifyReplay(input, started.replay);
+      if (replay) return replay;
       try {
         const current = await profileByLogin(input.uid);
         const methodOwner = await readCanonicalAuthMethod(
@@ -1746,27 +1722,22 @@ export function createCanonicalAuthIdentityService(
     async peekVerifyReplay(opId, method, uid) {
       const operation = await readCanonicalAuthOperation(db, opId);
       if (!operation) return null;
-      operationContext(operation, "verify", method, uid);
-      if (now() - operation.updatedAtMs > AUTH_OP_REPLAY_TTL_MS) return null;
-      const isCompletedReplay =
-        operation.status === "success" &&
-        isAuthProfileResponse(operation.result);
-      if (
-        !isCompletedReplay &&
-        operation.status !== "started" &&
-        operation.status !== "failed"
-      ) {
-        return null;
-      }
+      assertAuthOperationContext(operation, {
+        kind: "verify",
+        method,
+        loginUid: uid,
+      });
+      const replayState = verifyReplayState(operation, now());
+      if (!replayState) return null;
       const verified = await repairVerifiedCaller(
         uid,
         method,
-        cleanString(record(operation.meta).methodValueHash),
+        readVerifyOperationMeta(operation.meta).methodValueHash,
       );
       if (!verified) return null;
       const response = profileResponse(verified.identity, uid, opId);
       if (
-        !isCompletedReplay &&
+        replayState === "incomplete" &&
         !(await completeVerifySuccess(operation, verified, response))
       ) {
         return null;
@@ -1781,13 +1752,20 @@ export function createCanonicalAuthIdentityService(
     ) {
       const operation = await readCanonicalAuthOperation(db, result.opId);
       if (!operation) return null;
-      operationContext(operation, "verify", method, uid);
+      assertAuthOperationContext(operation, {
+        kind: "verify",
+        method,
+        loginUid: uid,
+      });
       const normalized = normalizeMethodValue(method, expectedMethodValue);
       if (
         operation.status !== "success" ||
-        now() - operation.updatedAtMs > AUTH_OP_REPLAY_TTL_MS ||
-        cleanString(record(operation.meta).methodValueHash) !==
-          hashMethodValue(method, normalized)
+        isAuthOperationReplayExpired(operation, now()) ||
+        !matchesVerifiedAuthMethod(
+          method,
+          normalized,
+          readVerifyOperationMeta(operation.meta).methodValueHash,
+        )
       )
         return null;
       const verified = await repairVerifiedCaller(

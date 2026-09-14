@@ -103,6 +103,60 @@ describe("event prize withdrawal D1 repository", () => {
     });
   });
 
+  it("deletes existing and absent records without consulting the fallback clock", async () => {
+    const store = createD1EventPrizeWithdrawalStore(
+      testEnv.EVENT_PRIZE_WITHDRAWALS_DB,
+      {
+        now: () => {
+          throw new Error("unexpected-clock-read");
+        },
+      },
+    );
+    const reference = store.record(eventId, prizeId);
+    await reference.transaction(() => ({ value: processing(100) }));
+    for (const decision of ["deleted", "already-absent"]) {
+      await expect(
+        reference.transaction(() => ({ value: null, decision })),
+      ).resolves.toEqual({
+        committed: true,
+        decision,
+        value: null,
+      });
+      await expect(reference.read()).resolves.toBeNull();
+    }
+  });
+
+  it("does not retry domain validation or timestamp failures", async () => {
+    let decisions = 0;
+    let clockCalls = 0;
+    const reference = createD1EventPrizeWithdrawalStore(
+      testEnv.EVENT_PRIZE_WITHDRAWALS_DB,
+      {
+        now: () => {
+          clockCalls++;
+          return Number.NaN;
+        },
+      },
+    ).record(eventId, prizeId);
+    await expect(
+      reference.transaction(() => {
+        decisions++;
+        return { value: { ...processing(100), eventId: "different-event" } };
+      }),
+    ).rejects.toThrow("invalid-event-prize-withdrawal-record");
+    expect(decisions).toBe(1);
+    expect(clockCalls).toBe(0);
+    await expect(
+      reference.transaction(() => {
+        decisions++;
+        return { value: processing(0) };
+      }),
+    ).rejects.toThrow("event-prize-withdrawal-d1-unavailable");
+    expect(decisions).toBe(2);
+    expect(clockCalls).toBe(1);
+    await expect(reference.read()).resolves.toBeNull();
+  });
+
   it("replaces completed records and reports D1 storage control mode", async () => {
     const store = createD1EventPrizeWithdrawalStore(
       testEnv.EVENT_PRIZE_WITHDRAWALS_DB,

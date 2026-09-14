@@ -15,7 +15,7 @@ type AlarmComponents = {
     nextAlarm: () => number | null;
   };
   matchState: { nextEffectAt: () => number | null };
-  dispatchMatchEffects: () => Promise<void>;
+  matchEffects: { dispatch: () => Promise<void> };
 };
 
 const rooms: Room[] = [];
@@ -64,7 +64,7 @@ it("refreshes sockets and expiry before awaiting effects, then schedules the ear
     };
     target.matchSync.nextAlarm = () => now + 4_000;
     target.matchState.nextEffectAt = () => now + 60_000;
-    target.dispatchMatchEffects = async () => {
+    target.matchEffects.dispatch = async () => {
       phases.push("effects");
       started();
       await gate;
@@ -112,7 +112,7 @@ for (const failed of ["invite", "match", "effects"] as const) {
       target.matchSync.alarm = () => run("match");
       target.matchSync.nextAlarm = () => deadline + 1_000;
       target.matchState.nextEffectAt = () => deadline + 60_000;
-      target.dispatchMatchEffects = () => run("effects");
+      target.matchEffects.dispatch = () => run("effects");
       await expect(instance.alarm()).rejects.toBe(error);
       expect(phases).toEqual([
         "expiry",
@@ -140,7 +140,7 @@ it("schedules surviving deadlines when another component cannot read its deadlin
     target.matchSync.alarm = async () => {};
     target.matchSync.nextAlarm = () => deadline + 5_000;
     target.matchState.nextEffectAt = () => deadline + 60_000;
-    target.dispatchMatchEffects = async () => {};
+    target.matchEffects.dispatch = async () => {};
     await expect(instance.alarm()).rejects.toBe(error);
     expect(await state.storage.getAlarm()).toBe(deadline);
   });

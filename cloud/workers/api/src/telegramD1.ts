@@ -10,6 +10,7 @@ import type {
 import { validateTelegramMessageKey } from "../../../runtime/telegram/desiredStateCore.js";
 import { validateTelegramTransactionDecision } from "./telegramTransaction.ts";
 import type { EventAnnouncementKind } from "./eventAnnouncementKinds.ts";
+import { runOptimisticTransaction } from "./optimisticTransaction.ts";
 
 const MAX_D1_TRANSACTION_ATTEMPTS = 25;
 
@@ -140,80 +141,57 @@ async function transactRow(
     ) => TransactionDecision<TelegramStoredRecord>;
   },
 ): Promise<TransactionResult<TelegramStoredRecord>> {
-  for (let attempt = 0; attempt < MAX_D1_TRANSACTION_ATTEMPTS; attempt += 1) {
-    const current = await readRow(db, input.table, input.keyColumn, input.key);
-    const decision = validateTelegramTransactionDecision(
-      input.updater(current?.record ?? null),
-    );
-    if (!decision.commit) {
-      return {
-        committed: false,
-        decision: decision.decision,
-        value: current?.record ?? null,
-      };
-    }
-    const updatedAtMs = Math.max(1, Math.floor(input.now()));
-    if (decision.value === null) {
-      if (!current) {
-        return {
-          committed: true,
-          decision: decision.decision,
-          value: null,
-        };
-      }
-      const deleted = await db
-        .prepare(
-          `DELETE FROM ${input.table}
+  return runOptimisticTransaction({
+    maxAttempts: MAX_D1_TRANSACTION_ATTEMPTS,
+    read: () => readRow(db, input.table, input.keyColumn, input.key),
+    decide(current) {
+      const decision = validateTelegramTransactionDecision(
+        input.updater(current),
+      );
+      return decision.commit
+        ? { value: decision.value, decision: decision.decision }
+        : { commit: false, decision: decision.decision };
+    },
+    async write(current, next) {
+      const updatedAtMs = Math.max(1, Math.floor(input.now()));
+      if (next === null) {
+        if (!current) {
+          return { applied: true, value: null };
+        }
+        const deleted = await db
+          .prepare(
+            `DELETE FROM ${input.table}
            WHERE ${input.keyColumn} = ? AND version = ?`,
-        )
-        .bind(input.key, current.version)
-        .run();
-      if (deleted.meta.changes === 1) {
-        return {
-          committed: true,
-          decision: decision.decision,
-          value: null,
-        };
+          )
+          .bind(input.key, current.version)
+          .run();
+        return { applied: deleted.meta.changes === 1, value: null };
       }
-      continue;
-    }
-    const encoded = encodeJsonRecord(decision.value);
-    if (!current) {
-      const inserted = await db
-        .prepare(
-          `INSERT INTO ${input.table} (
+      const encoded = encodeJsonRecord(next);
+      if (!current) {
+        const inserted = await db
+          .prepare(
+            `INSERT INTO ${input.table} (
              ${input.keyColumn}, record_json, version, updated_at_ms
            ) VALUES (?, ?, 1, ?)
            ON CONFLICT (${input.keyColumn}) DO NOTHING`,
-        )
-        .bind(input.key, encoded, updatedAtMs)
-        .run();
-      if (inserted.meta.changes === 1) {
-        return {
-          committed: true,
-          decision: decision.decision,
-          value: asRecord(decision.value),
-        };
+          )
+          .bind(input.key, encoded, updatedAtMs)
+          .run();
+        return { applied: inserted.meta.changes === 1, value: asRecord(next) };
       }
-      continue;
-    }
-    const updated = await db
-      .prepare(
-        `UPDATE ${input.table}
+      const updated = await db
+        .prepare(
+          `UPDATE ${input.table}
          SET record_json = ?, version = version + 1, updated_at_ms = ?
          WHERE ${input.keyColumn} = ? AND version = ?`,
-      )
-      .bind(encoded, updatedAtMs, input.key, current.version)
-      .run();
-    if (updated.meta.changes === 1) {
-      return {
-        committed: true,
-        decision: decision.decision,
-        value: asRecord(decision.value),
-      };
-    }
-  }
-  throw new TelegramD1Failure();
+        )
+        .bind(encoded, updatedAtMs, input.key, current.version)
+        .run();
+      return { applied: updated.meta.changes === 1, value: asRecord(next) };
+    },
+    conflictError: () => new TelegramD1Failure(),
+  });
 }
 
 export function createD1TelegramRepository(

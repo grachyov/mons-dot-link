@@ -4,6 +4,7 @@ import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import {
   createD1TelegramAnnouncementRepository,
   createD1TelegramRepository,
+  MAX_D1_TRANSACTION_ATTEMPTS,
   readTelegramStorageMode,
 } from "../src/telegramD1.ts";
 
@@ -81,6 +82,57 @@ describe("Telegram D1 repositories", () => {
       ),
     );
     expect(await repositories[0].getMessage("counter")).toEqual({ count: 12 });
+  });
+
+  it("deletes existing and absent records while retaining transaction decisions", async () => {
+    let clockCalls = 0;
+    const repository = createD1TelegramRepository(testEnv.TELEGRAM_DB, {
+      now: () => ++clockCalls,
+    });
+    await repository.transactMessage("delete-message", () => ({
+      value: { count: 1 },
+    }));
+    for (const decision of ["deleted", "already-absent"]) {
+      await expect(
+        repository.transactMessage("delete-message", () => ({
+          value: null,
+          decision,
+        })),
+      ).resolves.toEqual({
+        committed: true,
+        decision,
+        value: null,
+      });
+      await expect(repository.getMessage("delete-message")).resolves.toBeNull();
+    }
+    expect(clockCalls).toBe(3);
+    expect(MAX_D1_TRANSACTION_ATTEMPTS).toBe(25);
+  });
+
+  it("does not retry invalid decisions or unencodable records", async () => {
+    let clockCalls = 0;
+    const repository = createD1TelegramRepository(testEnv.TELEGRAM_DB, {
+      now: () => ++clockCalls,
+    });
+    await expect(
+      repository.transactMessage("invalid", () => ({
+        commit: false,
+        value: {},
+      })),
+    ).rejects.toThrow("Telegram logical abort must not include value");
+    expect(clockCalls).toBe(0);
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    let decisions = 0;
+    await expect(
+      repository.transactMessage("invalid", () => {
+        decisions++;
+        return { value: circular };
+      }),
+    ).rejects.toThrow("telegram-d1-unavailable");
+    expect(decisions).toBe(1);
+    expect(clockCalls).toBe(1);
+    await expect(repository.getMessage("invalid")).resolves.toBeNull();
   });
 
   it("serializes the bot-wide retry barrier and API gate", async () => {

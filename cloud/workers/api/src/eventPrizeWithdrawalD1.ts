@@ -2,6 +2,7 @@ import type {
   TransactionDecision,
   TransactionResult,
 } from "./repositoryContracts.ts";
+import { runOptimisticTransaction } from "./optimisticTransaction.ts";
 const MAX_TRANSACTION_ATTEMPTS = 12;
 
 type JsonRow = {
@@ -169,70 +170,50 @@ async function transactRow(
   ) => TransactionDecision<Record<string, unknown>>,
   now: () => number,
 ): Promise<TransactionResult<Record<string, unknown>>> {
-  for (let attempt = 0; attempt < MAX_TRANSACTION_ATTEMPTS; attempt += 1) {
-    const current = await readRow(db, eventId, prizeId);
-    const decision = updater(current?.record ?? null);
-    if ("commit" in decision)
-      return {
-        committed: false,
-        decision: decision.decision,
-        value: current?.record ?? null,
-      };
-    const next = decision.value;
-    if (next === null) {
-      if (!current)
-        return { committed: true, decision: decision.decision, value: null };
-      const deleted = await db
-        .prepare(
-          `DELETE FROM event_prize_withdrawals
+  return runOptimisticTransaction({
+    maxAttempts: MAX_TRANSACTION_ATTEMPTS,
+    read: () => readRow(db, eventId, prizeId),
+    decide: updater,
+    async write(current, next) {
+      if (next === null) {
+        if (!current) return { applied: true, value: null };
+        const deleted = await db
+          .prepare(
+            `DELETE FROM event_prize_withdrawals
            WHERE event_id = ? AND prize_id = ? AND version = ?`,
-        )
-        .bind(eventId, prizeId, current.version)
-        .run();
-      if (deleted.meta.changes > 0) {
-        return { committed: true, decision: decision.decision, value: null };
+          )
+          .bind(eventId, prizeId, current.version)
+          .run();
+        return { applied: deleted.meta.changes > 0, value: null };
       }
-      continue;
-    }
-    const normalized = normalizeRecord(eventId, prizeId, next);
-    const encoded = encodeRecord(eventId, prizeId, normalized);
-    const timestamp = updatedAtMs(normalized, now);
-    if (!current) {
-      const inserted = await db
-        .prepare(
-          `INSERT INTO event_prize_withdrawals (
+      const normalized = normalizeRecord(eventId, prizeId, next);
+      const encoded = encodeRecord(eventId, prizeId, normalized);
+      const timestamp = updatedAtMs(normalized, now);
+      if (!current) {
+        const inserted = await db
+          .prepare(
+            `INSERT INTO event_prize_withdrawals (
              event_id, prize_id, record_json, version, updated_at_ms
            ) VALUES (?, ?, ?, 1, ?)
            ON CONFLICT (event_id, prize_id) DO NOTHING`,
-        )
-        .bind(eventId, prizeId, encoded, timestamp)
-        .run();
-      if (inserted.meta.changes > 0) {
-        return {
-          committed: true,
-          decision: decision.decision,
-          value: normalized,
-        };
+          )
+          .bind(eventId, prizeId, encoded, timestamp)
+          .run();
+        return { applied: inserted.meta.changes > 0, value: normalized };
       }
-      continue;
-    }
-    const updated = await db
-      .prepare(
-        `UPDATE event_prize_withdrawals
+      const updated = await db
+        .prepare(
+          `UPDATE event_prize_withdrawals
          SET record_json = ?, version = version + 1, updated_at_ms = ?
          WHERE event_id = ? AND prize_id = ? AND version = ?`,
-      )
-      .bind(encoded, timestamp, eventId, prizeId, current.version)
-      .run();
-    if (updated.meta.changes > 0) {
-      return {
-        committed: true,
-        decision: decision.decision,
-        value: normalized,
-      };
-    }
-  }
-  throw new EventPrizeWithdrawalD1Failure("event-prize-withdrawal-d1-conflict");
+        )
+        .bind(encoded, timestamp, eventId, prizeId, current.version)
+        .run();
+      return { applied: updated.meta.changes > 0, value: normalized };
+    },
+    conflictError: () =>
+      new EventPrizeWithdrawalD1Failure("event-prize-withdrawal-d1-conflict"),
+  });
 }
 
 export async function readEventPrizeWithdrawalStorageMode(
