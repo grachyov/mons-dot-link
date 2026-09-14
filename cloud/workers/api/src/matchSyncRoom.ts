@@ -18,6 +18,7 @@ import {
   type SocketSessions,
 } from "./socketSession.ts";
 import { readSocketAdmission } from "./socketAdmission.ts";
+import { GameSessionTransitionFailure } from "./gameSessionCodec.ts";
 
 export const MATCH_SYNC_REPAIR_MS = 5_000;
 
@@ -231,6 +232,14 @@ export class MatchSyncRoom {
         if (!current()) continue;
         state.result = undefined;
         if (readingSource && attempt < 2) continue;
+        if (
+          readingSource &&
+          error instanceof GameSessionTransitionFailure &&
+          error.message === "game-session-transition-resource-pending"
+        ) {
+          await this.scheduleMatch(matchId, Date.now() + MATCH_SYNC_REPAIR_MS);
+          throw error;
+        }
         this.close(matchId, 1011, "Match source unavailable");
         throw error;
       }
@@ -460,7 +469,7 @@ export class MatchSyncRoom {
         } catch (error) {
           const code =
             error instanceof Error &&
-            /^(?:match|invite|event|profile)[a-zA-Z0-9:_-]{0,120}$/.test(
+            /^(?:match|invite|event|profile|game-session)[a-zA-Z0-9:_-]{0,120}$/.test(
               error.message,
             )
               ? error.message

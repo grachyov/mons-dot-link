@@ -19,6 +19,7 @@ import {
 import type { InviteReactions } from "../src/inviteReactions.ts";
 import type { MatchSyncMetadata } from "../src/matchSync.ts";
 import { MATCH_SYNC_REPAIR_MS } from "../src/matchSyncRoom.ts";
+import { GameSessionTransitionFailure } from "../src/gameSessionCodec.ts";
 
 type Room = DurableObjectStub<InviteReactions>;
 type Source = {
@@ -488,6 +489,74 @@ describe("live match snapshots", () => {
       expect(channel.socket.readyState).toBe(WebSocket.OPEN);
     });
   }
+
+  it.each(["notification", "alarm"] as const)(
+    "keeps healthy sockets through a pending transition and recovers by %s",
+    async (recovery) => {
+      vi.spyOn(Date, "now").mockReturnValue(Date.now());
+      const { room, inviteId, source } = await fixture(false);
+      const channel = await connect(room, inviteId);
+      const initial = await channel.snapshot();
+      let fenced = true;
+      let attempts = 0;
+      await runInDurableObject(room, (instance) => {
+        const mutable = instance as unknown as {
+          matchSync: {
+            dependencies: {
+              readMetadata: (inviteId: string) => Promise<unknown>;
+            };
+          };
+        };
+        const readMetadata = mutable.matchSync.dependencies.readMetadata;
+        mutable.matchSync.dependencies.readMetadata = async (id) => {
+          if (fenced) {
+            attempts++;
+            throw new GameSessionTransitionFailure("resource-pending");
+          }
+          return readMetadata(id);
+        };
+      });
+      source.invite.guestId = "guest-login";
+      source.matches.set(`guest-login/${inviteId}`, {
+        ...match,
+        color: "black",
+      });
+      await room.notifyMetadataChanged(inviteId);
+      await runNextAlarm(room);
+      expect(attempts).toBe(3);
+      expect(channel.messages).toHaveLength(0);
+      expect(channel.socket.readyState).toBe(WebSocket.OPEN);
+      await runInDurableObject(room, async (instance, state) => {
+        const saved = state.storage.sql
+          .exec<{ snapshot_json: string; next_at_ms: number }>(
+            "SELECT snapshot_json, next_at_ms FROM match_sync_snapshots WHERE match_id = ?",
+            inviteId,
+          )
+          .one();
+        expect(JSON.parse(saved.snapshot_json)).toEqual(initial);
+        expect(saved.next_at_ms).toBe(Date.now() + MATCH_SYNC_REPAIR_MS);
+        expect(await state.storage.getAlarm()).toBe(saved.next_at_ms);
+        await expect(instance.readMatches(inviteId, inviteId)).rejects.toThrow(
+          "game-session-transition-resource-pending",
+        );
+      });
+      expect(attempts).toBe(6);
+      await runDurableObjectAlarm(room);
+      expect(attempts).toBe(6);
+      expect(channel.messages).toHaveLength(0);
+      expect(channel.socket.readyState).toBe(WebSocket.OPEN);
+      fenced = false;
+      if (recovery === "notification")
+        await room.notifyMetadataChanged(inviteId);
+      await runNextAlarm(room);
+      expect(await channel.snapshot()).toMatchObject({
+        revision: 2,
+        guestPlayerId: "guest-login",
+        guestMatch: { color: "black" },
+      });
+      expect(channel.socket.readyState).toBe(WebSocket.OPEN);
+    },
+  );
 
   it("does not retry malformed match snapshots as a transient source failure", async () => {
     const { room, inviteId, source } = await fixture();
