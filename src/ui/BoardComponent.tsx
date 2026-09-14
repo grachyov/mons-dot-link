@@ -9,8 +9,6 @@ import React, {
 import styled from "styled-components";
 import { FaTimes, FaCheck } from "react-icons/fa";
 import {
-  isWatchOnly,
-  subscribeToWatchOnly,
   didClickBotStrengthControlButton,
   getCurrentDisplayedBoardSquareTypes,
   subscribeToDisplayedBoardSquareTypes,
@@ -24,7 +22,7 @@ import {
   isPangchiuBoard,
   subscribeToBoardColorSetChanges,
 } from "../content/boardStyles";
-import { defaultInputEventName, isMobile } from "../utils/misc";
+import { isMobile } from "../utils/misc";
 import { generateBoardPattern } from "../utils/boardPatternGenerator";
 import {
   attachRainbowAura,
@@ -36,29 +34,17 @@ import {
   playerSideMetadata,
   opponentSideMetadata,
   openBoardPlayerInfoProfile,
-  setWagerRenderHandler,
-  setWagerSlotLayouts,
   WAGER_WIN_PILE_SCALE as WAGER_WIN_STACK_SCALE,
   WagerPileSide,
   WagerPileRect,
   WagerSlotLayout,
-  WagerRenderState,
-  WagerPileRenderState,
   applyInviteBotButtonLayout,
 } from "../game/board";
-import {
-  setWagerPanelOutsideTapHandler,
-  setWagerPanelVisibilityChecker,
-} from "./controls/bottomControlsPort";
 import {
   bindBoardVideoReactionHandler,
   resetBoardVideoReactionHandler,
   showVideoReaction,
 } from "./controls/boardReactionPort";
-import { connection } from "../connection/connection";
-import { MatchWagerState } from "../connection/connectionModels";
-import { subscribeToWagerState } from "../game/wagerState";
-import { useAvailableMaterials } from "../hooks/useAvailableMaterials";
 import { getImageResource } from "../resources/imageResources";
 import { registerBoardTransientUiHandler } from "./uiSession";
 import {
@@ -73,6 +59,15 @@ import type {
   BoardPlayerInfoSlotState,
 } from "../game/boardUiPort";
 import type { BotAutomoveMode } from "../game/botAutomoveMode";
+
+import { BoardWagerLayer } from "./wagers/BoardWagerLayer";
+import { useBoardWagers } from "./wagers/useBoardWagers";
+import {
+  BOARD_WIDTH_UNITS,
+  BOARD_HEIGHT_UNITS,
+  toPercentX,
+  toPercentY,
+} from "./boardOverlayGeometry";
 
 export type {
   BoardInviteBotButtonLayout,
@@ -242,27 +237,8 @@ const VIDEO_REACTION_DEFAULT_LIFETIME_MS = 7000;
 const VIDEO_REACTION_MIN_LIFETIME_MS = 1000;
 const VIDEO_REACTION_MAX_LIFETIME_MS = 12000;
 const VIDEO_REACTION_END_GRACE_MS = 700;
-const BOARD_WIDTH_UNITS = 11;
-const BOARD_HEIGHT_UNITS = 14.1;
-const BOARD_MID_Y_UNITS = BOARD_HEIGHT_UNITS * 0.5;
 const BOARD_VIEWBOX_WIDTH = BOARD_WIDTH_UNITS * 100;
 const BOARD_VIEWBOX_HEIGHT = BOARD_HEIGHT_UNITS * 100;
-const WAGER_PANEL_PADDING_X_FRAC = 0.2;
-const WAGER_PANEL_PADDING_Y_FRAC = 0.2;
-const WAGER_PANEL_BUTTON_HEIGHT_FRAC = 0.4;
-const WAGER_PANEL_BUTTON_GAP_PX = 8;
-const WAGER_PANEL_PILE_GAP_FRAC = 0.2;
-const WAGER_PANEL_MIN_PADDING_PX = 12;
-const WAGER_PANEL_MIN_BUTTON_HEIGHT_PX = 34;
-const WAGER_PANEL_MIN_DECLINE_BUTTON_WIDTH_PX = 80;
-const WAGER_PANEL_MIN_ACCEPT_BUTTON_WIDTH_PX = 110;
-const WAGER_PANEL_MIN_PLAYER_BUTTON_WIDTH_PX = 150;
-const WAGER_PANEL_BUTTON_PADDING_X_PX = 16;
-const WAGER_PANEL_COUNT_GAP_FRAC = 0.06;
-const WAGER_PANEL_COUNT_MIN_GAP_PX = 4;
-const WAGER_PANEL_COUNT_MIN_WIDTH_PX = 32;
-const WAGER_PANEL_COUNT_Y_OFFSET_FRAC = 0.04;
-const wagerUiDebugLogsEnabled = import.meta.env.DEV;
 const BOT_STRENGTH_IGNORE_MOUSE_AFTER_TOUCH_MS = 700;
 const MIN_HORIZONTAL_OFFSET = 0.21;
 const END_OF_GAME_ICON_BASE_URL = "https://cdn.lil.org/mons/icons";
@@ -296,28 +272,6 @@ const WAGER_STACK_REACTION_GAP_MULTIPLIER = 0.08;
 const NAME_REACTION_GAP_MULTIPLIER = 0.0777;
 const WAGER_STACK_WIDTH_MULTIPLIER = 1.08;
 const WAGER_STACK_HEIGHT_MULTIPLIER = 0.94;
-
-const PENDING_PULSE_KEYFRAMES_NAME = "wagerPilePendingPulse";
-const PENDING_PULSE_ANIMATION = `${PENDING_PULSE_KEYFRAMES_NAME} 1.4s ease-in-out infinite`;
-
-const injectPendingPulseKeyframes = (() => {
-  let injected = false;
-  return () => {
-    if (injected) return;
-    injected = true;
-    const style = document.createElement("style");
-    style.textContent = `
-      @keyframes ${PENDING_PULSE_KEYFRAMES_NAME} {
-        0%, 100% { opacity: 1; }
-        15% { opacity: 1; }
-        40% { opacity: 0.2; }
-        60% { opacity: 0.2; }
-        85% { opacity: 1; }
-      }
-    `;
-    document.head.appendChild(style);
-  };
-})();
 
 const getVideoReactionPlaybackLifetimeMs = (videoElement: HTMLVideoElement) => {
   const currentTimeSeconds =
@@ -596,21 +550,6 @@ const useVideoReactionSlot = (
   };
 };
 
-type WagerPileElements = {
-  player: HTMLDivElement;
-  opponent: HTMLDivElement;
-  winner: HTMLDivElement;
-  playerDisappearing: HTMLDivElement;
-  opponentDisappearing: HTMLDivElement;
-  playerIcons: HTMLImageElement[];
-  opponentIcons: HTMLImageElement[];
-  winnerIcons: HTMLImageElement[];
-  playerDisappearingIcons: HTMLImageElement[];
-  opponentDisappearingIcons: HTMLImageElement[];
-};
-
-const toPercentX = (value: number) => (value / BOARD_WIDTH_UNITS) * 100;
-const toPercentY = (value: number) => (value / BOARD_HEIGHT_UNITS) * 100;
 const toOverlayFontSizePx = (
   svgFontSize: number,
   boardViewportRect: BoardViewportRect,
@@ -885,13 +824,7 @@ const getAvatarSize = (
   boardPixelSize: { width: number; height: number } | null,
 ) => 0.777 * getOuterElementsMultiplicator(boardPixelSize);
 
-type WagerStackRightEdges = Record<WagerPileSide, number>;
 type WagerSlotLayoutBySide = Record<WagerPileSide, WagerSlotLayout>;
-
-const emptyWagerStackRightEdges: WagerStackRightEdges = {
-  player: 0,
-  opponent: 0,
-};
 
 const hiddenWagerRect: WagerPileRect = { x: 0, y: 0, w: 0, h: 0 };
 const hiddenWagerSlotLayout: WagerSlotLayout = {
@@ -960,45 +893,6 @@ const playerInfoSlotHasVisibleName = (slot: BoardPlayerInfoSlotState) => {
 
 const playerInfoSlotHasNameReaction = (slot: BoardPlayerInfoSlotState) =>
   slot.nameReactionText !== "";
-
-const getWagerSideForBoardRect = (
-  rect: Pick<WagerPileRect, "y">,
-): WagerPileSide => (rect.y < BOARD_MID_Y_UNITS ? "opponent" : "player");
-
-const getWagerPileVisualSlot = (pile: WagerPileRenderState): WagerPileSide => {
-  if (pile.side === "player" || pile.side === "opponent") {
-    return pile.side;
-  }
-  return getWagerSideForBoardRect(pile.rect);
-};
-
-const addWagerStackRightEdgeForPile = (
-  rightEdges: WagerStackRightEdges,
-  pile: WagerPileRenderState | null,
-) => {
-  if (!pile) {
-    return;
-  }
-  const slot = getWagerPileVisualSlot(pile);
-  rightEdges[slot] = Math.max(rightEdges[slot], pile.rect.x + pile.rect.w);
-};
-
-const wagerStackRightEdgesEqual = (
-  a: WagerStackRightEdges,
-  b: WagerStackRightEdges,
-) => a.player === b.player && a.opponent === b.opponent;
-
-const getWagerIconPaintDepth = (
-  frame: { y: number },
-  rect: Pick<WagerPileRect, "y" | "h">,
-) => {
-  if (rect.h <= 0) {
-    return 0;
-  }
-  const normalizedTop = (frame.y - rect.y) / rect.h;
-  const clampedTop = Math.max(0, Math.min(1, normalizedTop));
-  return Math.round((1 - clampedTop) * 1000);
-};
 
 const getInviteBotButtonLayout = (
   scoreX: number,
@@ -1311,111 +1205,7 @@ const getBoardPlayerInfoLayout = (
   };
 };
 
-const getWagerPanelLayout = (
-  rect: { x: number; y: number; w: number; h: number },
-  isOpponent: boolean,
-  boardPixelSize: { width: number; height: number } | null,
-  hasActions: boolean,
-): {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  gridRows: string;
-  paddingXPx: number;
-  pileRow: number;
-  buttonRow: number;
-  buttonGapPx: number;
-  declineButtonMinWidthPx: number;
-  acceptButtonMinWidthPx: number;
-  playerButtonMinWidthPx: number;
-  buttonPaddingXPx: number;
-  countGap: number;
-} => {
-  const pxPerUnitX = boardPixelSize
-    ? boardPixelSize.width / BOARD_WIDTH_UNITS
-    : null;
-  const pxPerUnitY = boardPixelSize
-    ? boardPixelSize.height / BOARD_HEIGHT_UNITS
-    : null;
-  const minPaddingX = pxPerUnitX ? WAGER_PANEL_MIN_PADDING_PX / pxPerUnitX : 0;
-  const minPaddingY = pxPerUnitY ? WAGER_PANEL_MIN_PADDING_PX / pxPerUnitY : 0;
-  const paddingX = Math.max(rect.w * WAGER_PANEL_PADDING_X_FRAC, minPaddingX);
-  const paddingY = Math.max(rect.h * WAGER_PANEL_PADDING_Y_FRAC, minPaddingY);
-  const minButtonHeight = pxPerUnitY
-    ? WAGER_PANEL_MIN_BUTTON_HEIGHT_PX / pxPerUnitY
-    : 0;
-  const buttonHeight = hasActions
-    ? Math.max(rect.h * WAGER_PANEL_BUTTON_HEIGHT_FRAC, minButtonHeight)
-    : 0;
-  const minCountGap = pxPerUnitX
-    ? WAGER_PANEL_COUNT_MIN_GAP_PX / pxPerUnitX
-    : 0;
-  const countGap = Math.max(rect.w * WAGER_PANEL_COUNT_GAP_FRAC, minCountGap);
-  const minCountWidth = pxPerUnitX
-    ? WAGER_PANEL_COUNT_MIN_WIDTH_PX / pxPerUnitX
-    : 0;
-  const pileGap = hasActions ? rect.h * WAGER_PANEL_PILE_GAP_FRAC : 0;
-  const borderAndBufferPx = 4;
-  const opponentButtonsMinWidthPx =
-    WAGER_PANEL_MIN_DECLINE_BUTTON_WIDTH_PX +
-    WAGER_PANEL_MIN_ACCEPT_BUTTON_WIDTH_PX +
-    WAGER_PANEL_BUTTON_GAP_PX +
-    borderAndBufferPx;
-  const playerButtonMinWidthPx =
-    WAGER_PANEL_MIN_PLAYER_BUTTON_WIDTH_PX + borderAndBufferPx;
-  const buttonRowMinWidthPx = isOpponent
-    ? opponentButtonsMinWidthPx
-    : playerButtonMinWidthPx;
-  const buttonRowMinWidthUnits = pxPerUnitX
-    ? buttonRowMinWidthPx / pxPerUnitX
-    : 0;
-  const minPanelContentWidth = rect.w + countGap + minCountWidth;
-  const buttonRowWidth = hasActions
-    ? Math.max(rect.w, buttonRowMinWidthUnits, minPanelContentWidth)
-    : minPanelContentWidth;
-  const panelWidth = buttonRowWidth + paddingX * 2;
-  const panelHeight = rect.h + paddingY * 2 + pileGap + buttonHeight;
-  const centerX = rect.x + rect.w / 2;
-  const panelX = centerX - panelWidth / 2;
-  const panelY = isOpponent
-    ? rect.y - paddingY
-    : rect.y - (panelHeight - rect.h - paddingY);
-  const rowValues = hasActions
-    ? isOpponent
-      ? [paddingY, rect.h, pileGap, buttonHeight, paddingY]
-      : [paddingY, buttonHeight, pileGap, rect.h, paddingY]
-    : [paddingY, rect.h, paddingY];
-  const gridRows = rowValues
-    .map((value) => `${(value / panelHeight) * 100}%`)
-    .join(" ");
-  const paddingXPx = pxPerUnitX
-    ? paddingX * pxPerUnitX
-    : WAGER_PANEL_MIN_PADDING_PX;
-  const pileRow = hasActions ? (isOpponent ? 2 : 4) : 2;
-  const buttonRow = hasActions ? (isOpponent ? 4 : 2) : 0;
-
-  return {
-    x: panelX,
-    y: panelY,
-    width: panelWidth,
-    height: panelHeight,
-    gridRows,
-    paddingXPx,
-    pileRow,
-    buttonRow,
-    buttonGapPx: WAGER_PANEL_BUTTON_GAP_PX,
-    declineButtonMinWidthPx: WAGER_PANEL_MIN_DECLINE_BUTTON_WIDTH_PX,
-    acceptButtonMinWidthPx: WAGER_PANEL_MIN_ACCEPT_BUTTON_WIDTH_PX,
-    playerButtonMinWidthPx: WAGER_PANEL_MIN_PLAYER_BUTTON_WIDTH_PX,
-    buttonPaddingXPx: WAGER_PANEL_BUTTON_PADDING_X_PX,
-    countGap,
-  };
-};
-
 const BoardComponent: React.FC = () => {
-  injectPendingPulseKeyframes();
-
   const transitionTimeoutIdsRef = useRef<Set<number>>(new Set());
   const [currentColorSet, setCurrentColorSet] =
     useState<ColorSet>(getCurrentColorSet());
@@ -1449,27 +1239,12 @@ const BoardComponent: React.FC = () => {
     ok?: () => void;
     cancel?: () => void;
   }>({ blurry: true, svgElement: null, withConfirmAndCancelButtons: false });
-  const [wagerState, setWagerState] = useState<MatchWagerState | null>(null);
-  const { availableMaterials, frozenMaterialsStatus } = useAvailableMaterials();
-  const [watchOnlySnapshot, setWatchOnlySnapshot] = useState(isWatchOnly);
   const [playerUidSnapshot, setPlayerUidSnapshot] = useState(
     playerSideMetadata.uid,
   );
   const [opponentUidSnapshot, setOpponentUidSnapshot] = useState(
     opponentSideMetadata.uid,
   );
-  const [activeWagerPanelSide, setActiveWagerPanelSide] = useState<
-    WagerPileSide | "winner" | null
-  >(null);
-  const [activeWagerPanelRect, setActiveWagerPanelRect] = useState<{
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-  } | null>(null);
-  const [activeWagerPanelCount, setActiveWagerPanelCount] = useState<
-    number | null
-  >(null);
   const [botStrengthHovered, setBotStrengthHovered] = useState(false);
   const [botStrengthPressed, setBotStrengthPressed] = useState(false);
   const [boardPixelSize, setBoardPixelSize] = useState<{
@@ -1482,46 +1257,6 @@ const BoardComponent: React.FC = () => {
     seeIfShouldOffsetFromBorders(),
   );
   const boardSvgRef = useRef<SVGSVGElement | null>(null);
-  const wagerPilesLayerRef = useRef<HTMLDivElement | null>(null);
-  const wagerPileElementsRef = useRef<WagerPileElements | null>(null);
-  const wagerRenderStateRef = useRef<WagerRenderState | null>(null);
-  const activeWagerPanelSideRef = useRef<WagerPileSide | "winner" | null>(null);
-  const activeWagerPanelRectRef = useRef<{
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-  } | null>(null);
-  const activeWagerPanelCountRef = useRef<number | null>(null);
-  const disappearingAnimationStartedRef = useRef<{
-    player: boolean;
-    opponent: boolean;
-  }>({ player: false, opponent: false });
-  const pendingBlinkDelayTimersRef = useRef<{
-    player: number | null;
-    opponent: number | null;
-  }>({ player: null, opponent: null });
-  const pendingBlinkEnabledRef = useRef<{ player: boolean; opponent: boolean }>(
-    { player: false, opponent: false },
-  );
-  const previousMaterialUrlRef = useRef<{
-    player: string | null;
-    opponent: string | null;
-  }>({ player: null, opponent: null });
-  const materialChangeOldIconsRef = useRef<{
-    player: HTMLImageElement[];
-    opponent: HTMLImageElement[];
-  }>({ player: [], opponent: [] });
-  const lastWagerUiRenderSignatureRef = useRef<string>("");
-  const wagerPanelStateRef = useRef<{
-    actionsLocked: boolean;
-    playerHasProposal: boolean;
-    opponentHasProposal: boolean;
-  }>({
-    actionsLocked: true,
-    playerHasProposal: false,
-    opponentHasProposal: false,
-  });
   const opponentAuraContainerRef = useRef<HTMLDivElement | null>(null);
   const playerAuraContainerRef = useRef<HTMLDivElement | null>(null);
   const opponentAuraRefs = useRef<{
@@ -1551,11 +1286,6 @@ const BoardComponent: React.FC = () => {
       playerName: emptyTextMeasurement,
       opponentName: emptyTextMeasurement,
     });
-  const [wagerStackRightEdges, setWagerStackRightEdges] =
-    useState<WagerStackRightEdges>(emptyWagerStackRightEdges);
-  const wagerStackRightEdgesRef = useRef<WagerStackRightEdges>(
-    emptyWagerStackRightEdges,
-  );
   const [hoveredPlayerInfoSlot, setHoveredPlayerInfoSlot] =
     useState<WagerPileSide | null>(null);
   const [playerInfoTextLayoutVersion, setPlayerInfoTextLayoutVersion] =
@@ -1762,69 +1492,6 @@ const BoardComponent: React.FC = () => {
     }
   };
 
-  const proposals = wagerState?.proposals || {};
-  const playerUid = playerUidSnapshot;
-  const opponentUid = opponentUidSnapshot;
-  const playerProposal =
-    playerUid && proposals[playerUid] ? proposals[playerUid] : null;
-  const opponentProposal =
-    opponentUid && proposals[opponentUid] ? proposals[opponentUid] : null;
-  const wagerAgreement = wagerState?.agreed ?? null;
-  const wagerResolved = wagerState?.resolved ?? null;
-  const wagerActionsLocked =
-    watchOnlySnapshot || !!wagerAgreement || !!wagerResolved;
-  const opponentMaterial = opponentProposal?.material ?? null;
-  const opponentCount = opponentProposal?.count ?? 0;
-  const extraAvailable =
-    playerProposal &&
-    opponentMaterial &&
-    playerProposal.material === opponentMaterial
-      ? playerProposal.count
-      : 0;
-  const acceptCount = opponentMaterial
-    ? Math.min(
-        opponentCount,
-        (availableMaterials[opponentMaterial] ?? 0) + extraAvailable,
-      )
-    : 0;
-  const acceptLabel =
-    frozenMaterialsStatus !== "ready"
-      ? frozenMaterialsStatus === "unavailable"
-        ? "Balance unavailable"
-        : "Checking balance"
-      : acceptCount > 0 && acceptCount < opponentCount
-        ? `Accept (${acceptCount})`
-        : "Accept";
-  const canAccept = frozenMaterialsStatus === "ready" && acceptCount > 0;
-  const showOpponentActions =
-    !wagerActionsLocked &&
-    activeWagerPanelSide === "opponent" &&
-    !!opponentProposal;
-  const showPlayerActions =
-    !wagerActionsLocked &&
-    activeWagerPanelSide === "player" &&
-    !!playerProposal;
-  const wagerPanelHasActions = showOpponentActions || showPlayerActions;
-
-  useEffect(() => {
-    const unsubscribe = subscribeToWagerState((state) => {
-      setWagerState(state);
-      setWatchOnlySnapshot(isWatchOnly);
-    });
-    return () => {
-      unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = subscribeToWatchOnly((value) => {
-      setWatchOnlySnapshot(value);
-    });
-    return () => {
-      unsubscribe();
-    };
-  }, []);
-
   useEffect(() => {
     const unsubscribe = subscribeToDisplayedBoardSquareTypes(
       setDisplayedBoardSquareTypes,
@@ -1856,18 +1523,6 @@ const BoardComponent: React.FC = () => {
       unsubscribeBoardColorSet();
     };
   }, []);
-
-  useEffect(() => {
-    activeWagerPanelSideRef.current = activeWagerPanelSide;
-  }, [activeWagerPanelSide]);
-
-  useEffect(() => {
-    activeWagerPanelRectRef.current = activeWagerPanelRect;
-  }, [activeWagerPanelRect]);
-
-  useEffect(() => {
-    activeWagerPanelCountRef.current = activeWagerPanelCount;
-  }, [activeWagerPanelCount]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1908,14 +1563,6 @@ const BoardComponent: React.FC = () => {
       window.removeEventListener("blur", clearPressed);
     };
   }, [botStrengthPressed]);
-
-  useEffect(() => {
-    wagerPanelStateRef.current = {
-      actionsLocked: wagerActionsLocked,
-      playerHasProposal: !!playerProposal,
-      opponentHasProposal: !!opponentProposal,
-    };
-  }, [opponentProposal, playerProposal, wagerActionsLocked]);
 
   useLayoutEffect(() => {
     const updateSize = () => {
@@ -2051,812 +1698,6 @@ const BoardComponent: React.FC = () => {
     playerInfoOverlayState.player.nameVisible,
   ]);
 
-  const clearWagerPanel = useCallback(() => {
-    activeWagerPanelSideRef.current = null;
-    activeWagerPanelRectRef.current = null;
-    activeWagerPanelCountRef.current = null;
-    setActiveWagerPanelSide(null);
-    setActiveWagerPanelRect(null);
-    setActiveWagerPanelCount(null);
-  }, []);
-
-  const clearPendingWagerTransitionState = useCallback(() => {
-    clearAllTrackedTimeouts();
-    (["player", "opponent"] as const).forEach((sideKey) => {
-      pendingBlinkDelayTimersRef.current[sideKey] = null;
-      pendingBlinkEnabledRef.current[sideKey] = false;
-      previousMaterialUrlRef.current[sideKey] = null;
-      materialChangeOldIconsRef.current[sideKey].forEach((icon) =>
-        icon.remove(),
-      );
-      materialChangeOldIconsRef.current[sideKey] = [];
-    });
-    resetOpponentVideoTimeoutRefs();
-    resetPlayerVideoTimeoutRefs();
-  }, [
-    clearAllTrackedTimeouts,
-    resetOpponentVideoTimeoutRefs,
-    resetPlayerVideoTimeoutRefs,
-  ]);
-
-  useEffect(() => {
-    return () => {
-      clearPendingWagerTransitionState();
-      setTopBoardOverlayVisibleImpl = () => {};
-      resetBoardVideoReactionHandler();
-      showRaibowAuraImpl = () => {};
-      updateAuraForAvatarElementImpl = () => {};
-      updateWagerPlayerUidsImpl = () => {};
-      setBoardPlayerInfoOverlayStateImpl = () => {};
-      applyInviteBotButtonLayout(null);
-    };
-  }, [clearPendingWagerTransitionState]);
-
-  const clearBoardTransientUiHandler = useCallback(
-    (fadeOutVideos: boolean = true) => {
-      clearWagerPanel();
-      clearPendingWagerTransitionState();
-      setOverlayState({
-        blurry: true,
-        svgElement: null,
-        withConfirmAndCancelButtons: false,
-      });
-      if (opponentAuraRefs.current) {
-        hideAuraDom(opponentAuraRefs.current.background);
-      }
-      if (playerAuraRefs.current) {
-        hideAuraDom(playerAuraRefs.current.background);
-      }
-      if (!fadeOutVideos) {
-        clearVideoReactionsNow();
-        return;
-      }
-      if (opponentVideoVisible) {
-        dismissOpponentVideo(VIDEO_REACTION_CLEAR_FADE_OUT_MS);
-      } else {
-        clearOpponentVideoNow();
-      }
-      if (playerVideoVisible) {
-        dismissPlayerVideo(VIDEO_REACTION_CLEAR_FADE_OUT_MS);
-      } else {
-        clearPlayerVideoNow();
-      }
-    },
-    [
-      clearPendingWagerTransitionState,
-      clearOpponentVideoNow,
-      clearPlayerVideoNow,
-      clearVideoReactionsNow,
-      clearWagerPanel,
-      dismissOpponentVideo,
-      dismissPlayerVideo,
-      opponentVideoVisible,
-      playerVideoVisible,
-    ],
-  );
-
-  useEffect(() => {
-    return registerBoardTransientUiHandler(clearBoardTransientUiHandler);
-  }, [clearBoardTransientUiHandler]);
-
-  const openWagerPanelForSide = useCallback(
-    (side: WagerPileSide | "winner") => {
-      const state = wagerRenderStateRef.current;
-      if (!state || state.winAnimationActive) {
-        clearWagerPanel();
-        return;
-      }
-      const pileState =
-        side === "winner"
-          ? state.winner
-          : side === "opponent"
-            ? state.opponent
-            : state.player;
-      if (!pileState) {
-        clearWagerPanel();
-        return;
-      }
-      activeWagerPanelSideRef.current = side;
-      activeWagerPanelRectRef.current = pileState.rect;
-      activeWagerPanelCountRef.current =
-        pileState.actualCount ?? pileState.count;
-      setActiveWagerPanelSide(side);
-      setActiveWagerPanelRect(pileState.rect);
-      setActiveWagerPanelCount(pileState.actualCount ?? pileState.count);
-    },
-    [clearWagerPanel],
-  );
-
-  const handleWagerCancel = useCallback(
-    (event?: React.SyntheticEvent) => {
-      if (event) {
-        event.stopPropagation();
-        if (event.cancelable) {
-          event.preventDefault();
-        }
-      }
-      if (wagerActionsLocked || !playerProposal) {
-        clearWagerPanel();
-        return;
-      }
-      clearWagerPanel();
-      connection.cancelWagerProposal().catch(() => {});
-    },
-    [clearWagerPanel, playerProposal, wagerActionsLocked],
-  );
-
-  const handleWagerDecline = useCallback(
-    (event?: React.SyntheticEvent) => {
-      if (event) {
-        event.stopPropagation();
-        if (event.cancelable) {
-          event.preventDefault();
-        }
-      }
-      if (wagerActionsLocked || !opponentProposal) {
-        clearWagerPanel();
-        return;
-      }
-      clearWagerPanel();
-      connection.declineWagerProposal().catch(() => {});
-    },
-    [clearWagerPanel, opponentProposal, wagerActionsLocked],
-  );
-
-  const handleWagerAccept = useCallback(
-    (event?: React.SyntheticEvent) => {
-      if (event) {
-        event.stopPropagation();
-        if (event.cancelable) {
-          event.preventDefault();
-        }
-      }
-      if (wagerActionsLocked || !opponentProposal || !canAccept) {
-        clearWagerPanel();
-        return;
-      }
-      clearWagerPanel();
-      connection.acceptWagerProposal().catch(() => {});
-    },
-    [canAccept, clearWagerPanel, opponentProposal, wagerActionsLocked],
-  );
-
-  useEffect(() => {
-    if (activeWagerPanelSideRef.current === "opponent" && !opponentProposal) {
-      clearWagerPanel();
-      return;
-    }
-    if (activeWagerPanelSideRef.current === "player" && !playerProposal) {
-      clearWagerPanel();
-    }
-  }, [clearWagerPanel, opponentProposal, playerProposal]);
-
-  const ensureWagerPileElements = useCallback((): WagerPileElements | null => {
-    const layer = wagerPilesLayerRef.current;
-    if (!layer) {
-      return null;
-    }
-    const existing = wagerPileElementsRef.current;
-    if (
-      existing &&
-      layer.contains(existing.player) &&
-      layer.contains(existing.opponent) &&
-      layer.contains(existing.winner) &&
-      layer.contains(existing.playerDisappearing) &&
-      layer.contains(existing.opponentDisappearing)
-    ) {
-      return existing;
-    }
-    layer.innerHTML = "";
-
-    const createPileContainer = (
-      side: WagerPileSide | "winner",
-      isInteractive: boolean,
-    ) => {
-      const container = document.createElement("div");
-      container.dataset.wagerPile = side;
-      container.style.position = "absolute";
-      container.style.left = "0";
-      container.style.top = "0";
-      container.style.width = "0";
-      container.style.height = "0";
-      container.style.display = "block";
-      container.style.opacity = "0";
-      container.style.pointerEvents = isInteractive ? "auto" : "none";
-      container.style.touchAction = "none";
-      container.style.userSelect = "none";
-      container.style.zIndex = isInteractive ? "3" : "2";
-      container.style.overflow = "visible";
-      container.style.cursor = isInteractive ? "pointer" : "default";
-      if (isInteractive) {
-        container.addEventListener(defaultInputEventName, (event) => {
-          event.stopPropagation();
-          if (event.cancelable) {
-            event.preventDefault();
-          }
-          const config = wagerPanelStateRef.current;
-          if (!config.actionsLocked) {
-            if (side === "player" && !config.playerHasProposal) {
-              clearWagerPanel();
-              return;
-            }
-            if (side === "opponent" && !config.opponentHasProposal) {
-              clearWagerPanel();
-              return;
-            }
-          }
-          if (activeWagerPanelSideRef.current === side) {
-            clearWagerPanel();
-            return;
-          }
-          openWagerPanelForSide(side);
-        });
-      }
-      return container;
-    };
-
-    const playerDisappearing = createPileContainer("player", false);
-    const opponentDisappearing = createPileContainer("opponent", false);
-    const player = createPileContainer("player", true);
-    const opponent = createPileContainer("opponent", true);
-    const winner = createPileContainer("winner", true);
-    layer.append(
-      playerDisappearing,
-      opponentDisappearing,
-      player,
-      opponent,
-      winner,
-    );
-    const elements: WagerPileElements = {
-      player,
-      opponent,
-      winner,
-      playerDisappearing,
-      opponentDisappearing,
-      playerIcons: [],
-      opponentIcons: [],
-      winnerIcons: [],
-      playerDisappearingIcons: [],
-      opponentDisappearingIcons: [],
-    };
-    wagerPileElementsRef.current = elements;
-    return elements;
-  }, [clearWagerPanel, openWagerPanelForSide]);
-
-  const applyWagerRenderState = useCallback(
-    (state: WagerRenderState) => {
-      wagerRenderStateRef.current = state;
-      const nextStackRightEdges: WagerStackRightEdges = {
-        ...emptyWagerStackRightEdges,
-      };
-      addWagerStackRightEdgeForPile(nextStackRightEdges, state.player);
-      addWagerStackRightEdgeForPile(nextStackRightEdges, state.opponent);
-      addWagerStackRightEdgeForPile(
-        nextStackRightEdges,
-        state.playerDisappearing,
-      );
-      addWagerStackRightEdgeForPile(
-        nextStackRightEdges,
-        state.opponentDisappearing,
-      );
-      addWagerStackRightEdgeForPile(nextStackRightEdges, state.winner);
-      if (
-        !wagerStackRightEdgesEqual(
-          wagerStackRightEdgesRef.current,
-          nextStackRightEdges,
-        )
-      ) {
-        wagerStackRightEdgesRef.current = nextStackRightEdges;
-        setWagerStackRightEdges(nextStackRightEdges);
-      }
-      const signature = [
-        state.player
-          ? `${state.player.count}:${state.player.isPending ? 1 : 0}:${state.player.animation}`
-          : "none",
-        state.opponent
-          ? `${state.opponent.count}:${state.opponent.isPending ? 1 : 0}:${state.opponent.animation}`
-          : "none",
-        state.winner ? `${state.winner.count}` : "none",
-        state.playerDisappearing ? `${state.playerDisappearing.count}` : "none",
-        state.opponentDisappearing
-          ? `${state.opponentDisappearing.count}`
-          : "none",
-        state.winAnimationActive ? "1" : "0",
-      ].join("|");
-      if (
-        wagerUiDebugLogsEnabled &&
-        lastWagerUiRenderSignatureRef.current !== signature
-      ) {
-        lastWagerUiRenderSignatureRef.current = signature;
-        console.log("wager-debug", {
-          source: "board-ui",
-          event: "apply-render-state",
-          signature,
-          playerRect: state.player?.rect ?? null,
-          opponentRect: state.opponent?.rect ?? null,
-          winnerRect: state.winner?.rect ?? null,
-        });
-      }
-      const elements = ensureWagerPileElements();
-      if (!elements) {
-        if (wagerUiDebugLogsEnabled) {
-          console.log("wager-debug", {
-            source: "board-ui",
-            event: "apply-render-state:missing-elements",
-          });
-        }
-        return;
-      }
-
-      const APPEAR_ANIMATION_DURATION_MS = 320;
-      const APPEAR_ANIMATION_OFFSET_PCT = 35;
-
-      const PENDING_BLINK_DELAY_MS = 1300;
-
-      const MATERIAL_CHANGE_FADE_MS = 280;
-
-      const updatePile = (
-        container: HTMLDivElement,
-        icons: HTMLImageElement[],
-        pileState: WagerPileRenderState | null,
-        isOpponentSide: boolean,
-        side: WagerPileSide | "winner",
-      ) => {
-        const sideKey = side === "player" || side === "opponent" ? side : null;
-
-        if (
-          !pileState ||
-          pileState.count <= 0 ||
-          pileState.frames.length === 0
-        ) {
-          container.style.opacity = "0";
-          container.style.pointerEvents = "none";
-          container.style.animation = "none";
-          if (sideKey) {
-            if (pendingBlinkDelayTimersRef.current[sideKey] !== null) {
-              clearTrackedTimeout(pendingBlinkDelayTimersRef.current[sideKey]);
-              pendingBlinkDelayTimersRef.current[sideKey] = null;
-            }
-            pendingBlinkEnabledRef.current[sideKey] = false;
-            previousMaterialUrlRef.current[sideKey] = null;
-            materialChangeOldIconsRef.current[sideKey].forEach((icon) =>
-              icon.remove(),
-            );
-            materialChangeOldIconsRef.current[sideKey] = [];
-          }
-          while (icons.length > 0) {
-            const icon = icons.pop();
-            if (icon) {
-              icon.remove();
-            }
-          }
-          return;
-        }
-        const rect = pileState.rect;
-        if (rect.w === 0 || rect.h === 0) {
-          container.style.opacity = "0";
-          container.style.pointerEvents = "none";
-          container.style.animation = "none";
-          if (sideKey) {
-            if (pendingBlinkDelayTimersRef.current[sideKey] !== null) {
-              clearTrackedTimeout(pendingBlinkDelayTimersRef.current[sideKey]);
-              pendingBlinkDelayTimersRef.current[sideKey] = null;
-            }
-            pendingBlinkEnabledRef.current[sideKey] = false;
-            previousMaterialUrlRef.current[sideKey] = null;
-            materialChangeOldIconsRef.current[sideKey].forEach((icon) =>
-              icon.remove(),
-            );
-            materialChangeOldIconsRef.current[sideKey] = [];
-          }
-          while (icons.length > 0) {
-            const icon = icons.pop();
-            if (icon) {
-              icon.remove();
-            }
-          }
-          return;
-        }
-        container.style.opacity = "1";
-        container.style.pointerEvents = "auto";
-
-        if (sideKey && pileState.isPending) {
-          if (pileState.animation === "appear") {
-            pendingBlinkEnabledRef.current[sideKey] = false;
-            if (pendingBlinkDelayTimersRef.current[sideKey] !== null) {
-              clearTrackedTimeout(pendingBlinkDelayTimersRef.current[sideKey]);
-            }
-            pendingBlinkDelayTimersRef.current[sideKey] = setTrackedTimeout(
-              () => {
-                pendingBlinkDelayTimersRef.current[sideKey] = null;
-                pendingBlinkEnabledRef.current[sideKey] = true;
-                container.style.animation = PENDING_PULSE_ANIMATION;
-              },
-              PENDING_BLINK_DELAY_MS,
-            );
-            container.style.animation = "none";
-          } else {
-            if (
-              !pendingBlinkEnabledRef.current[sideKey] &&
-              pendingBlinkDelayTimersRef.current[sideKey] === null
-            ) {
-              pendingBlinkEnabledRef.current[sideKey] = true;
-            }
-            container.style.animation = pendingBlinkEnabledRef.current[sideKey]
-              ? PENDING_PULSE_ANIMATION
-              : "none";
-          }
-        } else if (sideKey) {
-          if (pendingBlinkDelayTimersRef.current[sideKey] !== null) {
-            clearTrackedTimeout(pendingBlinkDelayTimersRef.current[sideKey]);
-            pendingBlinkDelayTimersRef.current[sideKey] = null;
-          }
-          pendingBlinkEnabledRef.current[sideKey] = false;
-          container.style.animation = "none";
-        } else {
-          container.style.animation = "none";
-        }
-        container.style.left = `${toPercentX(rect.x)}%`;
-        container.style.top = `${toPercentY(rect.y)}%`;
-        container.style.width = `${toPercentX(rect.w)}%`;
-        container.style.height = `${toPercentY(rect.h)}%`;
-
-        const materialUrl = pileState.materialUrl;
-        const iconSize = pileState.iconSize;
-        const sizePctW = (iconSize / rect.w) * 100;
-        const sizePctH = (iconSize / rect.h) * 100;
-        const visibleCount = Math.min(pileState.count, pileState.frames.length);
-        const animationOffsetY = isOpponentSide
-          ? -APPEAR_ANIMATION_OFFSET_PCT
-          : APPEAR_ANIMATION_OFFSET_PCT;
-
-        const prevMaterial = sideKey
-          ? previousMaterialUrlRef.current[sideKey]
-          : null;
-        const materialChanged =
-          sideKey &&
-          prevMaterial !== null &&
-          prevMaterial !== materialUrl &&
-          icons.length > 0;
-        const shouldAnimate =
-          pileState.animation === "appear" || materialChanged;
-
-        if (materialChanged && sideKey) {
-          const oldIcons = [...icons];
-          oldIcons.forEach((icon) => {
-            icon.style.transition = `opacity ${MATERIAL_CHANGE_FADE_MS}ms ease-out`;
-            icon.style.opacity = "0";
-          });
-          materialChangeOldIconsRef.current[sideKey].forEach((icon) =>
-            icon.remove(),
-          );
-          materialChangeOldIconsRef.current[sideKey] = oldIcons;
-          setTrackedTimeout(() => {
-            oldIcons.forEach((icon) => icon.remove());
-            if (materialChangeOldIconsRef.current[sideKey] === oldIcons) {
-              materialChangeOldIconsRef.current[sideKey] = [];
-            }
-          }, MATERIAL_CHANGE_FADE_MS);
-          icons.length = 0;
-        }
-
-        if (sideKey) {
-          previousMaterialUrlRef.current[sideKey] = materialUrl;
-        }
-
-        while (icons.length > visibleCount) {
-          const icon = icons.pop();
-          if (icon) {
-            icon.remove();
-          }
-        }
-
-        const newIconsStartIndex = icons.length;
-
-        while (icons.length < visibleCount) {
-          const icon = document.createElement("img");
-          icon.alt = "";
-          icon.draggable = false;
-          icon.style.position = "absolute";
-          icon.style.left = "0";
-          icon.style.top = "0";
-          icon.style.width = "0";
-          icon.style.height = "0";
-          icon.style.pointerEvents = "none";
-          icon.style.userSelect = "none";
-          icon.style.objectFit = "contain";
-          if (shouldAnimate) {
-            icon.style.opacity = "0";
-            icon.style.transform = `translateY(${animationOffsetY}%)`;
-          }
-          container.appendChild(icon);
-          icons.push(icon);
-        }
-
-        for (let i = 0; i < visibleCount; i += 1) {
-          const frame = pileState.frames[i];
-          if (!frame) {
-            continue;
-          }
-          const icon = icons[i];
-          if (icon.dataset.src !== materialUrl) {
-            icon.dataset.src = materialUrl;
-            icon.src = materialUrl;
-          }
-          const leftPct = ((frame.x - rect.x) / rect.w) * 100;
-          const topPct = ((frame.y - rect.y) / rect.h) * 100;
-          icon.style.left = `${leftPct}%`;
-          icon.style.top = `${topPct}%`;
-          icon.style.width = `${sizePctW}%`;
-          icon.style.height = `${sizePctH}%`;
-          icon.style.zIndex = String(getWagerIconPaintDepth(frame, rect));
-        }
-
-        if (shouldAnimate && newIconsStartIndex < visibleCount) {
-          const triggerAnimation = () => {
-            requestAnimationFrame(() => {
-              requestAnimationFrame(() => {
-                for (let i = newIconsStartIndex; i < visibleCount; i += 1) {
-                  const icon = icons[i];
-                  if (icon) {
-                    const delay = (i - newIconsStartIndex) * 25;
-                    icon.style.transition = `opacity ${APPEAR_ANIMATION_DURATION_MS}ms cubic-bezier(0.22, 1, 0.36, 1) ${delay}ms, transform ${APPEAR_ANIMATION_DURATION_MS}ms cubic-bezier(0.22, 1, 0.36, 1) ${delay}ms`;
-                    icon.style.opacity = "1";
-                    icon.style.transform = "translateY(0)";
-                  }
-                }
-              });
-            });
-          };
-
-          const firstNewIcon = icons[newIconsStartIndex];
-          if (
-            firstNewIcon &&
-            firstNewIcon.complete &&
-            firstNewIcon.naturalWidth > 0
-          ) {
-            triggerAnimation();
-          } else if (firstNewIcon) {
-            const onLoad = () => {
-              firstNewIcon.removeEventListener("load", onLoad);
-              firstNewIcon.removeEventListener("error", onLoad);
-              triggerAnimation();
-            };
-            firstNewIcon.addEventListener("load", onLoad);
-            firstNewIcon.addEventListener("error", onLoad);
-          }
-        }
-      };
-
-      const DISAPPEAR_ANIMATION_DURATION_MS = 280;
-
-      const updateDisappearingPile = (
-        container: HTMLDivElement,
-        icons: HTMLImageElement[],
-        disappearingState: WagerPileRenderState | null,
-        side: "player" | "opponent",
-        startingOpacity: string,
-      ) => {
-        if (
-          !disappearingState ||
-          disappearingState.count <= 0 ||
-          disappearingState.frames.length === 0
-        ) {
-          container.style.transition = "none";
-          container.style.opacity = "0";
-          container.style.pointerEvents = "none";
-          disappearingAnimationStartedRef.current[side] = false;
-          while (icons.length > 0) {
-            const icon = icons.pop();
-            if (icon) icon.remove();
-          }
-          return;
-        }
-
-        if (disappearingAnimationStartedRef.current[side]) {
-          return;
-        }
-
-        const rect = disappearingState.rect;
-        if (rect.w === 0 || rect.h === 0) {
-          container.style.transition = "none";
-          container.style.opacity = "0";
-          container.style.pointerEvents = "none";
-          return;
-        }
-
-        container.style.left = `${toPercentX(rect.x)}%`;
-        container.style.top = `${toPercentY(rect.y)}%`;
-        container.style.width = `${toPercentX(rect.w)}%`;
-        container.style.height = `${toPercentY(rect.h)}%`;
-        container.style.pointerEvents = "none";
-        container.style.transition = "none";
-        container.style.animation = "none";
-        container.style.opacity = startingOpacity;
-
-        const materialUrl = disappearingState.materialUrl;
-        const iconSize = disappearingState.iconSize;
-        const sizePctW = (iconSize / rect.w) * 100;
-        const sizePctH = (iconSize / rect.h) * 100;
-        const visibleCount = Math.min(
-          disappearingState.count,
-          disappearingState.frames.length,
-        );
-
-        while (icons.length > visibleCount) {
-          const icon = icons.pop();
-          if (icon) icon.remove();
-        }
-        while (icons.length < visibleCount) {
-          const icon = document.createElement("img");
-          icon.alt = "";
-          icon.draggable = false;
-          icon.style.position = "absolute";
-          icon.style.pointerEvents = "none";
-          icon.style.userSelect = "none";
-          icon.style.objectFit = "contain";
-          container.appendChild(icon);
-          icons.push(icon);
-        }
-
-        for (let i = 0; i < visibleCount; i += 1) {
-          const frame = disappearingState.frames[i];
-          if (!frame) continue;
-          const icon = icons[i];
-          if (icon.dataset.src !== materialUrl) {
-            icon.dataset.src = materialUrl;
-            icon.src = materialUrl;
-          }
-          const leftPct = ((frame.x - rect.x) / rect.w) * 100;
-          const topPct = ((frame.y - rect.y) / rect.h) * 100;
-          icon.style.left = `${leftPct}%`;
-          icon.style.top = `${topPct}%`;
-          icon.style.width = `${sizePctW}%`;
-          icon.style.height = `${sizePctH}%`;
-          icon.style.zIndex = String(getWagerIconPaintDepth(frame, rect));
-        }
-
-        disappearingAnimationStartedRef.current[side] = true;
-
-        const triggerFade = () => {
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-              container.style.transition = `opacity ${DISAPPEAR_ANIMATION_DURATION_MS}ms ease-out`;
-              container.style.opacity = "0";
-            });
-          });
-        };
-
-        const firstIcon = icons[0];
-        if (firstIcon && firstIcon.complete && firstIcon.naturalWidth > 0) {
-          triggerFade();
-        } else if (firstIcon) {
-          const onLoad = () => {
-            firstIcon.removeEventListener("load", onLoad);
-            firstIcon.removeEventListener("error", onLoad);
-            triggerFade();
-          };
-          firstIcon.addEventListener("load", onLoad);
-          firstIcon.addEventListener("error", onLoad);
-        } else {
-          triggerFade();
-        }
-      };
-
-      const opponentCurrentOpacity = state.opponentDisappearing
-        ? window.getComputedStyle(elements.opponent).opacity
-        : "1";
-      const playerCurrentOpacity = state.playerDisappearing
-        ? window.getComputedStyle(elements.player).opacity
-        : "1";
-
-      updatePile(
-        elements.opponent,
-        elements.opponentIcons,
-        state.opponent,
-        true,
-        "opponent",
-      );
-      updatePile(
-        elements.player,
-        elements.playerIcons,
-        state.player,
-        false,
-        "player",
-      );
-      updatePile(
-        elements.winner,
-        elements.winnerIcons,
-        state.winner,
-        false,
-        "winner",
-      );
-
-      updateDisappearingPile(
-        elements.opponentDisappearing,
-        elements.opponentDisappearingIcons,
-        state.opponentDisappearing,
-        "opponent",
-        opponentCurrentOpacity,
-      );
-      updateDisappearingPile(
-        elements.playerDisappearing,
-        elements.playerDisappearingIcons,
-        state.playerDisappearing,
-        "player",
-        playerCurrentOpacity,
-      );
-
-      const activeSide = activeWagerPanelSideRef.current;
-      if (activeSide) {
-        if (state.winAnimationActive) {
-          clearWagerPanel();
-        } else if (state.winner && activeSide !== "winner") {
-          clearWagerPanel();
-        } else {
-          const pileState =
-            activeSide === "winner"
-              ? state.winner
-              : activeSide === "opponent"
-                ? state.opponent
-                : state.player;
-          if (!pileState) {
-            clearWagerPanel();
-          } else {
-            const prevRect = activeWagerPanelRectRef.current;
-            const nextRect = pileState.rect;
-            const rectChanged =
-              !prevRect ||
-              prevRect.x !== nextRect.x ||
-              prevRect.y !== nextRect.y ||
-              prevRect.w !== nextRect.w ||
-              prevRect.h !== nextRect.h;
-            if (rectChanged) {
-              activeWagerPanelRectRef.current = nextRect;
-              setActiveWagerPanelRect(nextRect);
-            }
-            const nextCount = pileState.actualCount ?? pileState.count;
-            if (activeWagerPanelCountRef.current !== nextCount) {
-              activeWagerPanelCountRef.current = nextCount;
-              setActiveWagerPanelCount(nextCount);
-            }
-          }
-        }
-      }
-    },
-    [
-      clearTrackedTimeout,
-      clearWagerPanel,
-      ensureWagerPileElements,
-      setTrackedTimeout,
-    ],
-  );
-  const applyWagerRenderStateRef = useRef(applyWagerRenderState);
-
-  useEffect(() => {
-    setWagerPanelVisibilityChecker(
-      () => activeWagerPanelSideRef.current !== null,
-    );
-    setWagerPanelOutsideTapHandler((event) => {
-      if (!activeWagerPanelSideRef.current) {
-        return false;
-      }
-      const target = event.target;
-      if (
-        target instanceof Element &&
-        target.closest('[data-wager-panel="true"], [data-wager-pile]')
-      ) {
-        return false;
-      }
-      clearWagerPanel();
-      return true;
-    });
-    return () => {
-      setWagerPanelOutsideTapHandler(null);
-      setWagerPanelVisibilityChecker(() => false);
-    };
-  }, [clearWagerPanel]);
-
   const playerInfoLayout = useMemo(() => {
     return getBoardPlayerInfoLayout(
       playerInfoOverlayState,
@@ -2905,26 +1746,91 @@ const BoardComponent: React.FC = () => {
     applyInviteBotButtonLayout(playerInfoLayout.inviteBotButtonLayout);
   }, [playerInfoLayout.inviteBotButtonLayout]);
 
-  useLayoutEffect(() => {
-    applyWagerRenderStateRef.current = applyWagerRenderState;
-  }, [applyWagerRenderState]);
+  const {
+    stackRightEdges: wagerStackRightEdges,
+    clearPanel: clearWagerPanel,
+    resetTransitionState: resetWagerTransitionState,
+    layerProps: wagerLayerProps,
+  } = useBoardWagers({
+    playerUid: playerUidSnapshot,
+    opponentUid: opponentUidSnapshot,
+    slotLayouts: computedWagerSlotLayouts,
+    layoutRevision: playerInfoOverlayState.wagerLayoutRevision,
+    setTrackedTimeout,
+    clearTrackedTimeout,
+  });
 
-  useLayoutEffect(() => {
-    setWagerSlotLayouts(
-      computedWagerSlotLayouts,
-      playerInfoOverlayState.wagerLayoutRevision,
-    );
-  }, [computedWagerSlotLayouts, playerInfoOverlayState.wagerLayoutRevision]);
+  const clearPendingBoardTransitionState = useCallback(() => {
+    clearAllTrackedTimeouts();
+    resetWagerTransitionState();
+    resetOpponentVideoTimeoutRefs();
+    resetPlayerVideoTimeoutRefs();
+  }, [
+    clearAllTrackedTimeouts,
+    resetWagerTransitionState,
+    resetOpponentVideoTimeoutRefs,
+    resetPlayerVideoTimeoutRefs,
+  ]);
 
-  useLayoutEffect(() => {
-    setWagerRenderHandler((state) => {
-      applyWagerRenderStateRef.current(state);
-    });
+  useEffect(() => {
     return () => {
-      setWagerRenderHandler(null);
-      setWagerSlotLayouts(null);
+      clearPendingBoardTransitionState();
+      setTopBoardOverlayVisibleImpl = () => {};
+      resetBoardVideoReactionHandler();
+      showRaibowAuraImpl = () => {};
+      updateAuraForAvatarElementImpl = () => {};
+      updateWagerPlayerUidsImpl = () => {};
+      setBoardPlayerInfoOverlayStateImpl = () => {};
+      applyInviteBotButtonLayout(null);
     };
-  }, []);
+  }, [clearPendingBoardTransitionState]);
+
+  const clearBoardTransientUiHandler = useCallback(
+    (fadeOutVideos: boolean = true) => {
+      clearWagerPanel();
+      clearPendingBoardTransitionState();
+      setOverlayState({
+        blurry: true,
+        svgElement: null,
+        withConfirmAndCancelButtons: false,
+      });
+      if (opponentAuraRefs.current) {
+        hideAuraDom(opponentAuraRefs.current.background);
+      }
+      if (playerAuraRefs.current) {
+        hideAuraDom(playerAuraRefs.current.background);
+      }
+      if (!fadeOutVideos) {
+        clearVideoReactionsNow();
+        return;
+      }
+      if (opponentVideoVisible) {
+        dismissOpponentVideo(VIDEO_REACTION_CLEAR_FADE_OUT_MS);
+      } else {
+        clearOpponentVideoNow();
+      }
+      if (playerVideoVisible) {
+        dismissPlayerVideo(VIDEO_REACTION_CLEAR_FADE_OUT_MS);
+      } else {
+        clearPlayerVideoNow();
+      }
+    },
+    [
+      clearPendingBoardTransitionState,
+      clearOpponentVideoNow,
+      clearPlayerVideoNow,
+      clearVideoReactionsNow,
+      clearWagerPanel,
+      dismissOpponentVideo,
+      dismissPlayerVideo,
+      opponentVideoVisible,
+      playerVideoVisible,
+    ],
+  );
+
+  useEffect(() => {
+    return registerBoardTransientUiHandler(clearBoardTransientUiHandler);
+  }, [clearBoardTransientUiHandler]);
 
   useEffect(() => {
     if (!botStrengthControlOverlay.visible) {
@@ -2960,87 +1866,6 @@ const BoardComponent: React.FC = () => {
     top: isPangchiuBoardLayout ? "7.05%" : "7.02%",
     height: isPangchiuBoardLayout ? "82.6%" : "78.2%",
     aspectRatio: isPangchiuBoardLayout ? "1524/1612" : "1",
-  };
-  const activeWagerPileRect = activeWagerPanelSide
-    ? activeWagerPanelRect
-    : null;
-  const isOpponentPanel =
-    activeWagerPanelSide === "opponent"
-      ? true
-      : activeWagerPanelSide === "player"
-        ? false
-        : activeWagerPileRect
-          ? getWagerSideForBoardRect(activeWagerPileRect) === "opponent"
-          : false;
-  const wagerPanelLayout =
-    activeWagerPanelSide && activeWagerPileRect
-      ? getWagerPanelLayout(
-          activeWagerPileRect,
-          isOpponentPanel,
-          boardPixelSize,
-          wagerPanelHasActions,
-        )
-      : null;
-  const wagerCountLayout =
-    wagerPanelLayout && activeWagerPileRect && activeWagerPanelCount !== null
-      ? (() => {
-          const pxPerUnitX = boardPixelSize
-            ? boardPixelSize.width / BOARD_WIDTH_UNITS
-            : null;
-          const minGap = pxPerUnitX
-            ? WAGER_PANEL_COUNT_MIN_GAP_PX / pxPerUnitX
-            : 0;
-          const gap = Math.max(wagerPanelLayout.countGap, minGap);
-          const centerY =
-            activeWagerPileRect.y +
-            activeWagerPileRect.h / 2 -
-            activeWagerPileRect.h * WAGER_PANEL_COUNT_Y_OFFSET_FRAC;
-          const left = activeWagerPileRect.x + activeWagerPileRect.w + gap;
-          const leftPct =
-            ((left - wagerPanelLayout.x) / wagerPanelLayout.width) * 100;
-          const topPct =
-            ((centerY - wagerPanelLayout.y) / wagerPanelLayout.height) * 100;
-          return { leftPct, topPct };
-        })()
-      : null;
-  const wagerPanelTheme = prefersDarkMode
-    ? {
-        background: "rgba(28, 28, 28, 0.72)",
-        border: "rgba(255, 255, 255, 0.12)",
-        shadow: "0 10px 22px rgba(0, 0, 0, 0.35)",
-        buttonBackground: "rgba(255, 255, 255, 0.1)",
-        buttonBorder: "rgba(255, 255, 255, 0.18)",
-        buttonText: "var(--color-gray-f0)",
-      }
-    : {
-        background: "rgba(250, 250, 250, 0.78)",
-        border: "rgba(0, 0, 0, 0.08)",
-        shadow: "0 10px 22px rgba(0, 0, 0, 0.18)",
-        buttonBackground: "rgba(0, 0, 0, 0.06)",
-        buttonBorder: "rgba(0, 0, 0, 0.08)",
-        buttonText: "var(--color-gray-33)",
-      };
-  const wagerPanelButtonStyle: React.CSSProperties = {
-    height: "100%",
-    alignSelf: "center",
-    justifySelf: "center",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    background: wagerPanelTheme.buttonBackground,
-    border: `1px solid ${wagerPanelTheme.buttonBorder}`,
-    color: wagerPanelTheme.buttonText,
-    borderRadius: "999px",
-    fontWeight: 600,
-    fontSize: "0.9em",
-    letterSpacing: "0.01em",
-    cursor: "pointer",
-    whiteSpace: "nowrap",
-    minWidth: 0,
-    padding: 0,
-    margin: 0,
-    outline: "none",
-    boxSizing: "border-box" as const,
   };
   const botStrengthModeLabel =
     botStrengthControlOverlay.mode === "fast"
@@ -3536,152 +2361,11 @@ const BoardComponent: React.FC = () => {
             pointerEvents: "none",
           }}
         >
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              pointerEvents: "none",
-              zIndex: 0,
-            }}
-          >
-            {wagerPanelLayout && (
-              <div
-                data-wager-panel="true"
-                style={{
-                  position: "absolute",
-                  left: `${toPercentX(wagerPanelLayout.x)}%`,
-                  top: `${toPercentY(wagerPanelLayout.y)}%`,
-                  width: `${toPercentX(wagerPanelLayout.width)}%`,
-                  height: `${toPercentY(wagerPanelLayout.height)}%`,
-                  display: "grid",
-                  gridTemplateRows: wagerPanelLayout.gridRows,
-                  paddingLeft: `${wagerPanelLayout.paddingXPx}px`,
-                  paddingRight: `${wagerPanelLayout.paddingXPx}px`,
-                  boxSizing: "border-box",
-                  background: wagerPanelTheme.background,
-                  border: `1px solid ${wagerPanelTheme.border}`,
-                  boxShadow: wagerPanelTheme.shadow,
-                  borderRadius: "16px",
-                  backdropFilter: "blur(6px)",
-                  WebkitBackdropFilter: "blur(6px)",
-                  overflow: "visible",
-                  pointerEvents: "auto",
-                  userSelect: "none",
-                  zIndex: 2,
-                }}
-              >
-                {wagerCountLayout && (
-                  <div
-                    aria-hidden="true"
-                    style={{
-                      position: "absolute",
-                      left: `${wagerCountLayout.leftPct}%`,
-                      top: `${wagerCountLayout.topPct}%`,
-                      transform: "translate(0, -50%)",
-                      fontSize: "0.72em",
-                      fontWeight: 500,
-                      letterSpacing: "0.02em",
-                      color: prefersDarkMode
-                        ? "rgba(240, 240, 240, 0.6)"
-                        : "rgba(40, 40, 40, 0.52)",
-                      pointerEvents: "none",
-                      userSelect: "none",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    ({activeWagerPanelCount})
-                  </div>
-                )}
-                <div
-                  aria-hidden="true"
-                  style={{ gridRow: wagerPanelLayout.pileRow }}
-                />
-                {wagerPanelHasActions && (
-                  <div
-                    data-wager-panel="true"
-                    style={{
-                      gridRow: wagerPanelLayout.buttonRow,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      gap: `${wagerPanelLayout.buttonGapPx}px`,
-                      height: "100%",
-                      width: "100%",
-                      overflow: "visible",
-                    }}
-                  >
-                    {showOpponentActions && (
-                      <>
-                        <button
-                          data-wager-panel="true"
-                          type="button"
-                          onClick={!isMobile ? handleWagerDecline : undefined}
-                          onTouchStart={
-                            isMobile ? handleWagerDecline : undefined
-                          }
-                          style={{
-                            ...wagerPanelButtonStyle,
-                            flex: "1 0 auto",
-                            minWidth: `${wagerPanelLayout.declineButtonMinWidthPx}px`,
-                            paddingLeft: `${wagerPanelLayout.buttonPaddingXPx}px`,
-                            paddingRight: `${wagerPanelLayout.buttonPaddingXPx}px`,
-                          }}
-                        >
-                          Decline
-                        </button>
-                        <button
-                          data-wager-panel="true"
-                          type="button"
-                          disabled={!canAccept}
-                          onClick={!isMobile ? handleWagerAccept : undefined}
-                          onTouchStart={
-                            isMobile ? handleWagerAccept : undefined
-                          }
-                          style={{
-                            ...wagerPanelButtonStyle,
-                            flex: "1 0 auto",
-                            minWidth: `${wagerPanelLayout.acceptButtonMinWidthPx}px`,
-                            paddingLeft: `${wagerPanelLayout.buttonPaddingXPx}px`,
-                            paddingRight: `${wagerPanelLayout.buttonPaddingXPx}px`,
-                            opacity: canAccept ? 1 : 0.5,
-                            cursor: "pointer",
-                          }}
-                        >
-                          {acceptLabel}
-                        </button>
-                      </>
-                    )}
-                    {showPlayerActions && (
-                      <button
-                        data-wager-panel="true"
-                        type="button"
-                        onClick={!isMobile ? handleWagerCancel : undefined}
-                        onTouchStart={isMobile ? handleWagerCancel : undefined}
-                        style={{
-                          ...wagerPanelButtonStyle,
-                          flexShrink: 0,
-                          minWidth: `${wagerPanelLayout.playerButtonMinWidthPx}px`,
-                          paddingLeft: `${wagerPanelLayout.buttonPaddingXPx}px`,
-                          paddingRight: `${wagerPanelLayout.buttonPaddingXPx}px`,
-                        }}
-                      >
-                        Cancel Proposal
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-            <div
-              ref={wagerPilesLayerRef}
-              style={{
-                position: "absolute",
-                inset: 0,
-                pointerEvents: "none",
-                zIndex: 3,
-              }}
-            />
-          </div>
+          <BoardWagerLayer
+            {...wagerLayerProps}
+            boardPixelSize={boardPixelSize}
+            prefersDarkMode={prefersDarkMode}
+          />
           <div
             style={{
               position: "absolute",
