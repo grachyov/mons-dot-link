@@ -7,21 +7,11 @@ import {
   type MineRockRequest,
   type MineRockResponse,
 } from "@mons/shared/mining";
-import {
-  AuthApiFailure,
-  authErrorResponse,
-  isProfileWritesDisabledFailure,
-} from "./authErrors.ts";
-import {
-  authJsonResponse,
-  authPreflightResponse,
-  getAuthCorsHeaders,
-} from "./authHttp.ts";
-import {
-  verifySessionRequest,
-  type WorkerExecutionContext,
-} from "./sessionAuth.ts";
+import { AuthApiFailure } from "./authErrors.ts";
+import { authJsonResponse } from "./authHttp.ts";
+import type { WorkerExecutionContext } from "./sessionAuth.ts";
 import type { RequestIdentity } from "./requestIdentity.ts";
+import { authenticatedPost } from "./authenticatedPost.ts";
 import {
   createMiningRepository,
   type MiningRepository,
@@ -165,46 +155,32 @@ export async function handleMiningRoute(
   ctx: WorkerExecutionContext,
   dependencies: MiningRouteDependencies = {},
 ): Promise<Response> {
-  let corsHeaders: Record<string, string> = { Vary: "Origin" };
-  try {
-    corsHeaders = getAuthCorsHeaders(request);
-    if (request.method === "OPTIONS") {
-      return authPreflightResponse(corsHeaders);
-    }
-    if (request.method !== "POST") {
-      throw new AuthApiFailure(405, "method-not-allowed", "method-not-allowed");
-    }
-    const identity = await (
-      dependencies.verifyIdentity || verifySessionRequest
-    )(request, env, ctx);
-    await assertProfileMutationAllowed(env);
-    await enforceMiningRateLimit(env, identity.uid);
-    const input = await parseMineRockRequest(request);
-    const repository = dependencies.repository || createMiningRepository(env);
-    return authJsonResponse(
-      await mineRock(
-        input,
-        identity,
-        repository,
-        (dependencies.now || Date.now)(),
-      ),
-      200,
-      corsHeaders,
-    );
-  } catch (error) {
-    const failure =
-      error instanceof AuthApiFailure
-        ? error
-        : new AuthApiFailure(503, "unavailable", "mining-service-unavailable");
-    if (failure.status >= 500 && !isProfileWritesDisabledFailure(failure)) {
-      (
-        dependencies.logFailure ||
-        ((kind) =>
-          console.error(
-            JSON.stringify({ event: "mining_route_failure", kind }),
-          ))
-      )(failure.message);
-    }
-    return authErrorResponse(failure, corsHeaders);
-  }
+  return authenticatedPost(
+    request,
+    env,
+    ctx,
+    {
+      failureMessage: "mining-service-unavailable",
+      failureEvent: "mining_route_failure",
+      logFailure: dependencies.logFailure,
+      verifyIdentity: dependencies.verifyIdentity,
+    },
+    async ({ corsHeaders, authenticate }) => {
+      const identity = await authenticate();
+      await assertProfileMutationAllowed(env);
+      await enforceMiningRateLimit(env, identity.uid);
+      const input = await parseMineRockRequest(request);
+      const repository = dependencies.repository || createMiningRepository(env);
+      return authJsonResponse(
+        await mineRock(
+          input,
+          identity,
+          repository,
+          (dependencies.now || Date.now)(),
+        ),
+        200,
+        corsHeaders,
+      );
+    },
+  );
 }

@@ -18,16 +18,8 @@ import {
   type SyncEventStateRequest,
 } from "@mons/shared/events";
 import { normalizeRecordKey } from "@mons/shared/ids";
-import {
-  AuthApiFailure,
-  authErrorResponse,
-  isProfileWritesDisabledFailure,
-} from "./authErrors.ts";
-import {
-  authJsonResponse,
-  authPreflightResponse,
-  getAuthCorsHeaders,
-} from "./authHttp.ts";
+import { AuthApiFailure, authErrorResponse } from "./authErrors.ts";
+import { authJsonResponse, getAuthCorsHeaders } from "./authHttp.ts";
 import {
   EVENT_OPERATION_TIMEOUT_MS,
   joinEvent,
@@ -35,10 +27,7 @@ import {
   toggleEventPrizeSelection,
   type EventParticipationDependencies,
 } from "./eventParticipation.ts";
-import {
-  verifySessionRequest,
-  type WorkerExecutionContext,
-} from "./sessionAuth.ts";
+import type { WorkerExecutionContext } from "./sessionAuth.ts";
 import type { EventGameplayRepository } from "./eventRepository.ts";
 import { EventWritesDisabled, assertEventWritesAllowed } from "./eventD1.ts";
 import { createEventMutationRepository } from "./eventMutationRepository.ts";
@@ -53,6 +42,7 @@ import {
 } from "./eventOperations.ts";
 import { assertProfileMutationAllowed } from "./profileCanonicalActivation.ts";
 import type { RequestIdentity } from "./requestIdentity.ts";
+import { authenticatedPost } from "./authenticatedPost.ts";
 
 export const EVENT_PATHS = new Set([
   "/events/create",
@@ -176,137 +166,123 @@ async function handleEventRequest(
   ctx: WorkerExecutionContext,
   dependencies: EventRouteDependencies = {},
 ): Promise<Response> {
-  let corsHeaders: Record<string, string> = { Vary: "Origin" };
-  try {
-    corsHeaders = getAuthCorsHeaders(request);
-    if (request.method === "OPTIONS") {
-      return authPreflightResponse(corsHeaders);
-    }
-    if (request.method !== "POST") {
-      throw new AuthApiFailure(405, "method-not-allowed", "method-not-allowed");
-    }
-    const pathname = new URL(request.url).pathname;
-    if (!EVENT_PATHS.has(pathname)) {
-      throw new AuthApiFailure(404, "not-found", "not-found");
-    }
-    const isParticipationPath =
-      pathname === "/events/participants/join" ||
-      pathname === "/events/participants/remove" ||
-      pathname === "/events/prize-selections/toggle";
-    const signal = isParticipationPath
-      ? dependencies.participation?.signal ||
-        AbortSignal.timeout(EVENT_OPERATION_TIMEOUT_MS)
-      : dependencies.control?.signal ||
-        AbortSignal.timeout(EVENT_CONTROL_TIMEOUT_MS);
-    const identity = await (
-      dependencies.verifyIdentity || verifySessionRequest
-    )(request, env, ctx);
-    if (dependencies.assertEventWrites) {
-      await dependencies.assertEventWrites();
-    } else if (!dependencies.verifyIdentity) {
-      await assertEventWritesAllowed(env.EVENT_DB);
-    }
-    await assertProfileMutationAllowed(env);
-    const body = await readEventBody(request, pathname);
-    const schedule = (work: Promise<void>) => ctx.waitUntil(work);
-    const repository = createEventMutationRepository(env, {
-      eventRepository: dependencies.repository,
-      schedule,
-    });
-    const participation = {
-      ...dependencies.participation,
-      signal,
-    };
-    let operation: Promise<unknown>;
-    if (pathname === "/events/participants/join") {
-      if (!isJoinEventRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+  return authenticatedPost(
+    request,
+    env,
+    ctx,
+    {
+      failureMessage: "event-service-unavailable",
+      failureEvent: "event_service_failure",
+      logFailure: dependencies.logFailure,
+      verifyIdentity: dependencies.verifyIdentity,
+      errorResponse: (error, corsHeaders) =>
+        error instanceof EventWritesDisabled
+          ? authJsonResponse(
+              {
+                ok: false,
+                error: "unavailable",
+                message: "event-writes-disabled",
+              },
+              503,
+              { ...corsHeaders, "Retry-After": "60" },
+            )
+          : null,
+    },
+    async ({ pathname, corsHeaders, authenticate }) => {
+      if (!EVENT_PATHS.has(pathname)) {
+        throw new AuthApiFailure(404, "not-found", "not-found");
       }
-      operation = joinEvent(identity, body, repository, participation);
-    } else if (pathname === "/events/participants/remove") {
-      if (!isRemoveEventParticipantRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+      const isParticipationPath =
+        pathname === "/events/participants/join" ||
+        pathname === "/events/participants/remove" ||
+        pathname === "/events/prize-selections/toggle";
+      const signal = isParticipationPath
+        ? dependencies.participation?.signal ||
+          AbortSignal.timeout(EVENT_OPERATION_TIMEOUT_MS)
+        : dependencies.control?.signal ||
+          AbortSignal.timeout(EVENT_CONTROL_TIMEOUT_MS);
+      const identity = await authenticate();
+      if (dependencies.assertEventWrites) {
+        await dependencies.assertEventWrites();
+      } else if (!dependencies.verifyIdentity) {
+        await assertEventWritesAllowed(env.EVENT_DB);
       }
-      operation = removeEventParticipant(
-        identity,
-        body,
-        repository,
-        participation,
-      );
-    } else if (pathname === "/events/prize-selections/toggle") {
-      if (!isToggleEventPrizeSelectionRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      operation = toggleEventPrizeSelection(
-        identity,
-        body,
-        repository,
-        participation,
-      );
-    } else if (pathname === "/events/create") {
-      if (!isCreateEventRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      operation = createEvent(env, identity, body, {
-        ...dependencies.control,
-        repository,
-        signal,
+      await assertProfileMutationAllowed(env);
+      const body = await readEventBody(request, pathname);
+      const schedule = (work: Promise<void>) => ctx.waitUntil(work);
+      const repository = createEventMutationRepository(env, {
+        eventRepository: dependencies.repository,
+        schedule,
       });
-    } else if (pathname === "/events/start/postpone") {
-      if (!isPostponeEventStartRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      operation = postponeEventStart(env, identity, body, {
-        ...dependencies.control,
-        repository,
+      const participation = {
+        ...dependencies.participation,
         signal,
-      });
-    } else if (pathname === "/events/matches/winners/disqualify") {
-      if (!isDisqualifyEventMatchWinnersRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+      };
+      let operation: Promise<unknown>;
+      if (pathname === "/events/participants/join") {
+        if (!isJoinEventRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = joinEvent(identity, body, repository, participation);
+      } else if (pathname === "/events/participants/remove") {
+        if (!isRemoveEventParticipantRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = removeEventParticipant(
+          identity,
+          body,
+          repository,
+          participation,
+        );
+      } else if (pathname === "/events/prize-selections/toggle") {
+        if (!isToggleEventPrizeSelectionRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = toggleEventPrizeSelection(
+          identity,
+          body,
+          repository,
+          participation,
+        );
+      } else if (pathname === "/events/create") {
+        if (!isCreateEventRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = createEvent(env, identity, body, {
+          ...dependencies.control,
+          repository,
+          signal,
+        });
+      } else if (pathname === "/events/start/postpone") {
+        if (!isPostponeEventStartRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = postponeEventStart(env, identity, body, {
+          ...dependencies.control,
+          repository,
+          signal,
+        });
+      } else if (pathname === "/events/matches/winners/disqualify") {
+        if (!isDisqualifyEventMatchWinnersRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = disqualifyEventMatchWinners(env, identity, body, {
+          ...dependencies.control,
+          repository,
+          signal,
+        });
+      } else {
+        if (!isSyncEventStateRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        operation = syncEventState(env, identity, body, {
+          ...dependencies.control,
+          repository,
+          signal,
+        });
       }
-      operation = disqualifyEventMatchWinners(env, identity, body, {
-        ...dependencies.control,
-        repository,
-        signal,
-      });
-    } else {
-      if (!isSyncEventStateRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      operation = syncEventState(env, identity, body, {
-        ...dependencies.control,
-        repository,
-        signal,
-      });
-    }
-    const response = await operation;
-    return authJsonResponse(response, 200, corsHeaders);
-  } catch (error) {
-    if (error instanceof EventWritesDisabled) {
-      return authJsonResponse(
-        {
-          ok: false,
-          error: "unavailable",
-          message: "event-writes-disabled",
-        },
-        503,
-        { ...corsHeaders, "Retry-After": "60" },
-      );
-    }
-    const failure =
-      error instanceof AuthApiFailure
-        ? error
-        : new AuthApiFailure(503, "unavailable", "event-service-unavailable");
-    if (failure.status >= 500 && !isProfileWritesDisabledFailure(failure)) {
-      (
-        dependencies.logFailure ||
-        ((kind) =>
-          console.error(
-            JSON.stringify({ event: "event_service_failure", kind }),
-          ))
-      )(failure.message);
-    }
-    return authErrorResponse(failure, corsHeaders);
-  }
+      const response = await operation;
+      return authJsonResponse(response, 200, corsHeaders);
+    },
+  );
 }

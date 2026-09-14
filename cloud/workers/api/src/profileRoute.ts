@@ -6,21 +6,11 @@ import {
   type ProfileCustomizationUpdateResponse,
   type ProfileLookupResponse,
 } from "@mons/shared/profiles";
-import {
-  AuthApiFailure,
-  authErrorResponse,
-  isProfileWritesDisabledFailure,
-} from "./authErrors.ts";
-import {
-  authJsonResponse,
-  authPreflightResponse,
-  getAuthCorsHeaders,
-} from "./authHttp.ts";
-import {
-  verifySessionRequest,
-  type WorkerExecutionContext,
-} from "./sessionAuth.ts";
+import { AuthApiFailure } from "./authErrors.ts";
+import { authJsonResponse } from "./authHttp.ts";
+import type { WorkerExecutionContext } from "./sessionAuth.ts";
 import type { RequestIdentity } from "./requestIdentity.ts";
+import { authenticatedPost } from "./authenticatedPost.ts";
 import { readBoundedJson } from "./http.ts";
 import {
   createProfileCustomizationRepository,
@@ -99,161 +89,148 @@ export async function handleProfileRoute(
   ctx: WorkerExecutionContext,
   dependencies: ProfileRouteDependencies = {},
 ): Promise<Response> {
-  let corsHeaders: Record<string, string> = { Vary: "Origin" };
-  try {
-    corsHeaders = getAuthCorsHeaders(request);
-    if (request.method === "OPTIONS") {
-      return authPreflightResponse(corsHeaders);
-    }
-    if (request.method !== "POST") {
-      throw new AuthApiFailure(405, "method-not-allowed", "method-not-allowed");
-    }
-    const pathname = new URL(request.url).pathname;
-    const identity = await (
-      dependencies.verifyIdentity || verifySessionRequest
-    )(request, env, ctx);
-    if (PROFILE_WRITE_PATHS.has(pathname)) {
-      await assertProfileMutationAllowed(env);
-    }
-    const body = await parseBody(request);
+  return authenticatedPost(
+    request,
+    env,
+    ctx,
+    {
+      failureMessage: "profile-service-unavailable",
+      failureEvent: "profile_route_failure",
+      logFailure: dependencies.logFailure,
+      verifyIdentity: dependencies.verifyIdentity,
+    },
+    async ({ pathname, corsHeaders, authenticate }) => {
+      const identity = await authenticate();
+      if (PROFILE_WRITE_PATHS.has(pathname)) {
+        await assertProfileMutationAllowed(env);
+      }
+      const body = await parseBody(request);
 
-    if (pathname === "/profiles/username") {
-      if (!isUsernameEditRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+      if (pathname === "/profiles/username") {
+        if (!isUsernameEditRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        const username = body.username.trim();
+        let validationError = "";
+        if (isReservedExplicitUsername(username)) {
+          validationError = USERNAME_VALIDATION_MESSAGES.reserved;
+        } else if (username.length > USERNAME_MAX_LENGTH) {
+          validationError = USERNAME_VALIDATION_MESSAGES.tooLong;
+        } else if (username && !isAlphanumericUsername(username)) {
+          validationError = USERNAME_VALIDATION_MESSAGES.alphanumeric;
+        }
+        if (validationError) {
+          const response: UsernameEditResponse = {
+            ok: false,
+            validationError,
+          };
+          return authJsonResponse(response, 200, corsHeaders);
+        }
+        const usernameRepository =
+          dependencies.usernameRepository || createUsernameRepository(env);
+        const outcome = await usernameRepository.editUsername(
+          identity.uid,
+          username,
+        );
+        if (outcome === "taken") {
+          return authJsonResponse(
+            {
+              ok: false,
+              validationError: "That name has been taken. Choose another.",
+            } satisfies UsernameEditResponse,
+            200,
+            corsHeaders,
+          );
+        }
+        if (outcome === "cannot-clear") {
+          return authJsonResponse(
+            {
+              ok: false,
+              validationError: "Can't be empty.",
+            } satisfies UsernameEditResponse,
+            200,
+            corsHeaders,
+          );
+        }
+        return authJsonResponse(
+          { ok: outcome === "updated" } satisfies UsernameEditResponse,
+          200,
+          corsHeaders,
+        );
       }
-      const username = body.username.trim();
-      let validationError = "";
-      if (isReservedExplicitUsername(username)) {
-        validationError = USERNAME_VALIDATION_MESSAGES.reserved;
-      } else if (username.length > USERNAME_MAX_LENGTH) {
-        validationError = USERNAME_VALIDATION_MESSAGES.tooLong;
-      } else if (username && !isAlphanumericUsername(username)) {
-        validationError = USERNAME_VALIDATION_MESSAGES.alphanumeric;
+
+      if (pathname === "/profiles/custom") {
+        if (!isProfileCustomizationUpdateRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        const signal =
+          dependencies.customizationSignal ||
+          AbortSignal.timeout(PROFILE_CUSTOMIZATION_TIMEOUT_MS);
+        const customizationRepository =
+          dependencies.customizationRepository ||
+          createProfileCustomizationRepository(env, {
+            signal,
+          });
+        signal.throwIfAborted();
+        const outcome = await customizationRepository.updateCustomization(
+          identity.uid,
+          body,
+          (profile) =>
+            (
+              dependencies.authorizeCustomization ||
+              authorizeProfileCustomization
+            )(body, profile, env, { signal }),
+        );
+        if (outcome === "profile-not-found") {
+          throw new AuthApiFailure(404, "not-found", "profile-not-found");
+        }
+        if (outcome === "login-profile-conflict") {
+          throw new AuthApiFailure(
+            409,
+            "failed-precondition",
+            "login-profile-conflict",
+          );
+        }
+        return authJsonResponse(
+          { ok: true } satisfies ProfileCustomizationUpdateResponse,
+          200,
+          corsHeaders,
+        );
       }
-      if (validationError) {
-        const response: UsernameEditResponse = {
-          ok: false,
-          validationError,
+
+      const repository =
+        dependencies.repository || createProfileRepository(env);
+
+      if (pathname === "/profiles/lookup") {
+        if (!isProfileLookupRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        const id = body.id.trim();
+        if (!validLookupId(body.kind, id)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        const profile =
+          body.kind === "login"
+            ? await repository.getProfileByLoginId(id)
+            : await repository.getProfileById(id);
+        const response: ProfileLookupResponse = { ok: true, profile };
+        return authJsonResponse(response, 200, corsHeaders);
+      }
+
+      if (pathname === "/leaderboards/read") {
+        if (!isLeaderboardReadRequest(body)) {
+          throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
+        }
+        const response: LeaderboardReadResponse = {
+          ok: true,
+          profiles: await repository.readLeaderboard(body.type),
         };
         return authJsonResponse(response, 200, corsHeaders);
       }
-      const usernameRepository =
-        dependencies.usernameRepository || createUsernameRepository(env);
-      const outcome = await usernameRepository.editUsername(
-        identity.uid,
-        username,
-      );
-      if (outcome === "taken") {
-        return authJsonResponse(
-          {
-            ok: false,
-            validationError: "That name has been taken. Choose another.",
-          } satisfies UsernameEditResponse,
-          200,
-          corsHeaders,
-        );
-      }
-      if (outcome === "cannot-clear") {
-        return authJsonResponse(
-          {
-            ok: false,
-            validationError: "Can't be empty.",
-          } satisfies UsernameEditResponse,
-          200,
-          corsHeaders,
-        );
-      }
-      return authJsonResponse(
-        { ok: outcome === "updated" } satisfies UsernameEditResponse,
-        200,
-        corsHeaders,
-      );
-    }
 
-    if (pathname === "/profiles/custom") {
-      if (!isProfileCustomizationUpdateRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      const signal =
-        dependencies.customizationSignal ||
-        AbortSignal.timeout(PROFILE_CUSTOMIZATION_TIMEOUT_MS);
-      const customizationRepository =
-        dependencies.customizationRepository ||
-        createProfileCustomizationRepository(env, {
-          signal,
-        });
-      signal.throwIfAborted();
-      const outcome = await customizationRepository.updateCustomization(
-        identity.uid,
-        body,
-        (profile) =>
-          (
-            dependencies.authorizeCustomization || authorizeProfileCustomization
-          )(body, profile, env, { signal }),
-      );
-      if (outcome === "profile-not-found") {
-        throw new AuthApiFailure(404, "not-found", "profile-not-found");
-      }
-      if (outcome === "login-profile-conflict") {
-        throw new AuthApiFailure(
-          409,
-          "failed-precondition",
-          "login-profile-conflict",
-        );
-      }
-      return authJsonResponse(
-        { ok: true } satisfies ProfileCustomizationUpdateResponse,
-        200,
-        corsHeaders,
-      );
-    }
-
-    const repository = dependencies.repository || createProfileRepository(env);
-
-    if (pathname === "/profiles/lookup") {
-      if (!isProfileLookupRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      const id = body.id.trim();
-      if (!validLookupId(body.kind, id)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      const profile =
-        body.kind === "login"
-          ? await repository.getProfileByLoginId(id)
-          : await repository.getProfileById(id);
-      const response: ProfileLookupResponse = { ok: true, profile };
-      return authJsonResponse(response, 200, corsHeaders);
-    }
-
-    if (pathname === "/leaderboards/read") {
-      if (!isLeaderboardReadRequest(body)) {
-        throw new AuthApiFailure(400, "invalid-argument", "invalid-request");
-      }
-      const response: LeaderboardReadResponse = {
-        ok: true,
-        profiles: await repository.readLeaderboard(body.type),
-      };
-      return authJsonResponse(response, 200, corsHeaders);
-    }
-
-    throw new AuthApiFailure(404, "not-found", "not-found");
-  } catch (error) {
-    const failure =
-      error instanceof AuthApiFailure
-        ? error
-        : new AuthApiFailure(503, "unavailable", "profile-service-unavailable");
-    if (failure.status >= 500 && !isProfileWritesDisabledFailure(failure)) {
-      (
-        dependencies.logFailure ||
-        ((kind) =>
-          console.error(
-            JSON.stringify({ event: "profile_route_failure", kind }),
-          ))
-      )(failure.message);
-    }
-    return authErrorResponse(failure, corsHeaders);
-  }
+      throw new AuthApiFailure(404, "not-found", "not-found");
+    },
+  );
 }
 
 export { validLookupId };

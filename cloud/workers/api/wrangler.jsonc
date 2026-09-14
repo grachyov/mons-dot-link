@@ -27,6 +27,7 @@
   "vars": {
     "APPLE_AUDIENCES": "link.mons",
     "AUTH_MUTATIONS_DISABLED": "false",
+    "NEW_MATCH_TIMER_STORAGE": "d1",
     "EVENT_DB_BOOKMARK_EPOCH": "446cba4b-31c0-4c5e-8daa-af7d235fbe0f",
   },
   "d1_databases": [

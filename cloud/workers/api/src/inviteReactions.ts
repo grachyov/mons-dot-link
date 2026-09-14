@@ -33,6 +33,7 @@ import {
 import { MatchSyncRoom } from "./matchSyncRoom.ts";
 import type { MatchSyncMetadata, MatchSyncReadResult } from "./matchSync.ts";
 import { MatchStateStore } from "./matchStateStore.ts";
+import { parseNewMatchTimerStorage } from "./localMatchTimerStore.ts";
 import { captureMatchStateRpc, type MatchStateRpc } from "./matchStateRpc.ts";
 import type {
   MatchStateClaimTimerRequest,
@@ -145,6 +146,9 @@ export class InviteReactions
     });
     this.matchState = new MatchStateStore(ctx.storage, {
       timerStarts: createMatchTimerStartStore(env.PROFILE_GAMES_DB),
+      newMatchTimerStorage: parseNewMatchTimerStorage(
+        env.NEW_MATCH_TIMER_STORAGE,
+      ),
       scheduleAlarm: (atMs, transaction) =>
         this.scheduleInviteAlarm(atMs, transaction),
     });

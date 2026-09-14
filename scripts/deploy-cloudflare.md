@@ -27,6 +27,16 @@ Deploy only affected Workers. Shared prize-catalog changes need both the API and
 
 Authenticate Wrangler locally or supply `CLOUDFLARE_API_TOKEN` through the process environment. Never put credentials in arguments, source files, release files, or logs.
 
+## New-match timer storage
+
+`NEW_MATCH_TIMER_STORAGE` chooses `d1` or `local` only when the Durable Object creates a wholly new match. Missing configuration means `d1`; invalid values are rejected. The checked-in configuration selects `local`. Each new match persists its choice with its first records. Existing or imported matches without a saved choice continue using D1, and creation retries or partial pairs never change that choice. New rematches can use local timers within an existing invite Durable Object.
+
+Review and validate support before activation. Prepare the support candidate from code that understands both modes with `NEW_MATCH_TIMER_STORAGE` set to `d1`, then prepare the activation candidate with the same code and the setting changed to `local`. Record the support candidate as the compatible rollback target. Use the routine API release path for any separately authorized release, including publication of owned Workflow definitions whose dependencies changed. These additive Durable Object tables need no D1 migration, active-match adoption, write freeze, or Queue pause.
+
+Rollback must retain code that reads the saved timer mode and the additive local tables. Setting new-match storage back to `d1` affects only future matches; already-local matches continue using local timers. An unmodified Worker version from before timer-mode support is not a compatible rollback after any local match has been created. Keep existing D1 timer markers, reconciliation sweeps, and downstream cleanup for legacy matches. Do not bulk-copy or delete active markers, reset saved modes, or rewrite historical records.
+
+Before an authorized promotion, validate mixed legacy/local matches, timer replay, takebacks, eviction, and rollback configuration in the local runtime suite. After promotion, run the standard API and affected invite-lifecycle smoke checks. Finish when the required checks pass; no additional observation window is needed.
+
 ## Canonical operators
 
 Status commands are read-only and use Cloudflare credentials. Completed migration phases and source-proof operations are retired and fail during argument validation.

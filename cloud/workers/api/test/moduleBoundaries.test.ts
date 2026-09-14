@@ -55,23 +55,39 @@ test("canonical profile internals never import their public facade", () => {
   assert.deepEqual(violations, []);
 });
 
-test("event persistence internals have no facade dependencies or runtime cycles", () => {
-  const facade = resolve(import.meta.dirname, "../src/eventD1.ts");
-  const internalRoot = resolve(import.meta.dirname, "../src/eventD1");
-  const internals = reachableRuntimeFiles(facade).filter((path) =>
-    path.startsWith(`${internalRoot}/`),
-  );
-  assert.ok(internals.length > 0);
-  for (const path of internals) {
-    const dependencies = runtimeSpecifiers(path)
-      .map((specifier) => resolveRuntimeImport(path, specifier))
-      .filter((dependency): dependency is string => dependency !== null);
-    for (const dependency of dependencies) {
-      const reachable = reachableRuntimeFiles(dependency);
-      assert.ok(!reachable.includes(facade), relative(repositoryRoot, path));
-      assert.ok(!reachable.includes(path), relative(repositoryRoot, path));
+for (const module of [
+  "eventD1",
+  "authIdentityCanonical",
+  "profileGameProjection",
+]) {
+  test(`${module} internals have no facade dependencies or runtime cycles`, () => {
+    const facade = resolve(import.meta.dirname, `../src/${module}.ts`);
+    const internalRoot = resolve(import.meta.dirname, `../src/${module}`);
+    const internals = reachableRuntimeFiles(facade).filter((path) =>
+      path.startsWith(`${internalRoot}/`),
+    );
+    assert.ok(internals.length > 0);
+    for (const path of internals) {
+      const dependencies = runtimeSpecifiers(path)
+        .map((specifier) => resolveRuntimeImport(path, specifier))
+        .filter((dependency): dependency is string => dependency !== null);
+      for (const dependency of dependencies) {
+        const reachable = reachableRuntimeFiles(dependency);
+        assert.ok(!reachable.includes(facade), relative(repositoryRoot, path));
+        assert.ok(!reachable.includes(path), relative(repositoryRoot, path));
+      }
     }
-  }
+  });
+}
+
+test("projection processing and recovery have separate dependency boundaries", () => {
+  const root = resolve(import.meta.dirname, "../src/profileGameProjection");
+  const processing = resolve(root, "processing.ts");
+  const recovery = resolve(root, "recovery.ts");
+  const queue = resolve(root, "queue.ts");
+  assert.ok(!reachableRuntimeFiles(processing).includes(recovery));
+  assert.ok(!reachableRuntimeFiles(recovery).includes(processing));
+  assert.ok(!reachableRuntimeFiles(recovery).includes(queue));
 });
 
 test("event announcement scheduling and dispatch do not depend on recovery orchestration", () => {
@@ -471,19 +487,28 @@ test("the final Worker runtime has no Firestore profile transport or retired bin
 });
 
 test("canonical auth and recovery cannot construct Firebase clients or access Firebase configuration", () => {
+  const internalRoot = resolve(
+    import.meta.dirname,
+    "../src/authIdentityCanonical",
+  );
+  const sources = new Set<string>();
   for (const file of [
     "authIdentity.ts",
     "authIdentityCanonical.ts",
     "authRecovery.ts",
   ]) {
-    const source = readFileSync(
-      resolve(import.meta.dirname, "../src", file),
-      "utf8",
-    );
+    const entry = resolve(import.meta.dirname, "../src", file);
+    sources.add(entry);
+    for (const path of reachableRuntimeFiles(entry)) {
+      if (path.startsWith(`${internalRoot}/`)) sources.add(path);
+    }
+  }
+  for (const path of sources) {
+    const source = readFileSync(path, "utf8");
     assert.doesNotMatch(
       source,
       /firebaseRtdb|\bStateRepository\b|createEventStateRepository|FIREBASE_[A-Z_]+|\bfetch\s*\(/,
-      file,
+      relative(repositoryRoot, path),
     );
   }
 });

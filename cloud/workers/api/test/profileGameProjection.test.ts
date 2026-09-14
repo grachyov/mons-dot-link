@@ -8,8 +8,10 @@ import type {
   RatingProfileGameProjectionRepository,
   RatingUpdateData,
 } from "../src/gameplayRepository.ts";
+import type { EventStore } from "../src/eventStoreContracts.ts";
 import {
   claimAutomatchSweepCandidate,
+  claimEventSweepCandidate,
   handleProfileGameProjectionMessage,
   processAutomatchProfileGameProjection,
   processEventProfileGameProjection,
@@ -2104,6 +2106,41 @@ test("scheduled recovery bounds concurrent claims", async () => {
     0,
   );
   assert.equal(maximum, 10);
+});
+
+test("event recovery helpers accept only the outbox transaction capability", async () => {
+  const state: Pick<EventStore, "transactEventProfileGameProjectionOutbox"> = {
+    async transactEventProfileGameProjectionOutbox(_eventId, updater) {
+      const decision = updater(null);
+      assert.ok("commit" in decision);
+      assert.equal(decision.commit, false);
+      return { committed: false, decision: decision.decision, value: null };
+    },
+  };
+  assert.equal(
+    await claimEventSweepCandidate(
+      state,
+      {
+        lastQueuedAtMs: 0,
+        task: {
+          kind: "event-profile-game-projection",
+          eventId: "event-1",
+          requestId: "request-1",
+        },
+      },
+      600_000,
+    ),
+    false,
+  );
+  assert.deepEqual(
+    await repairInvalidEventSweepEntry(
+      state,
+      "event-1",
+      600_000,
+      () => "repair-request",
+    ),
+    { kind: "changed" },
+  );
 });
 
 test("event recovery normalizes every non-null malformed marker", async () => {

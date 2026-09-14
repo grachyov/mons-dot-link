@@ -1,5 +1,6 @@
 import { decodeEventUpdates } from "../src/eventCompatibilityCodec.ts";
 import { env } from "cloudflare:workers";
+import { parseNewMatchTimerStorage } from "../src/localMatchTimerStore.ts";
 import {
   applyD1Migrations,
   runDurableObjectAlarm,
@@ -462,6 +463,27 @@ describe("gameplay with canonical Durable Object storage", () => {
       timer: started.timer,
     });
     const room = workerEnv.INVITE_REACTIONS.getByName(inviteId);
+    const timerStorage = parseNewMatchTimerStorage(
+      workerEnv.NEW_MATCH_TIMER_STORAGE,
+    );
+    await runInDurableObject(room, (_instance, durableState) => {
+      expect(
+        durableState.storage.sql
+          .exec<{ mode: string }>(
+            "SELECT mode FROM match_state_timer_cohorts WHERE match_id = ?",
+            inviteId,
+          )
+          .one().mode,
+      ).toBe(timerStorage);
+      expect(
+        durableState.storage.sql
+          .exec<{ count: number }>(
+            "SELECT COUNT(*) AS count FROM match_state_timer_starts WHERE match_id = ?",
+            inviteId,
+          )
+          .one().count,
+      ).toBe(timerStorage === "local" ? 1 : 0);
+    });
     const pendingEffects = () =>
       runInDurableObject(
         room,
@@ -480,7 +502,7 @@ describe("gameplay with canonical Durable Object storage", () => {
         )
         .bind(inviteId)
         .first("count"),
-    ).toBe(1);
+    ).toBe(timerStorage === "local" ? 0 : 1);
     expect(await runDurableObjectAlarm(room)).toBe(true);
     expect(await pendingEffects()).toBe(0);
     expect(

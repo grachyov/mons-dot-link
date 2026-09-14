@@ -67,6 +67,8 @@ Schema maintenance may require `--freeze`, affected Queue pauses, verification o
 
 Moves, takebacks, timer starts/claims, surrender, and rematches use authenticated Worker APIs and typed Durable Object mutations. Cumulative delivery preserves prefixes, replay, status, and timer fences. Pending downstream effects remain durable and recover through the existing alarm.
 
+New matches persist a timer-storage choice in their invite Durable Object. With `NEW_MATCH_TIMER_STORAGE=local`, timer markers and match updates commit in one local SQLite transaction. Existing matches without a choice continue using their D1 markers; configuration changes and creation retries never move a match between stores. Local timer markers retain the first deadline for each highest turn, including across takebacks and eviction. They remain alongside match records; D1 timer reconciliation continues for legacy matches. See the deployment guide's new-match timer procedure for support, activation, and compatible rollback.
+
 `GET /matches/snapshot?playerId=…&matchId=…` resolves D1 routing and reads the exact canonical or archived match. An absent route returns `match: null`; unavailable canonical state is an error. Public historical pairs come solely from D1 and never backfill on reads.
 
 ```sh
