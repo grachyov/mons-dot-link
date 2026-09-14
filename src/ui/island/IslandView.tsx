@@ -47,6 +47,7 @@ import {
   getMaterialImageUrl,
 } from "../../resources/materialImageResources";
 import { useMaterialImages } from "../../hooks/useMaterialImages";
+import { getImageResource } from "../../resources/imageResources";
 import { openProfileSignInPopup } from "../identity/profileUiPort";
 import { signInButtonVisualStyles } from "../identity/signInButtonStyles";
 import {
@@ -863,20 +864,7 @@ const MINING_FRAME_MS = 175;
 const WALKING_FRAME_MS = 120;
 const STANDING_FRAME_MS = 200;
 
-let islandImagePromise: Promise<string | null> | null = null;
-
-const getIslandImageUrl = () => {
-  if (!islandImagePromise) {
-    islandImagePromise = fetch(DEFAULT_URL)
-      .then((res) => {
-        if (!res.ok) throw new Error("Failed to fetch image");
-        return res.blob();
-      })
-      .then((blob) => URL.createObjectURL(blob))
-      .catch(() => null);
-  }
-  return islandImagePromise;
-};
+const getIslandImageUrl = () => getImageResource(DEFAULT_URL).load();
 
 type MaterialPullRect = {
   left: number;

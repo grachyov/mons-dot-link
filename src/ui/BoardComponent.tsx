@@ -59,6 +59,7 @@ import { connection } from "../connection/connection";
 import { MatchWagerState } from "../connection/connectionModels";
 import { subscribeToWagerState } from "../game/wagerState";
 import { useAvailableMaterials } from "../hooks/useAvailableMaterials";
+import { getImageResource } from "../resources/imageResources";
 import { registerBoardTransientUiHandler } from "./uiSession";
 import {
   bindBoardUiHandlers,
@@ -339,46 +340,21 @@ const getErrorName = (error: unknown) =>
     ? String((error as { name?: unknown }).name)
     : "";
 
-const endOfGameIconPromises: Map<
-  EndOfGameIconName,
-  Promise<string | null>
-> = new Map();
-const endOfGameIconResolvedUrls: Partial<Record<EndOfGameIconName, string>> =
-  {};
 type EndOfGameIconHrefs = Record<EndOfGameIconName, string>;
 
 const getEndOfGameIconHrefs = (): EndOfGameIconHrefs => ({
-  victory: endOfGameIconResolvedUrls.victory || END_OF_GAME_ICON_URLS.victory,
-  resign: endOfGameIconResolvedUrls.resign || END_OF_GAME_ICON_URLS.resign,
+  victory:
+    getImageResource(END_OF_GAME_ICON_URLS.victory).getCachedValue() ||
+    END_OF_GAME_ICON_URLS.victory,
+  resign:
+    getImageResource(END_OF_GAME_ICON_URLS.resign).getCachedValue() ||
+    END_OF_GAME_ICON_URLS.resign,
 });
-
-const fetchCachedImageUrl = (url: string): Promise<string | null> =>
-  fetch(url)
-    .then((res) => {
-      if (!res.ok) throw new Error("Failed to fetch image");
-      return res.blob();
-    })
-    .then((blob) => URL.createObjectURL(blob))
-    .catch(() => null);
 
 const getEndOfGameIconCachedUrl = (
   name: EndOfGameIconName,
-): Promise<string | null> => {
-  if (!endOfGameIconPromises.has(name)) {
-    const promise = fetchCachedImageUrl(END_OF_GAME_ICON_URLS[name]).then(
-      (resolvedUrl) => {
-        if (resolvedUrl) {
-          endOfGameIconResolvedUrls[name] = resolvedUrl;
-        } else {
-          endOfGameIconPromises.delete(name);
-        }
-        return resolvedUrl;
-      },
-    );
-    endOfGameIconPromises.set(name, promise);
-  }
-  return endOfGameIconPromises.get(name)!;
-};
+): Promise<string | null> =>
+  getImageResource(END_OF_GAME_ICON_URLS[name]).load();
 
 const preloadEndOfGameIcons = () =>
   (Object.keys(END_OF_GAME_ICON_URLS) as EndOfGameIconName[]).map((name) =>

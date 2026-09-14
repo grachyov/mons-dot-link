@@ -17,6 +17,7 @@ import { generateBoardPattern } from "../utils/boardPatternGenerator";
 import { isMobile } from "../utils/misc";
 import { setBoardStyleSet, setItemsStyleSet } from "../game/board";
 import { loadGameAssets } from "../assets/gameAssetsLoader";
+import { getImageResource } from "../resources/imageResources";
 
 const PICTURE_BOARD_STYLE_SETS = [BoardStyleSet.Pangchiu] as const;
 type PictureBoardStyleSet = (typeof PICTURE_BOARD_STYLE_SETS)[number];
@@ -26,22 +27,21 @@ const BOARD_PREVIEW_URLS: Record<PictureBoardStyleSet, string> = {
     "https://cdn.lil.org/mons/boards/backgrounds/thumbs/pangchiu.jpg",
 };
 
-type BoardPreviewCache = {
-  promise: Promise<string | null> | null;
-  url: string | null;
-  failed: boolean;
+type BoardPreviewDecodeCache = {
+  promise: Promise<void> | null;
   decoded: boolean;
 };
 
-const createBoardPreviewCache = (): BoardPreviewCache => ({
+const createBoardPreviewDecodeCache = (): BoardPreviewDecodeCache => ({
   promise: null,
-  url: null,
-  failed: false,
   decoded: false,
 });
 
-const boardPreviewCaches: Record<PictureBoardStyleSet, BoardPreviewCache> = {
-  [BoardStyleSet.Pangchiu]: createBoardPreviewCache(),
+const boardPreviewDecodeCaches: Record<
+  PictureBoardStyleSet,
+  BoardPreviewDecodeCache
+> = {
+  [BoardStyleSet.Pangchiu]: createBoardPreviewDecodeCache(),
 };
 
 type BoardPreviewDisplayState = Record<
@@ -55,11 +55,10 @@ type BoardPreviewDisplayState = Record<
 
 const createBoardPreviewDisplayState = (): BoardPreviewDisplayState =>
   PICTURE_BOARD_STYLE_SETS.reduce((state, styleSet) => {
-    const cache = boardPreviewCaches[styleSet];
     state[styleSet] = {
-      src: cache.url,
-      loaded: cache.decoded,
-      failed: cache.failed,
+      src: getImageResource(BOARD_PREVIEW_URLS[styleSet]).getCachedValue(),
+      loaded: boardPreviewDecodeCaches[styleSet].decoded,
+      failed: false,
     };
     return state;
   }, {} as BoardPreviewDisplayState);
@@ -83,60 +82,45 @@ const getItemStylePreviewUrl = async (
   }
 };
 
-const getBoardPreviewUrl = (styleSet: PictureBoardStyleSet) => {
-  const cache = boardPreviewCaches[styleSet];
-  if (cache.url) {
-    return Promise.resolve(cache.url);
-  }
-  if (cache.failed) {
-    return Promise.resolve(null);
-  }
-  if (!cache.promise) {
-    cache.promise = fetch(BOARD_PREVIEW_URLS[styleSet])
-      .then((res) => {
-        if (!res.ok) throw new Error("Failed to fetch image");
-        return res.blob();
-      })
-      .then((blob) => {
-        cache.url = URL.createObjectURL(blob);
-        return cache.url;
-      })
-      .catch(() => {
-        cache.failed = true;
-        return null;
-      });
-  }
-  return cache.promise.then((url) => {
-    if (!url) {
-      cache.failed = true;
-    }
-    return url;
-  });
-};
+const getBoardPreviewUrl = (styleSet: PictureBoardStyleSet) =>
+  getImageResource(BOARD_PREVIEW_URLS[styleSet]).load();
 
 const decodeBoardPreview = (styleSet: PictureBoardStyleSet, url: string) => {
-  const cache = boardPreviewCaches[styleSet];
+  const cache = boardPreviewDecodeCaches[styleSet];
   if (cache.decoded || typeof Image === "undefined") {
     cache.decoded = true;
     return Promise.resolve();
   }
+  if (cache.promise) {
+    return cache.promise;
+  }
   const img = new Image();
-  img.src = url;
-  const decodePromise =
-    typeof img.decode === "function"
-      ? img.decode()
-      : new Promise<void>((resolve, reject) => {
-          img.onload = () => resolve();
-          img.onerror = () => reject();
-        });
-  return decodePromise.then(() => {
-    cache.decoded = true;
-  });
+  let decodePromise: Promise<void>;
+  if (typeof img.decode === "function") {
+    img.src = url;
+    decodePromise = img.decode();
+  } else {
+    decodePromise = new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject();
+      img.src = url;
+    });
+  }
+  cache.promise = decodePromise
+    .then(() => {
+      cache.decoded = true;
+    })
+    .finally(() => {
+      cache.promise = null;
+    });
+  return cache.promise;
 };
 
 const preloadBoardPreview = (styleSet: PictureBoardStyleSet) => {
-  const cache = boardPreviewCaches[styleSet];
-  if (cache.url || cache.failed || typeof window === "undefined") {
+  if (
+    boardPreviewDecodeCaches[styleSet].decoded ||
+    typeof window === "undefined"
+  ) {
     return;
   }
   getBoardPreviewUrl(styleSet)
@@ -402,7 +386,7 @@ const BoardStylePickerComponent: React.FC = () => {
           }));
           return;
         }
-        const cache = boardPreviewCaches[styleSet];
+        const cache = boardPreviewDecodeCaches[styleSet];
         setBoardPreviewDisplayState((prevState) => ({
           ...prevState,
           [styleSet]: {

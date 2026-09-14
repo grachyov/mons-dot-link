@@ -1,5 +1,5 @@
 import { MATERIAL_KEYS, type MiningMaterialName } from "@mons/shared/mining";
-import { createCachedResource } from "./cachedResource";
+import { getImageResource } from "./imageResources";
 
 export type MaterialImageUrls = Record<MiningMaterialName, string | null>;
 
@@ -11,18 +11,7 @@ const pendingNotifications = new Set<MiningMaterialName>();
 const materialImageResources = new Map(
   MATERIAL_KEYS.map((name) => [
     name,
-    createCachedResource<string>(
-      async () => {
-        const response = await fetch(
-          `https://cdn.lil.org/mons/rocks/materials/${name}.webp`,
-        );
-        if (!response.ok) {
-          throw new Error("Failed to fetch material image");
-        }
-        return URL.createObjectURL(await response.blob());
-      },
-      () => {},
-    ),
+    getImageResource(`https://cdn.lil.org/mons/rocks/materials/${name}.webp`),
   ]),
 );
 

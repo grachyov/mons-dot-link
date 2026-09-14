@@ -86,10 +86,7 @@ import {
 } from "@mons/shared/events";
 import type { AuthState } from "../connection/authModels";
 import { InventoryModal } from "./InventoryModal";
-import {
-  createCachedResource,
-  type CachedResource,
-} from "../resources/cachedResource";
+import { getImageResource } from "../resources/imageResources";
 import { useMaterialImages } from "../hooks/useMaterialImages";
 
 const MATERIAL_TYPES: MiningMaterialName[] = [...MINING_MATERIAL_NAMES];
@@ -155,48 +152,8 @@ const getDefaultScheduledDateTimeInput = (): { date: string; time: string } => {
   };
 };
 
-type ImageUrlResource = CachedResource<string | false>;
-
-const specialLeaderboardTypeImageResources: Map<
-  LeaderboardSpecialType,
-  ImageUrlResource
-> = new Map();
-
-const createImageUrlResource = (url: string): ImageUrlResource =>
-  createCachedResource(
-    async () => {
-      try {
-        const response = await fetch(url);
-        if (!response.ok) {
-          return false;
-        }
-        return URL.createObjectURL(await response.blob());
-      } catch {
-        return false;
-      }
-    },
-    () => {},
-  );
-
-const loadCachedImageUrl = <Key,>(
-  resources: Map<Key, ImageUrlResource>,
-  key: Key,
-  url: string,
-): Promise<string | null> => {
-  let resource = resources.get(key);
-  if (!resource) {
-    resource = createImageUrlResource(url);
-    resources.set(key, resource);
-  }
-  return resource.load().then((value) => value || null);
-};
-
 const getSpecialLeaderboardTypeImageUrl = (type: LeaderboardSpecialType) =>
-  loadCachedImageUrl(
-    specialLeaderboardTypeImageResources,
-    type,
-    LEADERBOARD_TYPE_ICON_URLS[type],
-  );
+  getImageResource(LEADERBOARD_TYPE_ICON_URLS[type]).load();
 
 const isMaterialLeaderboardType = (
   value: LeaderboardType,

@@ -6,7 +6,6 @@ import React, {
   useCallback,
   useMemo,
 } from "react";
-import { VALID_REACTION_IDS } from "@mons/shared/nfts";
 import {
   FIXED_STICKER_IDS,
   STICKER_ID_WHITELIST,
@@ -77,6 +76,10 @@ import {
 import NavigationPicker from "./NavigationPicker";
 import { useNavigationGames } from "./controls/useNavigationGames";
 import {
+  STICKER_IMAGE_BASE_URL,
+  useReactionPicker,
+} from "./controls/useReactionPicker";
+import {
   ControlsContainer,
   BrushButton,
   NavigationListButton,
@@ -97,11 +100,6 @@ import {
   WagerButtonAmount,
   ShimmerText,
 } from "./BottomControlsStyles";
-import {
-  fetchNftsForIdentity,
-  getNftIdentityKey,
-  NFT_CACHE_TTL_MS,
-} from "../services/nftService";
 import { closeMenuAndInfoIfAny } from "./controls/menuPort";
 import BoardStylePickerComponent, {
   preloadPangchiuBoardPreview,
@@ -122,7 +120,6 @@ import {
 } from "../connection/connectionModels";
 import { subscribeToWagerState } from "../game/wagerState";
 import { getStashedPlayerProfile } from "../utils/playerMetadata";
-import { storage, type ReactionExtraStickerCache } from "../utils/storage";
 import {
   getCurrentTarget,
   isTransitionInProgress,
@@ -212,46 +209,6 @@ let pendingDelayedCancelAutomatchIntentExpiresAtMs = 0;
 let pendingDelayedCancelAutomatchRevealAtMs = 0;
 let pendingFreshAutomatchCancelRevealAtMs = 0;
 
-type StickerEntitlementState = {
-  stickerIds: readonly number[];
-  ownerKey: string | null;
-  expiresAtMs: number;
-};
-const EMPTY_STICKER_ENTITLEMENT: StickerEntitlementState = {
-  stickerIds: FIXED_STICKER_IDS,
-  ownerKey: null,
-  expiresAtMs: 0,
-};
-const STICKER_IMAGE_BASE_URL = "https://cdn.lil.org/mons/emojipack/swagpack/64";
-const stickerImagePromises: Map<number, Promise<string | null>> = new Map();
-
-const fetchImageUrl = (url: string): Promise<string | null> =>
-  fetch(url)
-    .then((res) => {
-      if (!res.ok) throw new Error("Failed to fetch image");
-      return res.blob();
-    })
-    .then((blob) => URL.createObjectURL(blob))
-    .catch(() => null);
-
-const getCachedImageUrl = <T extends string | number>(
-  cache: Map<T, Promise<string | null>>,
-  key: T,
-  url: string,
-) => {
-  if (!cache.has(key)) {
-    cache.set(key, fetchImageUrl(url));
-  }
-  return cache.get(key)!;
-};
-
-const getStickerImageUrl = (id: number) =>
-  getCachedImageUrl(
-    stickerImagePromises,
-    id,
-    `${STICKER_IMAGE_BASE_URL}/${id}.webp`,
-  );
-
 const clearPendingImmediateCancelAutomatchIntent = () => {
   pendingImmediateCancelAutomatchInviteId = null;
   pendingImmediateCancelAutomatchIntentExpiresAtMs = 0;
@@ -331,79 +288,6 @@ const consumePendingDelayedCancelAutomatchIntent = (): number | null => {
     return revealAtMs > 0 ? revealAtMs : null;
   }
   return null;
-};
-
-const mergeStickerIds = (
-  base: readonly number[],
-  extra: readonly number[],
-): number[] => {
-  if (!extra.length) return base.slice();
-  const seen = new Set<number>(base);
-  const merged = base.slice();
-  for (const id of extra) {
-    if (!seen.has(id)) {
-      seen.add(id);
-      merged.push(id);
-    }
-  }
-  return merged;
-};
-
-const normalizeStickerIds = (value: unknown): number[] => {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (id): id is number =>
-      typeof id === "number" &&
-      Number.isSafeInteger(id) &&
-      VALID_REACTION_IDS.includes(id),
-  );
-};
-
-const getSwagpackReactionStickerIds = (value: unknown): number[] => {
-  if (!Array.isArray(value)) return [];
-  const ids = value.map((item) => (item as { id?: unknown }).id);
-  return normalizeStickerIds(ids);
-};
-
-const areStickerIdArraysEqual = (
-  left: readonly number[],
-  right: readonly number[],
-): boolean => {
-  if (left.length !== right.length) return false;
-  for (let i = 0; i < left.length; i += 1) {
-    if (left[i] !== right[i]) return false;
-  }
-  return true;
-};
-
-const getStoredStickerOwnerKey = (): string | null => {
-  return getNftIdentityKey(storage.getAuthIdentity());
-};
-
-const hasUsableStickerCacheExpiry = (expiresAtMs: number): boolean => {
-  const now = Date.now();
-  return expiresAtMs > now && expiresAtMs <= now + NFT_CACHE_TTL_MS;
-};
-
-const toUsableStickerEntitlement = (
-  cache: ReactionExtraStickerCache | null,
-  expectedOwnerKey: string,
-): StickerEntitlementState | null => {
-  if (
-    !cache ||
-    getNftIdentityKey(cache) !== expectedOwnerKey ||
-    !hasUsableStickerCacheExpiry(cache.expiresAtMs)
-  ) {
-    return null;
-  }
-  return {
-    stickerIds: mergeStickerIds(
-      FIXED_STICKER_IDS,
-      normalizeStickerIds(cache.extraIds),
-    ),
-    ownerKey: expectedOwnerKey,
-    expiresAtMs: cache.expiresAtMs,
-  };
 };
 
 const RematchSeriesInlineControl = styled.div`
@@ -739,7 +623,7 @@ interface BottomControlsProps {
 }
 
 const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
-  const { authStatus, profileId, ethAddress, solAddress } = authState;
+  const { authStatus, profileId } = authState;
   const isAuthenticated = authStatus === "authenticated";
   const [isEndMatchButtonVisible, setIsEndMatchButtonVisible] = useState(false);
   const [isEndMatchConfirmed, setIsEndMatchConfirmed] = useState(false);
@@ -854,43 +738,12 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     progress: 0,
     requestDate: Date.now(),
   });
-  const [stickerEntitlement, setStickerEntitlement] =
-    useState<StickerEntitlementState>(EMPTY_STICKER_ENTITLEMENT);
-  const currentStickerOwnerKey = isAuthenticated
-    ? getNftIdentityKey(authState)
-    : null;
-  const clearStickerEntitlement = useCallback(() => {
-    setStickerEntitlement((current) => {
-      if (
-        current.ownerKey === null &&
-        current.expiresAtMs === 0 &&
-        areStickerIdArraysEqual(current.stickerIds, FIXED_STICKER_IDS)
-      ) {
-        return current;
-      }
-      return EMPTY_STICKER_ENTITLEMENT;
-    });
-  }, []);
-  const applyStickerEntitlement = useCallback(
-    (next: StickerEntitlementState) => {
-      setStickerEntitlement((current) =>
-        current.ownerKey === next.ownerKey &&
-        current.expiresAtMs > next.expiresAtMs
-          ? current
-          : next,
-      );
-    },
-    [],
-  );
-  const hasStickerEntitlementForCurrentOwner =
-    currentStickerOwnerKey !== null &&
-    stickerEntitlement.ownerKey === currentStickerOwnerKey;
-  const hasFreshStickerEntitlement =
-    hasStickerEntitlementForCurrentOwner &&
-    stickerEntitlement.expiresAtMs > Date.now();
-  const visibleStickerIds = hasStickerEntitlementForCurrentOwner
-    ? stickerEntitlement.stickerIds
-    : FIXED_STICKER_IDS;
+  const {
+    visibleStickerIds,
+    hasFreshStickerEntitlement,
+    stickerUrls,
+    canSendSticker,
+  } = useReactionPicker({ authState, isOpen: isReactionPickerVisible });
   const [pickerMaxHeight, setPickerMaxHeight] = useState<number | undefined>(
     undefined,
   );
@@ -916,9 +769,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
   const beginInviteFlowRef = useRef<
     (options?: { skipSoundInit?: boolean }) => void
   >(() => {});
-  const [stickerUrls, setStickerUrls] = useState<Record<number, string | null>>(
-    {},
-  );
   const [wagerState, setWagerState] = useState<MatchWagerState | null>(null);
 
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -1334,109 +1184,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
   }, [isClaimVictoryConfirmVisible, updateClaimVictoryConfirmPosition]);
 
   useEffect(() => {
-    if (!isReactionPickerVisible) return;
-    let isCancelled = false;
-    const ownerKeyAtRequest = currentStickerOwnerKey;
-    if (ownerKeyAtRequest === null) {
-      clearStickerEntitlement();
-      return;
-    }
-    if (getStoredStickerOwnerKey() !== ownerKeyAtRequest) {
-      clearStickerEntitlement();
-      return;
-    }
-    const cached = storage.getReactionExtraStickerCache(null);
-    const cachedEntitlement = toUsableStickerEntitlement(
-      cached,
-      ownerKeyAtRequest,
-    );
-    if (cachedEntitlement) {
-      applyStickerEntitlement(cachedEntitlement);
-    } else {
-      setStickerEntitlement((current) =>
-        current.ownerKey === ownerKeyAtRequest
-          ? current
-          : EMPTY_STICKER_ENTITLEMENT,
-      );
-    }
-    const fetchReactions = async () => {
-      try {
-        const snapshot = await fetchNftsForIdentity(authState);
-        const { data, expiresAtMs } = snapshot;
-        if (
-          isCancelled ||
-          data.ok !== true ||
-          expiresAtMs <= Date.now() ||
-          getStoredStickerOwnerKey() !== ownerKeyAtRequest
-        ) {
-          return;
-        }
-        const currentCache = storage.getReactionExtraStickerCache(null);
-        const currentCacheEntitlement = toUsableStickerEntitlement(
-          currentCache,
-          ownerKeyAtRequest,
-        );
-        if (
-          currentCacheEntitlement &&
-          currentCacheEntitlement.expiresAtMs > expiresAtMs
-        ) {
-          applyStickerEntitlement(currentCacheEntitlement);
-          return;
-        }
-        const extraIds = getSwagpackReactionStickerIds(data.swagpack_reactions);
-        const nextStickerIds = mergeStickerIds(FIXED_STICKER_IDS, extraIds);
-        applyStickerEntitlement({
-          stickerIds: nextStickerIds,
-          ownerKey: ownerKeyAtRequest,
-          expiresAtMs,
-        });
-        const nextCache = {
-          profileId,
-          ethAddress,
-          solAddress,
-          extraIds,
-          expiresAtMs,
-        };
-        if (
-          !currentCacheEntitlement ||
-          currentCacheEntitlement.expiresAtMs !== expiresAtMs ||
-          !areStickerIdArraysEqual(
-            normalizeStickerIds(currentCache?.extraIds),
-            extraIds,
-          )
-        ) {
-          storage.setReactionExtraStickerCache(nextCache);
-        }
-      } catch {}
-    };
-    fetchReactions();
-    return () => {
-      isCancelled = true;
-    };
-  }, [
-    applyStickerEntitlement,
-    authState,
-    clearStickerEntitlement,
-    currentStickerOwnerKey,
-    ethAddress,
-    isReactionPickerVisible,
-    profileId,
-    solAddress,
-  ]);
-
-  useEffect(() => {
-    setStickerEntitlement((current) => {
-      if (
-        current.ownerKey === null ||
-        current.ownerKey === currentStickerOwnerKey
-      ) {
-        return current;
-      }
-      return EMPTY_STICKER_ENTITLEMENT;
-    });
-  }, [currentStickerOwnerKey]);
-
-  useEffect(() => {
     if (!isReactionPickerVisible) {
       setIsWagerMode(false);
       setWagerSelection({ name: null, count: 0 });
@@ -1449,23 +1196,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     });
     return unsubscribe;
   }, []);
-
-  useEffect(() => {
-    if (!isReactionPickerVisible || !visibleStickerIds.length) return;
-    let mounted = true;
-    visibleStickerIds.forEach((id) => {
-      getStickerImageUrl(id).then((url) => {
-        if (!mounted) return;
-        setStickerUrls((prev) => {
-          if (prev[id] === url) return prev;
-          return { ...prev, [id]: url };
-        });
-      });
-    });
-    return () => {
-      mounted = false;
-    };
-  }, [isReactionPickerVisible, visibleStickerIds]);
 
   useEffect(() => {
     return subscribeToEventModalState((state) => {
@@ -2163,15 +1893,7 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
         setIsReactionPickerVisible(false);
         return;
       }
-      const isFixedSticker = FIXED_STICKER_IDS.includes(stickerId);
-      if (
-        !isFixedSticker &&
-        (currentStickerOwnerKey === null ||
-          stickerEntitlement.ownerKey !== currentStickerOwnerKey ||
-          stickerEntitlement.expiresAtMs <= Date.now() ||
-          getStoredStickerOwnerKey() !== currentStickerOwnerKey ||
-          !stickerEntitlement.stickerIds.includes(stickerId))
-      ) {
+      if (!canSendSticker(stickerId)) {
         setIsReactionPickerVisible(false);
         return;
       }
@@ -2205,14 +1927,7 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
         }, 9999);
       }
     },
-    [
-      currentStickerOwnerKey,
-      isVoiceReactionButtonVisible,
-      setMatchScopedTimeout,
-      stickerEntitlement.expiresAtMs,
-      stickerEntitlement.ownerKey,
-      stickerEntitlement.stickerIds,
-    ],
+    [canSendSticker, isVoiceReactionButtonVisible, setMatchScopedTimeout],
   );
 
   const handleReactionSelect = useCallback(
