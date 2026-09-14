@@ -12,7 +12,8 @@ import {
   STICKER_ID_WHITELIST,
 } from "@mons/shared/reactions";
 import { MATCH_TIMER_DURATION_SECONDS } from "@mons/shared/timers";
-import { createEmptyMaterials } from "@mons/shared/mining";
+import { useAvailableMaterials } from "../hooks/useAvailableMaterials";
+import { useMaterialImages } from "../hooks/useMaterialImages";
 import {
   FaUndo,
   FaFlag,
@@ -111,11 +112,7 @@ import {
   subscribeMoveHistoryPopupReload,
   triggerMoveHistoryPopupSelectionReset,
 } from "./controls/moveHistoryPopupStore";
-import {
-  MATERIALS,
-  MaterialName,
-  rocksMiningService,
-} from "../services/rocksMiningService";
+import { MATERIALS, MaterialName } from "../services/rocksMiningService";
 import {
   EventNavigationPreviewParticipant,
   EventRecord,
@@ -124,13 +121,6 @@ import {
   NavigationItem,
 } from "../connection/connectionModels";
 import { subscribeToWagerState } from "../game/wagerState";
-import {
-  computeAvailableMaterials,
-  getFrozenMaterials,
-  getFrozenMaterialsStatus,
-  hasConfirmedFrozenMaterials,
-  subscribeToFrozenMaterials,
-} from "../services/wagerMaterialsService";
 import { getStashedPlayerProfile } from "../utils/playerMetadata";
 import { storage, type ReactionExtraStickerCache } from "../utils/storage";
 import {
@@ -232,12 +222,7 @@ const EMPTY_STICKER_ENTITLEMENT: StickerEntitlementState = {
   ownerKey: null,
   expiresAtMs: 0,
 };
-const MATERIAL_IMAGE_BASE_URL = "https://cdn.lil.org/mons/rocks/materials";
 const STICKER_IMAGE_BASE_URL = "https://cdn.lil.org/mons/emojipack/swagpack/64";
-const materialImagePromises: Map<
-  MaterialName,
-  Promise<string | null>
-> = new Map();
 const stickerImagePromises: Map<number, Promise<string | null>> = new Map();
 
 const fetchImageUrl = (url: string): Promise<string | null> =>
@@ -260,12 +245,6 @@ const getCachedImageUrl = <T extends string | number>(
   return cache.get(key)!;
 };
 
-const getMaterialImageUrl = (name: MaterialName) =>
-  getCachedImageUrl(
-    materialImagePromises,
-    name,
-    `${MATERIAL_IMAGE_BASE_URL}/${name}.webp`,
-  );
 const getStickerImageUrl = (id: number) =>
   getCachedImageUrl(
     stickerImagePromises,
@@ -925,20 +904,12 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     name: MaterialName | null;
     count: number;
   }>({ name: null, count: 0 });
-  const [materialUrls, setMaterialUrls] = useState<
-    Record<MaterialName, string | null>
-  >(() => {
-    const initial: Partial<Record<MaterialName, string | null>> = {};
-    MATERIALS.forEach((n) => (initial[n] = null));
-    return initial as Record<MaterialName, string | null>;
-  });
-  const [materialAmounts, setMaterialAmounts] = useState<
-    Record<MaterialName, number>
-  >(() => {
-    const initial: Partial<Record<MaterialName, number>> = {};
-    MATERIALS.forEach((n) => (initial[n] = 0));
-    return initial as Record<MaterialName, number>;
-  });
+  const materialUrls = useMaterialImages();
+  const {
+    availableMaterials: materialAmounts,
+    frozenMaterialsStatus,
+    hasConfirmedSnapshot: hasFrozenSnapshot,
+  } = useAvailableMaterials();
   const eventCloudSubscriptionEventIdRef = useRef<string | null>(null);
   const eventGameButtonStickyTimeoutRef = useRef<number | null>(null);
   const navigationSelectionEpochRef = useRef(0);
@@ -949,17 +920,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     {},
   );
   const [wagerState, setWagerState] = useState<MatchWagerState | null>(null);
-  const frozenMaterialsRef =
-    useRef<Record<MaterialName, number>>(getFrozenMaterials());
-  const [frozenMaterialsStatus, setFrozenMaterialsStatus] = useState(
-    getFrozenMaterialsStatus,
-  );
-  const [hasFrozenSnapshot, setHasFrozenSnapshot] = useState(
-    hasConfirmedFrozenMaterials,
-  );
-  const latestServiceMaterialsRef = useRef<Record<MaterialName, number>>(
-    createEmptyMaterials(),
-  );
 
   const pickerRef = useRef<HTMLDivElement>(null);
   const bottomControlsRef = useRef<HTMLDivElement>(null);
@@ -1491,35 +1451,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = rocksMiningService.subscribe((snapshot) => {
-      const next = { ...snapshot.materials };
-      latestServiceMaterialsRef.current = next;
-      const available = computeAvailableMaterials(
-        next,
-        frozenMaterialsRef.current,
-      );
-      setMaterialAmounts(available);
-    });
-    return unsubscribe;
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = subscribeToFrozenMaterials(
-      (materials, status, confirmed) => {
-        setFrozenMaterialsStatus(status);
-        setHasFrozenSnapshot(confirmed);
-        frozenMaterialsRef.current = materials;
-        const available = computeAvailableMaterials(
-          latestServiceMaterialsRef.current,
-          materials,
-        );
-        setMaterialAmounts(available);
-      },
-    );
-    return unsubscribe;
-  }, []);
-
-  useEffect(() => {
     if (!isReactionPickerVisible || !visibleStickerIds.length) return;
     let mounted = true;
     visibleStickerIds.forEach((id) => {
@@ -1535,19 +1466,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
       mounted = false;
     };
   }, [isReactionPickerVisible, visibleStickerIds]);
-
-  useEffect(() => {
-    let mounted = true;
-    MATERIALS.forEach((name) => {
-      getMaterialImageUrl(name).then((url) => {
-        if (!mounted) return;
-        setMaterialUrls((prev) => ({ ...prev, [name]: url }));
-      });
-    });
-    return () => {
-      mounted = false;
-    };
-  }, []);
 
   useEffect(() => {
     return subscribeToEventModalState((state) => {

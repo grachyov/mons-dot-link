@@ -5,7 +5,6 @@ import React, {
   useLayoutEffect,
   useCallback,
 } from "react";
-import { flushSync } from "react-dom";
 import styled from "styled-components";
 import { storage } from "../../utils/storage";
 import { connection } from "../../connection/connection";
@@ -19,10 +18,6 @@ import {
 import { setAuthStatusGlobally } from "../../connection/authentication";
 import type { AuthState } from "../../connection/authModels";
 import { handleLoginSuccess } from "../../connection/loginSuccess";
-import {
-  preloadAppleSignInLibrary,
-  signInWithApplePopup,
-} from "../../connection/appleConnection";
 import {
   clearConsumedXRedirectResult,
   isXRedirectStartedError,
@@ -60,14 +55,11 @@ import {
 import { useEthereumWalletPicker } from "../EthereumWalletPicker";
 import { primeInjectedEthereumProviderDiscovery } from "../../connection/injectedEthereumProviders";
 import {
-  type AppleButtonUiState,
-  type AuthIntentResponse,
   type XButtonUiState,
-  APPLE_INTENT_REFRESH_BUFFER_MS,
   getAppleButtonLabel,
   getXButtonLabel,
-  isAppleIntentUsable,
 } from "./authFlowState";
+import { useAppleAuthFlow } from "./useAppleAuthFlow";
 import {
   type ProfileSignInApi,
   type ProfileSignInPopupMode,
@@ -249,8 +241,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
   const [solanaText, setSolanaText] = useState("Solana");
   const [ethereumText, setEthereumText] = useState("Ethereum");
   const [inlineAuthError, setInlineAuthError] = useState("");
-  const [appleButtonState, setAppleButtonState] =
-    useState<AppleButtonUiState>("idle");
   const [xButtonState, setXButtonState] = useState<XButtonUiState>("idle");
   const [isPendingXSignInRedirect, setIsPendingXSignInRedirect] =
     useState<boolean>(() => {
@@ -283,11 +273,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
   >(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const notificationTimeoutRef = useRef<number | null>(null);
-  const appleIntentRef = useRef<AuthIntentResponse | null>(null);
-  const appleIntentPromiseRef = useRef<Promise<AuthIntentResponse> | null>(
-    null,
-  );
-  const appleConfirmExpiryTimeoutRef = useRef<number | null>(null);
   const pendingXSignInStaleTimeoutRef = useRef<number | null>(null);
   const xRedirectNavigationFallbackTimeoutRef = useRef<number | null>(null);
   const xRedirectVisibilityRecoveryHandlerRef = useRef<(() => void) | null>(
@@ -296,9 +281,7 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
   const logoutReturnFocusIdRef = useRef<string | null>(null);
   const settingsReturnFocusIdRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
-  const isOpenRef = useRef(isOpen);
   const authStatusRef = useRef(authStatus);
-  const latestAppleActionRef = useRef(0);
   const nextSettingsInlineMessageIdRef = useRef(0);
   const shouldReopenSettingsAfterXRedirectRef = useRef(
     peekXRedirectResult()?.consentSource === "settings",
@@ -321,12 +304,34 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     [],
   );
 
+  const {
+    state: appleButtonState,
+    start: handleAppleClick,
+    resetUi: resetAppleUi,
+  } = useAppleAuthFlow({
+    consentSource: "signin",
+    shouldPreload: isOpen && authStatus !== "authenticated",
+    canStart: () => true,
+    canConfirm: () => isOpen && authStatus !== "authenticated",
+    onStart: () => setInlineAuthError(""),
+    onVerified: (result, mounted) => {
+      if (result.ok === true && handleLoginSuccess(result)) {
+        setAuthStatusGlobally("authenticated");
+        if (mounted) {
+          setInlineAuthError("");
+          setIsOpen(false);
+          hideShinyCard();
+        }
+      }
+    },
+    onError: (error) => {
+      console.error("Apple sign in error:", error);
+      const cooldownMessage = formatAuthCooldownErrorMessage(error);
+      if (cooldownMessage) setInlineAuthError(cooldownMessage);
+    },
+  });
   const appleText = getAppleButtonLabel(appleButtonState);
   const xText = getXButtonLabel(xButtonState);
-  const isAppleBusy =
-    appleButtonState === "preparing" ||
-    appleButtonState === "connecting" ||
-    appleButtonState === "verifying";
   const isXBusy = xButtonState === "connecting";
   const isPendingXSignInRedirectBlockingUi =
     isPendingXSignInRedirect && !isPendingXSignInRedirectStale;
@@ -363,13 +368,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     setPopupMode("inline");
   }, [authStatus, isOpen, popupMode]);
 
-  const clearAppleConfirmExpiryTimeout = useCallback(() => {
-    if (appleConfirmExpiryTimeoutRef.current) {
-      window.clearTimeout(appleConfirmExpiryTimeoutRef.current);
-      appleConfirmExpiryTimeoutRef.current = null;
-    }
-  }, []);
-
   const clearPendingXSignInStaleTimeout = useCallback(() => {
     if (pendingXSignInStaleTimeoutRef.current !== null) {
       window.clearTimeout(pendingXSignInStaleTimeoutRef.current);
@@ -403,35 +401,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     setIsEditingName(false);
     hideShinyCard();
   }, []);
-
-  const scheduleAppleConfirmExpiryTimeout = useCallback(() => {
-    clearAppleConfirmExpiryTimeout();
-    const intent = appleIntentRef.current;
-    if (!intent) {
-      return;
-    }
-    const msUntilIntentIsStale =
-      intent.expiresAtMs - Date.now() - APPLE_INTENT_REFRESH_BUFFER_MS;
-    if (msUntilIntentIsStale <= 0) {
-      if (isMountedRef.current) {
-        setAppleButtonState((current) =>
-          current === "confirm" ? "idle" : current,
-        );
-      }
-      return;
-    }
-    appleConfirmExpiryTimeoutRef.current = window.setTimeout(() => {
-      appleConfirmExpiryTimeoutRef.current = null;
-      if (!isMountedRef.current) {
-        return;
-      }
-      if (!isAppleIntentUsable(appleIntentRef.current)) {
-        setAppleButtonState((current) =>
-          current === "confirm" ? "idle" : current,
-        );
-      }
-    }, msUntilIntentIsStale + 50);
-  }, [clearAppleConfirmExpiryTimeout]);
 
   const armPendingXSignInStaleTimeout = useCallback(() => {
     clearPendingXSignInStaleTimeout();
@@ -542,7 +511,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      clearAppleConfirmExpiryTimeout();
       clearPendingXSignInStaleTimeout();
       clearXRedirectNavigationFallbackTimeout();
       clearXRedirectVisibilityRecovery();
@@ -551,15 +519,10 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
       }
     };
   }, [
-    clearAppleConfirmExpiryTimeout,
     clearPendingXSignInStaleTimeout,
     clearXRedirectNavigationFallbackTimeout,
     clearXRedirectVisibilityRecovery,
   ]);
-
-  useEffect(() => {
-    isOpenRef.current = isOpen;
-  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen || authStatus === "authenticated") {
@@ -605,21 +568,8 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
   ]);
 
   useEffect(() => {
-    if (authStatus === "authenticated" && appleButtonState !== "idle") {
-      setAppleButtonState("idle");
-      return;
-    }
-    if (
-      authStatus === "authenticated" ||
-      !isOpen ||
-      appleButtonState !== "confirm"
-    ) {
-      return;
-    }
-    if (!isAppleIntentUsable(appleIntentRef.current)) {
-      setAppleButtonState("idle");
-    }
-  }, [authStatus, isOpen, appleButtonState]);
+    if (authStatus === "authenticated") resetAppleUi();
+  }, [authStatus, resetAppleUi]);
 
   useEffect(() => {
     if (authStatus === "authenticated" && xButtonState !== "idle") {
@@ -632,19 +582,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     clearXRedirectNavigationFallbackTimeout,
     clearXRedirectVisibilityRecovery,
     xButtonState,
-  ]);
-
-  useEffect(() => {
-    if (appleButtonState !== "confirm") {
-      clearAppleConfirmExpiryTimeout();
-      return;
-    }
-    scheduleAppleConfirmExpiryTimeout();
-    return clearAppleConfirmExpiryTimeout;
-  }, [
-    appleButtonState,
-    clearAppleConfirmExpiryTimeout,
-    scheduleAppleConfirmExpiryTimeout,
   ]);
 
   useEffect(() => {
@@ -969,39 +906,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     restoreFocusById(settingsReturnFocusIdRef);
   };
 
-  const ensurePreparedAppleIntent =
-    useCallback(async (): Promise<AuthIntentResponse> => {
-      if (isAppleIntentUsable(appleIntentRef.current)) {
-        return appleIntentRef.current;
-      }
-      if (!appleIntentPromiseRef.current) {
-        const pendingIntentPromise = connection
-          .beginAuthIntent("apple")
-          .then((intent) => {
-            if (appleIntentPromiseRef.current === pendingIntentPromise) {
-              appleIntentRef.current = intent;
-            }
-            return intent;
-          })
-          .finally(() => {
-            if (appleIntentPromiseRef.current === pendingIntentPromise) {
-              appleIntentPromiseRef.current = null;
-            }
-          });
-        appleIntentPromiseRef.current = pendingIntentPromise;
-      }
-      return appleIntentPromiseRef.current;
-    }, []);
-
-  const takePreparedAppleIntent = useCallback((): AuthIntentResponse | null => {
-    if (!isAppleIntentUsable(appleIntentRef.current)) {
-      return null;
-    }
-    const intent = appleIntentRef.current;
-    appleIntentRef.current = null;
-    return intent;
-  }, []);
-
   useEffect(() => {
     if (!isOpen || authStatus === "authenticated") {
       return;
@@ -1009,9 +913,7 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
     void import("../../connection/solanaConnection").catch(() => {});
     void import("../../connection/ethereumConnection").catch(() => {});
     primeInjectedEthereumProviderDiscovery();
-    void preloadAppleSignInLibrary().catch(() => {});
-    void ensurePreparedAppleIntent().catch(() => {});
-  }, [isOpen, authStatus, ensurePreparedAppleIntent]);
+  }, [isOpen, authStatus]);
 
   const handleXClick = async () => {
     if (isXBusy) {
@@ -1093,92 +995,6 @@ const ProfileSignIn: React.FC<ProfileSignInProps> = ({ authState }) => {
       }
     } finally {
       setIsSolanaConnecting(false);
-    }
-  };
-
-  const handleAppleClick = async () => {
-    if (isAppleBusy) {
-      return;
-    }
-
-    setInlineAuthError("");
-    const actionId = latestAppleActionRef.current + 1;
-    latestAppleActionRef.current = actionId;
-    const isActionCurrent = () => latestAppleActionRef.current === actionId;
-    const setAppleStateIfMounted = (nextState: AppleButtonUiState) => {
-      if (isMountedRef.current && isActionCurrent()) {
-        setAppleButtonState(nextState);
-      }
-    };
-    try {
-      const intent = takePreparedAppleIntent();
-      if (!intent) {
-        setAppleStateIfMounted("preparing");
-        await Promise.all([
-          preloadAppleSignInLibrary(),
-          ensurePreparedAppleIntent(),
-        ]);
-        if (!isActionCurrent()) {
-          return;
-        }
-        if (!isAppleIntentUsable(appleIntentRef.current)) {
-          setAppleStateIfMounted("idle");
-          return;
-        }
-        if (isMountedRef.current) {
-          if (isOpenRef.current && authStatusRef.current !== "authenticated") {
-            setAppleButtonState("confirm");
-          } else {
-            setAppleButtonState("idle");
-          }
-        }
-        return;
-      }
-      if (isMountedRef.current && isActionCurrent()) {
-        flushSync(() => {
-          setAppleButtonState("connecting");
-        });
-      }
-      const signInResult = await signInWithApplePopup({
-        nonce: intent.nonce,
-        state: intent.state,
-        intentId: intent.intentId,
-        expiresAtMs: intent.expiresAtMs,
-        consentSource: "signin",
-      });
-      if (!signInResult) {
-        setAppleStateIfMounted("idle");
-        return;
-      }
-      if (!isActionCurrent()) {
-        return;
-      }
-      const { idToken } = signInResult;
-      setAppleStateIfMounted("verifying");
-      const res = await connection.verifyAppleToken(
-        intent.intentId,
-        idToken,
-        "signin",
-      );
-      if (!isActionCurrent()) {
-        return;
-      }
-      if (res && res.ok === true && handleLoginSuccess(res)) {
-        setInlineAuthError("");
-        setAppleStateIfMounted("idle");
-        setAuthStatusGlobally("authenticated");
-        setIsOpen(false);
-        hideShinyCard();
-        return;
-      }
-      setAppleStateIfMounted("idle");
-    } catch (error) {
-      console.error("Apple sign in error:", error);
-      const cooldownMessage = formatAuthCooldownErrorMessage(error);
-      if (cooldownMessage) {
-        setInlineAuthError(cooldownMessage);
-      }
-      setAppleStateIfMounted("idle");
     }
   };
 

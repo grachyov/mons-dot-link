@@ -58,13 +58,7 @@ import {
 import { connection } from "../connection/connection";
 import { MatchWagerState } from "../connection/connectionModels";
 import { subscribeToWagerState } from "../game/wagerState";
-import { rocksMiningService } from "../services/rocksMiningService";
-import {
-  computeAvailableMaterials,
-  getFrozenMaterials,
-  getFrozenMaterialsStatus,
-  subscribeToFrozenMaterials,
-} from "../services/wagerMaterialsService";
+import { useAvailableMaterials } from "../hooks/useAvailableMaterials";
 import { registerBoardTransientUiHandler } from "./uiSession";
 import {
   bindBoardUiHandlers,
@@ -1480,14 +1474,7 @@ const BoardComponent: React.FC = () => {
     cancel?: () => void;
   }>({ blurry: true, svgElement: null, withConfirmAndCancelButtons: false });
   const [wagerState, setWagerState] = useState<MatchWagerState | null>(null);
-  const [miningMaterials, setMiningMaterials] = useState(
-    rocksMiningService.getSnapshot().materials,
-  );
-  const [frozenMaterials, setFrozenMaterialsState] =
-    useState(getFrozenMaterials());
-  const [frozenMaterialsStatus, setFrozenMaterialsStatus] = useState(
-    getFrozenMaterialsStatus,
-  );
+  const { availableMaterials, frozenMaterialsStatus } = useAvailableMaterials();
   const [watchOnlySnapshot, setWatchOnlySnapshot] = useState(isWatchOnly);
   const [playerUidSnapshot, setPlayerUidSnapshot] = useState(
     playerSideMetadata.uid,
@@ -1810,10 +1797,6 @@ const BoardComponent: React.FC = () => {
   const wagerResolved = wagerState?.resolved ?? null;
   const wagerActionsLocked =
     watchOnlySnapshot || !!wagerAgreement || !!wagerResolved;
-  const availableMaterials = computeAvailableMaterials(
-    miningMaterials,
-    frozenMaterials,
-  );
   const opponentMaterial = opponentProposal?.material ?? null;
   const opponentCount = opponentProposal?.count ?? 0;
   const extraAvailable =
@@ -1870,25 +1853,6 @@ const BoardComponent: React.FC = () => {
     const unsubscribe = subscribeToDisplayedBoardSquareTypes(
       setDisplayedBoardSquareTypes,
     );
-    return () => {
-      unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = rocksMiningService.subscribe((snapshot) => {
-      setMiningMaterials(snapshot.materials);
-    });
-    return () => {
-      unsubscribe();
-    };
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = subscribeToFrozenMaterials((materials, status) => {
-      setFrozenMaterialsState(materials);
-      setFrozenMaterialsStatus(status);
-    });
     return () => {
       unsubscribe();
     };

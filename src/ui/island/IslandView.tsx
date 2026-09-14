@@ -39,10 +39,14 @@ import {
   rocksMiningService,
 } from "../../services/rocksMiningService";
 import {
-  computeAvailableMaterials,
-  getFrozenMaterials,
-  subscribeToFrozenMaterials,
-} from "../../services/wagerMaterialsService";
+  readAvailableMaterials,
+  subscribeAvailableMaterials,
+} from "../../services/availableMaterials";
+import {
+  getCachedMaterialImageUrl,
+  getMaterialImageUrl,
+} from "../../resources/materialImageResources";
+import { useMaterialImages } from "../../hooks/useMaterialImages";
 import { openProfileSignInPopup } from "../identity/profileUiPort";
 import { signInButtonVisualStyles } from "../identity/signInButtonStyles";
 import {
@@ -880,13 +884,7 @@ type MaterialPullRect = {
   width: number;
   height: number;
 };
-const MATERIAL_BASE_URL = "https://cdn.lil.org/mons/rocks/materials";
 let persistentMonPosRef: { x: number; y: number } | null = null;
-
-const materialImagePromises: Map<
-  MaterialName,
-  Promise<string | null>
-> = new Map();
 
 let monSpritesModulePromise: Promise<{
   getSpriteByKey: (key: string) => string;
@@ -896,21 +894,6 @@ const getMonSpritesModule = () => {
     monSpritesModulePromise = import("../../assets/monsSprites");
   }
   return monSpritesModulePromise;
-};
-
-const getMaterialImageUrl = (name: MaterialName) => {
-  if (!materialImagePromises.has(name)) {
-    const url = `${MATERIAL_BASE_URL}/${name}.webp`;
-    const p = fetch(url)
-      .then((res) => {
-        if (!res.ok) throw new Error("Failed to fetch image");
-        return res.blob();
-      })
-      .then((blob) => URL.createObjectURL(blob))
-      .catch(() => null);
-    materialImagePromises.set(name, p);
-  }
-  return materialImagePromises.get(name)!;
 };
 
 function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
@@ -1021,23 +1004,9 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
   const heroWrapRef = useRef<HTMLDivElement | null>(null);
   const [materialAmounts, setMaterialAmounts] = useState<
     Record<MaterialName, number>
-  >(() => {
-    const snapshot = rocksMiningService.getSnapshot();
-    return computeAvailableMaterials(snapshot.materials, getFrozenMaterials());
-  });
-  const latestServiceMaterialsRef = useRef<Record<MaterialName, number>>({
-    ...rocksMiningService.getSnapshot().materials,
-  });
-  const frozenMaterialsRef =
-    useRef<Record<MaterialName, number>>(getFrozenMaterials());
+  >(() => readAvailableMaterials().availableMaterials);
   const amountsDecoupledRef = useRef(false);
-  const [materialUrls, setMaterialUrls] = useState<
-    Record<MaterialName, string | null>
-  >(() => {
-    const initial: Partial<Record<MaterialName, string | null>> = {};
-    MATERIALS.forEach((n) => (initial[n] = null));
-    return initial as Record<MaterialName, string | null>;
-  });
+  const materialUrls = useMaterialImages();
   const [dudeVisible, setDudeVisible] = useState(false);
   const [monVisible, setMonVisible] = useState(false);
   const [monTeleporting, setMonTeleporting] = useState(false);
@@ -1050,32 +1019,16 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
   });
   const decodedMaterialsRef = useRef<Set<MaterialName>>(new Set());
   useEffect(() => {
-    const unsubscribe = rocksMiningService.subscribe((snapshot) => {
-      const next = { ...snapshot.materials };
-      latestServiceMaterialsRef.current = next;
+    return subscribeAvailableMaterials(({ availableMaterials }) => {
       if (!amountsDecoupledRef.current) {
-        const available = computeAvailableMaterials(
-          next,
-          frozenMaterialsRef.current,
-        );
-        setMaterialAmounts(available);
+        setMaterialAmounts(availableMaterials);
       }
-      setRockAvailable(rocksMiningService.shouldShowRock());
     });
-    return unsubscribe;
   }, []);
   useEffect(() => {
-    const unsubscribe = subscribeToFrozenMaterials((materials) => {
-      frozenMaterialsRef.current = materials;
-      if (!amountsDecoupledRef.current) {
-        const available = computeAvailableMaterials(
-          latestServiceMaterialsRef.current,
-          materials,
-        );
-        setMaterialAmounts(available);
-      }
+    return rocksMiningService.subscribe(() => {
+      setRockAvailable(rocksMiningService.shouldShowRock());
     });
-    return unsubscribe;
   }, []);
   const isMaterialTarget = useCallback(
     (node: Node | null) => {
@@ -2059,19 +2012,6 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
   }, [islandImgLoaded]);
 
   useEffect(() => {
-    let mounted = true;
-    MATERIALS.forEach((name) => {
-      getMaterialImageUrl(name).then((url) => {
-        if (!mounted) return;
-        setMaterialUrls((prev) => ({ ...prev, [name]: url }));
-      });
-    });
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
     const win: any = typeof window !== "undefined" ? (window as any) : null;
     const schedule = (fn: () => void) => {
@@ -2625,11 +2565,7 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
     overlayJustOpenedAtRef.current = 0;
     clearAnonSignInDrop();
     amountsDecoupledRef.current = false;
-    const resetMaterials = computeAvailableMaterials(
-      latestServiceMaterialsRef.current,
-      frozenMaterialsRef.current,
-    );
-    setMaterialAmounts(resetMaterials);
+    setMaterialAmounts(readAvailableMaterials().availableMaterials);
     const container = fxContainerRef.current;
     if (container && container.parentNode) {
       try {
@@ -2752,15 +2688,8 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
       const imgEl = islandButtonImgRef.current;
       if (!imgEl) return;
       overlayPhaseRef.current = "opening";
-      const snapshot = rocksMiningService.getSnapshot();
-      const nextMaterials = { ...snapshot.materials };
-      latestServiceMaterialsRef.current = nextMaterials;
       amountsDecoupledRef.current = false;
-      const available = computeAvailableMaterials(
-        nextMaterials,
-        frozenMaterialsRef.current,
-      );
-      setMaterialAmounts(available);
+      setMaterialAmounts(readAvailableMaterials().availableMaterials);
       const rect = imgEl.getBoundingClientRect();
       const vh = window.innerHeight;
       const vw = window.innerWidth;
@@ -2901,7 +2830,7 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
 
   const pullMaterialToBar = useCallback(
     (name: MaterialName, fromRect: MaterialPullRect) => {
-      const url = materialUrls[name];
+      const url = getCachedMaterialImageUrl(name);
       if (!url) return;
       const host = materialItemRefs.current[name];
       if (!host) return;
@@ -2979,7 +2908,7 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
         }));
       }
     },
-    [materialItemRefs, materialUrls, setMaterialAmounts],
+    [materialItemRefs, setMaterialAmounts],
   );
 
   const flushMaterialPullQueue = useCallback(() => {

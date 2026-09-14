@@ -3,7 +3,7 @@ import {
   createDropsForMiningEvent,
   formatMiningDateLocal,
 } from "@mons/shared/mining";
-import {
+import type {
   MiningMaterialName,
   PlayerMiningData,
   PlayerMiningMaterials,

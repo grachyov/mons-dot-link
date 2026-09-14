@@ -6,7 +6,6 @@ import React, {
   useState,
 } from "react";
 import type { AuthVerificationResponse } from "@mons/shared/auth";
-import { flushSync } from "react-dom";
 import styled from "styled-components";
 import {
   ModalOverlay,
@@ -24,11 +23,7 @@ import { handleLoginSuccess } from "../../connection/loginSuccess";
 import { setAuthStatusGlobally } from "../../connection/authentication";
 import { useEthereumWalletPicker } from "../EthereumWalletPicker";
 import { primeInjectedEthereumProviderDiscovery } from "../../connection/injectedEthereumProviders";
-import {
-  clearAppleSignInTransientState,
-  preloadAppleSignInLibrary,
-  signInWithApplePopup,
-} from "../../connection/appleConnection";
+import { clearAppleSignInTransientState } from "../../connection/appleConnection";
 import {
   isXRedirectStartedError,
   startXRedirectAuth,
@@ -38,14 +33,11 @@ import { isMobile } from "../../utils/misc";
 import { notifyOtherTabsAboutSignIn } from "../../session/logoutOrchestrator";
 import { resetNftCache } from "../../services/nftCache";
 import {
-  type AppleButtonUiState,
-  type AuthIntentResponse,
-  APPLE_INTENT_REFRESH_BUFFER_MS,
   getSettingsAppleFlowInProgress,
-  isAppleIntentUsable,
   setSettingsAppleFlowInProgress,
   subscribeSettingsAppleFlowProgress,
 } from "./authFlowState";
+import { useAppleAuthFlow } from "./useAppleAuthFlow";
 
 const SettingsPopup = styled(ModalPopup)`
   padding: 20px;
@@ -319,8 +311,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     useState<LinkedMethods>(EMPTY_LINKED_METHODS);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [busyMethod, setBusyMethod] = useState<MethodKey | null>(null);
-  const [appleButtonState, setAppleButtonState] =
-    useState<AppleButtonUiState>("idle");
   const [pendingDisconnectState, setPendingDisconnectState] =
     useState<PendingDisconnectState | null>(null);
   const [solanaConnectText, setSolanaConnectText] = useState<string>("Connect");
@@ -331,14 +321,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [authMessage, setAuthMessage] = useState<string>(
     () => xInlineMessage?.message ?? "",
   );
-  const appleIntentRef = useRef<AuthIntentResponse | null>(null);
-  const appleIntentPromiseRef = useRef<Promise<AuthIntentResponse> | null>(
-    null,
-  );
   const isMountedRef = useRef(true);
-  const latestAppleActionRef = useRef(0);
   const previousGlobalAppleFlowRef = useRef(getSettingsAppleFlowInProgress());
-  const appleConfirmExpiryTimeoutRef = useRef<number | null>(null);
   const pendingDisconnectTimeoutRef = useRef<number | null>(null);
   const solanaNotFoundTimeoutRef = useRef<number | null>(null);
   const ethNotFoundTimeoutRef = useRef<number | null>(null);
@@ -377,45 +361,45 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   }, []);
 
-  const ensurePreparedAppleIntent =
-    useCallback(async (): Promise<AuthIntentResponse> => {
-      if (isAppleIntentUsable(appleIntentRef.current)) {
-        return appleIntentRef.current;
+  const {
+    state: appleButtonState,
+    start: runAppleConnectFlow,
+    invalidateAction: invalidateAppleAction,
+    clearIntent: clearAppleIntent,
+  } = useAppleAuthFlow({
+    consentSource: "settings",
+    shouldPreload: !isLoading && !linkedMethods.apple,
+    canStart: () =>
+      !isLoading && busyMethod === null && !getSettingsAppleFlowInProgress(),
+    canConfirm: () => !linkedMethods.apple,
+    onStart: () => setAuthMessage(""),
+    onPopupStart: () => {
+      setSettingsAppleFlowInProgress(true);
+      setBusyMethod("apple");
+    },
+    onPopupSettled: (current, mounted) => {
+      setSettingsAppleFlowInProgress(false);
+      if (current && mounted) {
+        setBusyMethod((method) => (method === "apple" ? null : method));
+        void refreshLinkedMethods();
       }
-      if (!appleIntentPromiseRef.current) {
-        const pendingIntentPromise = connection
-          .beginAuthIntent("apple")
-          .then((intent) => {
-            if (appleIntentPromiseRef.current === pendingIntentPromise) {
-              appleIntentRef.current = intent;
-            }
-            return intent;
-          })
-          .finally(() => {
-            if (appleIntentPromiseRef.current === pendingIntentPromise) {
-              appleIntentPromiseRef.current = null;
-            }
-          });
-        appleIntentPromiseRef.current = pendingIntentPromise;
+    },
+    onVerified: (result, mounted) => {
+      if (result.ok === true && handleLoginSuccess(result)) {
+        setAuthStatusGlobally("authenticated");
+        if (mounted) setAuthMessage("");
       }
-      return appleIntentPromiseRef.current;
-    }, []);
-
-  const takePreparedAppleIntent = useCallback((): AuthIntentResponse | null => {
-    if (!isAppleIntentUsable(appleIntentRef.current)) {
-      return null;
-    }
-    const intent = appleIntentRef.current;
-    appleIntentRef.current = null;
-    return intent;
-  }, []);
-
-  const clearAppleConfirmExpiryTimeout = useCallback(() => {
-    if (appleConfirmExpiryTimeoutRef.current) {
-      window.clearTimeout(appleConfirmExpiryTimeoutRef.current);
-      appleConfirmExpiryTimeoutRef.current = null;
-    }
-  }, []);
+    },
+    onError: (error, phase) => {
+      if (phase === "prepare") {
+        console.error("Failed to prepare apple sign in:", error);
+        return;
+      }
+      console.error("Failed to connect apple:", error);
+      const cooldownMessage = formatAuthCooldownErrorMessage(error);
+      if (cooldownMessage) setAuthMessage(cooldownMessage);
+    },
+  });
 
   const clearSolanaNotFoundTimeout = useCallback(() => {
     if (solanaNotFoundTimeoutRef.current !== null) {
@@ -438,46 +422,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   }, []);
 
-  const scheduleAppleConfirmExpiryTimeout = useCallback(() => {
-    clearAppleConfirmExpiryTimeout();
-    const intent = appleIntentRef.current;
-    if (!intent) {
-      return;
-    }
-    const msUntilIntentIsStale =
-      intent.expiresAtMs - Date.now() - APPLE_INTENT_REFRESH_BUFFER_MS;
-    if (msUntilIntentIsStale <= 0) {
-      if (isMountedRef.current) {
-        setAppleButtonState((current) =>
-          current === "confirm" ? "idle" : current,
-        );
-      }
-      return;
-    }
-    appleConfirmExpiryTimeoutRef.current = window.setTimeout(() => {
-      appleConfirmExpiryTimeoutRef.current = null;
-      if (!isMountedRef.current) {
-        return;
-      }
-      if (!isAppleIntentUsable(appleIntentRef.current)) {
-        setAppleButtonState((current) =>
-          current === "confirm" ? "idle" : current,
-        );
-      }
-    }, msUntilIntentIsStale + 50);
-  }, [clearAppleConfirmExpiryTimeout]);
-
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      clearAppleConfirmExpiryTimeout();
       clearPendingDisconnectTimeout();
       clearSolanaNotFoundTimeout();
       clearEthNotFoundTimeout();
     };
   }, [
-    clearAppleConfirmExpiryTimeout,
     clearPendingDisconnectTimeout,
     clearSolanaNotFoundTimeout,
     clearEthNotFoundTimeout,
@@ -569,14 +522,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [xInlineMessage]);
 
   useEffect(() => {
-    if (isLoading || linkedMethods.apple) {
-      return;
-    }
-    void preloadAppleSignInLibrary().catch(() => {});
-    void ensurePreparedAppleIntent().catch(() => {});
-  }, [isLoading, linkedMethods.apple, ensurePreparedAppleIntent]);
-
-  useEffect(() => {
     if (isLoading) {
       return;
     }
@@ -590,26 +535,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [isLoading, linkedMethods.eth, linkedMethods.sol]);
 
   useEffect(() => {
-    if (!linkedMethods.apple) {
-      return;
-    }
-    latestAppleActionRef.current += 1;
-    clearAppleConfirmExpiryTimeout();
-    setAppleButtonState("idle");
-  }, [clearAppleConfirmExpiryTimeout, linkedMethods.apple]);
-
-  useEffect(() => {
-    if (appleButtonState !== "confirm") {
-      clearAppleConfirmExpiryTimeout();
-      return;
-    }
-    scheduleAppleConfirmExpiryTimeout();
-    return clearAppleConfirmExpiryTimeout;
-  }, [
-    appleButtonState,
-    clearAppleConfirmExpiryTimeout,
-    scheduleAppleConfirmExpiryTimeout,
-  ]);
+    if (linkedMethods.apple) invalidateAppleAction();
+  }, [invalidateAppleAction, linkedMethods.apple]);
 
   useEffect(() => {
     const wasInProgress = previousGlobalAppleFlowRef.current;
@@ -758,108 +685,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     ],
   );
 
-  const runAppleConnectFlow = useCallback(async () => {
-    if (isLoading || busyMethod !== null) {
-      return;
-    }
-    if (getSettingsAppleFlowInProgress()) {
-      return;
-    }
-
-    setAuthMessage("");
-    const actionId = latestAppleActionRef.current + 1;
-    latestAppleActionRef.current = actionId;
-    const isActionCurrent = () => latestAppleActionRef.current === actionId;
-    const setAppleUiIfMounted = (nextState: AppleButtonUiState) => {
-      if (!isMountedRef.current || !isActionCurrent()) {
-        return;
-      }
-      setAppleButtonState(nextState);
-    };
-
-    const intent = takePreparedAppleIntent();
-    if (!intent) {
-      setAppleUiIfMounted("preparing");
-      try {
-        await Promise.all([
-          preloadAppleSignInLibrary(),
-          ensurePreparedAppleIntent(),
-        ]);
-        if (!isActionCurrent()) {
-          return;
-        }
-        if (!isAppleIntentUsable(appleIntentRef.current)) {
-          setAppleUiIfMounted("idle");
-          return;
-        }
-        if (isMountedRef.current && isActionCurrent()) {
-          setAppleButtonState("confirm");
-        }
-      } catch (error) {
-        console.error("Failed to prepare apple sign in:", error);
-        setAppleUiIfMounted("idle");
-      }
-      return;
-    }
-
-    setSettingsAppleFlowInProgress(true);
-    if (isMountedRef.current && isActionCurrent()) {
-      flushSync(() => {
-        setBusyMethod("apple");
-        setAppleButtonState("connecting");
-      });
-    }
-    try {
-      const signInResult = await signInWithApplePopup({
-        nonce: intent.nonce,
-        state: intent.state,
-        intentId: intent.intentId,
-        expiresAtMs: intent.expiresAtMs,
-        consentSource: "settings",
-      });
-      if (!isActionCurrent()) {
-        return;
-      }
-      if (!signInResult) {
-        setAppleUiIfMounted("idle");
-        return;
-      }
-      const { idToken } = signInResult;
-      setAppleUiIfMounted("verifying");
-      const result = await connection.verifyAppleToken(
-        intent.intentId,
-        idToken,
-        "settings",
-      );
-      if (!isActionCurrent()) {
-        return;
-      }
-      if (result && result.ok === true && handleLoginSuccess(result)) {
-        setAuthMessage("");
-        setAuthStatusGlobally("authenticated");
-      }
-    } catch (error) {
-      console.error("Failed to connect apple:", error);
-      const cooldownMessage = formatAuthCooldownErrorMessage(error);
-      if (cooldownMessage) {
-        setAuthMessage(cooldownMessage);
-      }
-    } finally {
-      setSettingsAppleFlowInProgress(false);
-      if (isActionCurrent() && isMountedRef.current) {
-        setBusyMethod((current) => (current === "apple" ? null : current));
-        setAppleButtonState("idle");
-        await refreshLinkedMethods();
-      }
-    }
-  }, [
-    busyMethod,
-    ensurePreparedAppleIntent,
-    isLoading,
-    refreshLinkedMethods,
-    takePreparedAppleIntent,
-  ]);
-
   const handleConnectClick = useCallback(
     (method: MethodKey) => {
       setPendingDisconnectState(null);
@@ -888,8 +713,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           }
           if (method === "apple") {
             clearAppleSignInTransientState();
-            appleIntentRef.current = null;
-            appleIntentPromiseRef.current = null;
+            clearAppleIntent();
           }
           updateProfileDisplayName(
             storage.getUsername(""),
@@ -914,7 +738,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setBusyMethod((current) => (current === method ? null : current));
       }
     },
-    [refreshLinkedMethods],
+    [clearAppleIntent, refreshLinkedMethods],
   );
 
   const renderMethodRow = (method: MethodKey, label: string) => {

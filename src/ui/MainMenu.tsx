@@ -90,6 +90,7 @@ import {
   createCachedResource,
   type CachedResource,
 } from "../resources/cachedResource";
+import { useMaterialImages } from "../hooks/useMaterialImages";
 
 const MATERIAL_TYPES: MiningMaterialName[] = [...MINING_MATERIAL_NAMES];
 const LEADERBOARD_TYPES: LeaderboardType[] = [
@@ -98,7 +99,6 @@ const LEADERBOARD_TYPES: LeaderboardType[] = [
   "total",
   "mp",
 ];
-const MATERIAL_BASE_URL = "https://cdn.lil.org/mons/rocks/materials";
 type LeaderboardSpecialType = keyof typeof LEADERBOARD_TYPE_ICON_URLS;
 
 type EventScheduleMode = "minutes" | "datetime";
@@ -157,8 +157,6 @@ const getDefaultScheduledDateTimeInput = (): { date: string; time: string } => {
 
 type ImageUrlResource = CachedResource<string | false>;
 
-const materialImageResources: Map<MiningMaterialName, ImageUrlResource> =
-  new Map();
 const specialLeaderboardTypeImageResources: Map<
   LeaderboardSpecialType,
   ImageUrlResource
@@ -192,13 +190,6 @@ const loadCachedImageUrl = <Key,>(
   }
   return resource.load().then((value) => value || null);
 };
-
-const getMaterialImageUrl = (name: MiningMaterialName) =>
-  loadCachedImageUrl(
-    materialImageResources,
-    name,
-    `${MATERIAL_BASE_URL}/${name}.webp`,
-  );
 
 const getSpecialLeaderboardTypeImageUrl = (type: LeaderboardSpecialType) =>
   loadCachedImageUrl(
@@ -1472,15 +1463,7 @@ const MainMenu: React.FC = () => {
         : "rating";
     },
   );
-  const [materialUrls, setMaterialUrls] = useState<
-    Record<MiningMaterialName, string | null>
-  >({
-    dust: null,
-    slime: null,
-    gum: null,
-    metal: null,
-    ice: null,
-  });
+  const materialUrls = useMaterialImages();
   const [specialLeaderboardTypeUrls, setSpecialLeaderboardTypeUrls] = useState<
     Record<LeaderboardSpecialType, string | null>
   >({
@@ -1502,15 +1485,6 @@ const MainMenu: React.FC = () => {
 
   useEffect(() => {
     let mounted = true;
-    MATERIAL_TYPES.forEach((name) => {
-      void getMaterialImageUrl(name).then((url) => {
-        if (mounted) {
-          setMaterialUrls((prev) =>
-            prev[name] === url ? prev : { ...prev, [name]: url },
-          );
-        }
-      });
-    });
     (
       Object.keys(LEADERBOARD_TYPE_ICON_URLS) as LeaderboardSpecialType[]
     ).forEach((type) => {
