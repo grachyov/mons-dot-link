@@ -248,196 +248,57 @@ test("navigation cache stays profile-scoped, sanitized, cloned, and bounded", ()
   }
 });
 
-test("navigation UI keeps hydrated games when polling stops and pages only through D1", () => {
+test("navigation toolbar delegates its data and preserves picker wiring", () => {
   const source = readFileSync(
     new URL("../src/ui/BottomControls.tsx", import.meta.url),
     "utf8",
   );
-  const subscriptionStart = source.indexOf(
-    "unsubscribe = connection.subscribeProfileGames",
-  );
-  const subscriptionEnd = source.indexOf(
-    "      (pageMeta) =>",
-    subscriptionStart,
-  );
-  const subscriptionHandlers = source.slice(subscriptionStart, subscriptionEnd);
-  const loadMoreStart = source.indexOf(
-    "const handleNavigationLoadMoreGames = () =>",
-  );
-  const loadMoreEnd = source.indexOf("  const handleShare", loadMoreStart);
-  const loadMore = source.slice(loadMoreStart, loadMoreEnd);
-
-  assert.ok(subscriptionStart > 0);
-  assert.ok(subscriptionEnd > subscriptionStart);
   assert.match(
-    subscriptionHandlers,
-    /setNavigationHasMoreGames\(false\);\s*setNavigationGamesCursor\(null\);\s*stopAllNavigationLoading\(\);/,
+    source,
+    /useNavigationGames\(\{\s*profileId,\s*authStatus,\s*isOpen: isNavigationPopupVisible,\s*client: connection,\s*\}\)/,
   );
-  assert.doesNotMatch(
-    subscriptionHandlers,
-    /setNavigationProjectedGames\(\[\]\)/,
-  );
-  assert.doesNotMatch(subscriptionHandlers, /setNavigationPagedGames\(\[\]\)/);
-  assert.match(loadMore, /\.getProfileGamesPage\(/);
-  assert.doesNotMatch(loadMore, /Fallback|getCurrentLoginFallbackGames/);
+  assert.match(source, /loadMore: handleNavigationLoadMoreGames/);
+  assert.match(source, /removeWaitingGame: handleNavigationGameRemove/);
   assert.match(source, /onRemoveGame=\{handleNavigationGameRemove\}/);
+  assert.match(source, /onLoadMoreGames=\{handleNavigationLoadMoreGames\}/);
+  assert.doesNotMatch(source, /connection\.subscribeProfileGames/);
+  assert.doesNotMatch(source, /connection\.getProfileGamesPage/);
+  assert.doesNotMatch(source, /writeNavigationGamesRuntimeCache/);
+  assert.match(source, /getEventParticipantPreview\(effectiveInviteEventId\)/);
 });
 
-test("navigation UI resets profile-bound state before popup-specific work", () => {
+test("toolbar automatch actions retain profile guards and cancel behavior", () => {
   const source = readFileSync(
     new URL("../src/ui/BottomControls.tsx", import.meta.url),
     "utf8",
   );
-  const resetStart = source.indexOf(
-    "const previousCacheScope = navigationCacheScopeRef.current",
+  const extract = (start, end) => {
+    const startIndex = source.indexOf(start);
+    const endIndex = source.indexOf(end, startIndex);
+    assert.ok(startIndex > 0, start);
+    assert.ok(endIndex > startIndex, end);
+    return source.slice(startIndex, endIndex);
+  };
+  const beginSource = extract(
+    "const beginAutomatchFlow = useCallback",
+    "const handleAutomatchClick",
   );
-  const popupClosedBranch = source.indexOf("if (!isNavigationPopupVisible)");
-  const resetSource = source.slice(resetStart, popupClosedBranch);
-  const eventPreviewStart = source.indexOf(
-    "const getEventCloudAvatarsFromNavigationSources",
-  );
-  const eventPreviewEnd = source.indexOf(
-    "interface BottomControlsProps",
-    eventPreviewStart,
-  );
-  const eventPreviewSource = source.slice(eventPreviewStart, eventPreviewEnd);
-
-  assert.ok(resetStart > 0);
-  assert.ok(popupClosedBranch > resetStart);
-  assert.match(
-    resetSource,
-    /navigationCacheScopeRef\.current = activeNavigationCacheScope/,
-  );
-  assert.match(resetSource, /navigationProfileScopeEpochRef\.current \+= 1/);
-  assert.match(resetSource, /setNavigationStateScopeKey\(null\)/);
-  assert.match(resetSource, /setNavigationProjectedGames\(\[\]\)/);
-  assert.match(resetSource, /setNavigationPagedGames\(\[\]\)/);
-  assert.match(resetSource, /setOptimisticPendingAutomatch\(null\)/);
-  assert.match(resetSource, /setIsCancelAutomatchDisabled\(false\)/);
-  assert.match(resetSource, /setNavigationRemovingInviteIds\(new Set\(\)\)/);
-  assert.match(resetSource, /setNavigationHasMoreGames\(false\)/);
-  assert.match(resetSource, /setNavigationGamesCursor\(null\)/);
-  assert.match(resetSource, /eventCloudSubscriptionEventIdRef\.current = null/);
-  assert.match(resetSource, /setLiveEventCloudAvatars\(\[\]\)/);
-  assert.match(
-    source,
-    /navigationStateScopeKey !== activeNavigationCacheScopeKey/,
-  );
-  assert.match(
-    eventPreviewSource,
-    /cacheScope: NavigationGamesCacheScope \| null/,
-  );
-  assert.match(
-    eventPreviewSource,
-    /readNavigationGamesCacheSnapshot\(cacheScope\)/,
-  );
-  assert.doesNotMatch(eventPreviewSource, /storage\.getProfileId/);
-  assert.match(
-    source,
-    /pagedNavigationGames,\s*activeNavigationCacheScope,\s*\)/,
-  );
-  assert.match(source, /navigationLoadMoreEpochRef\.current !== loadMoreEpoch/);
-  assert.match(source, /navigationLoadMoreEpochRef\.current === loadMoreEpoch/);
-
-  const cancelStart = source.indexOf(
+  const cancelSource = extract(
     "const handleCancelAutomatchClick = async",
-  );
-  const cancelEnd = source.indexOf(
     "const getPrimaryActionButtonText",
-    cancelStart,
   );
-  const cancelSource = source.slice(cancelStart, cancelEnd);
-  assert.match(
-    cancelSource,
-    /const isCancelRequestCurrent = \(\) =>\s*sessionGuard\(\) && isNavigationScopeActive\(\)/,
-  );
-  assert.equal(
-    cancelSource.match(/if \(!isCancelRequestCurrent\(\)\) \{/g)?.length,
-    2,
-  );
-  assert.match(
-    cancelSource,
-    /if \(result && result\.ok\) \{\s*setOptimisticPendingAutomatch\(null\);\s*dismissPendingAutomatchTransition\(\);\s*await transitionToHome/,
-  );
-});
-
-test("ownerless automatch state stays ephemeral and session scoped", () => {
-  const source = readFileSync(
-    new URL("../src/ui/BottomControls.tsx", import.meta.url),
-    "utf8",
-  );
-  const topStart = source.indexOf("const scopedTopNavigationGames = useMemo");
-  const topEnd = source.indexOf(
-    "const topNavigationItemIds = useMemo",
-    topStart,
-  );
-  const topSource = source.slice(topStart, topEnd);
-  const cacheStart = source.indexOf(
-    "writeNavigationGamesRuntimeCache(",
-    topEnd,
-  );
-  const cacheEnd = source.indexOf(
-    "const hydrateNavigationGamesFromCache",
-    cacheStart,
-  );
-  const cacheSource = source.slice(cacheStart, cacheEnd);
-  const beginStart = source.indexOf("const beginAutomatchFlow = useCallback");
-  const beginEnd = source.indexOf("const handleAutomatchClick", beginStart);
-  const beginSource = source.slice(beginStart, beginEnd);
-  const cancelStart = source.indexOf(
-    "const handleCancelAutomatchClick = async",
-  );
-  const cancelEnd = source.indexOf(
-    "const getPrimaryActionButtonText",
-    cancelStart,
-  );
-  const cancelSource = source.slice(cancelStart, cancelEnd);
-  const waitingStart = source.indexOf(
+  const waitingSource = extract(
     "const setAutomatchWaitingStateHandler = (waiting: boolean) =>",
-  );
-  const waitingEnd = source.indexOf(
     "const setAutomatchEnabledHandler",
-    waitingStart,
   );
-  const waitingSource = source.slice(waitingStart, waitingEnd);
-
-  assert.match(
-    topSource,
-    /const merged = scopedTopNavigationGames\.slice\(\);[\s\S]*?if \(\s*optimisticPendingAutomatchItem/,
-  );
-  assert.doesNotMatch(
-    topSource,
-    /hasActiveNavigationStateScope &&\s*optimisticPendingAutomatchItem/,
-  );
-  assert.match(
-    cacheSource,
-    /writeNavigationGamesRuntimeCache\(\s*scope,\s*scopedTopNavigationGames,/,
-  );
-  assert.match(
-    cacheSource,
-    /writeNavigationGamesPersistedTopCache\(\s*scope,\s*scopedTopNavigationGames,/,
-  );
-  assert.doesNotMatch(cacheSource, /scope,\s*topNavigationGames,/);
-
-  assert.match(
-    source,
-    /const isNavigationScopeCurrent = \([\s\S]*?\(currentScope\?\.scopeKey \?\? null\) === expectedScopeKey &&\s*currentEpoch === expectedEpoch;/,
-  );
-  for (const callbackSource of [beginSource, cancelSource]) {
-    assert.match(
-      callbackSource,
-      /isNavigationScopeCurrent\(\s*navigationCacheScopeRef\.current,\s*navigationScopeKey,\s*navigationProfileScopeEpochRef\.current,\s*navigationProfileScopeEpoch,/,
-    );
-  }
   assert.match(
     beginSource,
-    /const sessionGuard = connection\.createSessionGuard\(\)/,
+    /const isAutomatchRequestCurrent = createProfileRequestGuard\(\)/,
   );
-  assert.match(beginSource, /!sessionGuard\(\)/);
-  assert.doesNotMatch(beginSource, /!navigationScopeKey/);
+  assert.match(beginSource, /if \(!isAutomatchRequestCurrent\(\)\) \{/);
   assert.match(
     beginSource,
-    /requestPendingDelayedCancelAutomatchIntent\([\s\S]*?setOptimisticPendingAutomatch\(\{\s*item,\s*scopeKey: navigationScopeKey,\s*scopeEpoch: navigationProfileScopeEpoch,/,
+    /requestPendingDelayedCancelAutomatchIntent\([\s\S]*?setOptimisticPendingAutomatch\(item\)/,
   );
   assert.match(
     beginSource,
@@ -448,8 +309,16 @@ test("ownerless automatch state stays ephemeral and session scoped", () => {
     /else \{\s*clearPendingDelayedCancelAutomatchIntent\(\);\s*setOptimisticPendingAutomatch\(null\);\s*dismissPendingAutomatchTransition\(\);/,
   );
   assert.match(
-    source,
-    /const optimisticPendingAutomatchItem =\s*optimisticPendingAutomatch &&\s*isNavigationScopeCurrent\(\s*activeNavigationCacheScope,\s*optimisticPendingAutomatch\.scopeKey,\s*navigationProfileScopeEpochRef\.current,\s*optimisticPendingAutomatch\.scopeEpoch,/,
+    cancelSource,
+    /const isCancelRequestCurrent = createProfileRequestGuard\(\)/,
+  );
+  assert.equal(
+    cancelSource.match(/if \(!isCancelRequestCurrent\(\)\) \{/g)?.length,
+    2,
+  );
+  assert.match(
+    cancelSource,
+    /if \(result && result\.ok\) \{\s*setOptimisticPendingAutomatch\(null\);\s*dismissPendingAutomatchTransition\(\);\s*await transitionToHome/,
   );
   assert.match(
     waitingSource,
