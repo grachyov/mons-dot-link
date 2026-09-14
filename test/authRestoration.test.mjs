@@ -1,9 +1,24 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { registerHooks } from "node:module";
 import test from "node:test";
 import ts from "typescript";
 import { normalizeProfileEmojiId } from "../cloud/runtime/shared/profiles.js";
-import { ProfileApiError } from "../src/services/profileApi.ts";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (
+      context.parentURL?.endsWith(".ts") &&
+      (specifier.startsWith("./") || specifier.startsWith("../")) &&
+      !/\.[^/]+$/.test(specifier)
+    ) {
+      return nextResolve(`${specifier}.ts`, context);
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+const { ProfileApiError } = await import("../src/services/profileApi.ts");
 
 const source = ts.createSourceFile(
   "authentication.ts",

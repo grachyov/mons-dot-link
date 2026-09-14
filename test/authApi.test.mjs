@@ -270,6 +270,66 @@ test("keeps one unlink operation ID across a forced token refresh", async () => 
   assert.match(bodies[0].opId, /^[0-9a-f-]{36}$/);
 });
 
+test("serializes auth input before acquiring a token and reuses it after 401", async () => {
+  const request = { intentId: "original-intent" };
+  const bodies = [];
+  const refreshes = [];
+  globalThis.fetch = async (_input, init) => {
+    bodies.push(JSON.parse(init.body));
+    return bodies.length === 1
+      ? jsonResponse({ ok: false }, 401)
+      : jsonResponse({
+          ok: true,
+          flowId: "flow-id",
+          authUrl: "https://x.com/i/oauth2/authorize",
+          expiresAtMs: 1_600_000,
+        });
+  };
+
+  await beginXRedirectAuthViaApi(request, async (forceRefresh) => {
+    refreshes.push(forceRefresh);
+    request.intentId = forceRefresh ? "refreshed-intent" : "changed-intent";
+    return "token";
+  });
+
+  assert.deepEqual(refreshes, [false, true]);
+  assert.deepEqual(bodies, [
+    { intentId: "original-intent" },
+    { intentId: "original-intent" },
+  ]);
+});
+
+test("preserves auth token errors and masks unrelated token failures", async () => {
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches++;
+    throw new Error("unexpected-fetch");
+  };
+  const authError = new AuthApiError(
+    "unauthenticated",
+    "authentication-changed",
+    { reason: "session-replaced" },
+  );
+  await assert.rejects(
+    getLinkedAuthMethodsViaApi(async () => {
+      throw authError;
+    }),
+    (error) => error === authError,
+  );
+  await assert.rejects(
+    getLinkedAuthMethodsViaApi(async () => {
+      throw new Error("private-token-detail");
+    }),
+    (error) =>
+      error instanceof AuthApiError &&
+      error.name === "AuthApiError" &&
+      error.code === "unavailable" &&
+      error.message === "Auth service is unavailable." &&
+      error.details === undefined,
+  );
+  assert.equal(fetches, 0);
+});
+
 test("does not retry unlink after the authenticated user changes", async () => {
   const tokenRequests = [];
   const userA = {

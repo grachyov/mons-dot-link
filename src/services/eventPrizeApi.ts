@@ -6,7 +6,11 @@ import {
   type EventPrizeWithdrawalResponse,
   type EventPrizeWithdrawalStatusRequest,
 } from "@mons/shared/event-prizes";
-import type { AuthTokenProvider } from "./authApi";
+import {
+  authenticatedJsonRequest,
+  type ApiErrorPolicy,
+  type AuthTokenProvider,
+} from "./apiTransport";
 
 const EVENT_PRIZE_API_ROOT = "https://api.mons.link";
 const EVENT_PRIZE_API_REQUEST_TIMEOUT_MS = 15_000;
@@ -50,71 +54,25 @@ function isAuthApiError(
   );
 }
 
-function cancelBody(response: Response): void {
-  void response.body?.cancel().catch(() => undefined);
-}
-
-async function readBoundedJson(response: Response): Promise<unknown> {
-  const contentLength = Number(response.headers.get("Content-Length"));
-  if (
-    Number.isFinite(contentLength) &&
-    contentLength > EVENT_PRIZE_API_MAX_RESPONSE_BYTES
-  ) {
-    cancelBody(response);
-    throw new EventPrizeWithdrawalApiError(
-      "unavailable",
-      "Prize withdrawal service is unavailable.",
-    );
-  }
-  if (!response.body) {
-    throw new EventPrizeWithdrawalApiError(
-      "unavailable",
-      "Prize withdrawal service is unavailable.",
-    );
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const chunks: string[] = [];
-  let bytesRead = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytesRead += value.byteLength;
-      if (bytesRead > EVENT_PRIZE_API_MAX_RESPONSE_BYTES) {
-        throw new Error("oversized-response");
-      }
-      chunks.push(decoder.decode(value, { stream: true }));
+const withdrawalErrorPolicy: ApiErrorPolicy = {
+  createError: (code, message, details) =>
+    new EventPrizeWithdrawalApiError(code, message, details),
+  normalizeResponseError: (error) =>
+    error instanceof EventPrizeWithdrawalApiError ? error : undefined,
+  normalizeError: (error) => {
+    if (error instanceof EventPrizeWithdrawalApiError) return error;
+    if (isAuthApiError(error)) {
+      return new EventPrizeWithdrawalApiError(
+        error.code,
+        error.message,
+        error.details,
+      );
     }
-    chunks.push(decoder.decode());
-    return JSON.parse(chunks.join("")) as unknown;
-  } catch (error) {
-    void reader.cancel().catch(() => undefined);
-    if (error instanceof EventPrizeWithdrawalApiError) throw error;
-    throw new EventPrizeWithdrawalApiError(
-      "unavailable",
-      "Prize withdrawal service is unavailable.",
-    );
-  }
-}
-
-function responseError(
-  value: unknown,
-  status: number,
-): EventPrizeWithdrawalApiError {
-  const body = isRecord(value) ? value : {};
-  const code =
-    typeof body.error === "string" && body.error.trim()
-      ? body.error.trim()
-      : status === 401
-        ? "unauthenticated"
-        : "unavailable";
-  const message =
-    typeof body.message === "string" && body.message.trim()
-      ? body.message.trim()
-      : "Prize withdrawal service is unavailable.";
-  return new EventPrizeWithdrawalApiError(code, message, body.details);
-}
+    return undefined;
+  },
+  unavailableMessage: "Prize withdrawal service is unavailable.",
+  timeoutMessage: "Prize withdrawal timed out.",
+};
 
 async function postWithdrawalRequest(
   path: string,
@@ -136,86 +94,26 @@ async function postWithdrawalRequest(
     1,
     Math.min(dependencies.requestTimeoutMs, remainingMs),
   );
-  const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timeoutId = setTimeout(() => {
-      controller.abort();
-      reject(
-        new EventPrizeWithdrawalApiError(
-          timeoutMs >= remainingMs ? "deadline-exceeded" : "unavailable",
-          "Prize withdrawal timed out.",
-        ),
-      );
-    }, timeoutMs);
+  return authenticatedJsonRequest({
+    url: `${EVENT_PRIZE_API_ROOT}${path}`,
+    createRequestInit: () => ({
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+    tokenProvider,
+    validate: (value): value is EventPrizeWithdrawalResponse =>
+      isEventPrizeWithdrawalProcessingResponse(value) ||
+      isEventPrizeWithdrawalCompletedResponse(value),
+    timeoutMs,
+    maxResponseBytes: EVENT_PRIZE_API_MAX_RESPONSE_BYTES,
+    fetcher: dependencies.fetcher,
+    assertCurrentUser: () => tokenProvider.assertCurrentUser?.(),
+    errors: {
+      ...withdrawalErrorPolicy,
+      timeoutCode:
+        timeoutMs >= remainingMs ? "deadline-exceeded" : "unavailable",
+    },
   });
-  const run = async (): Promise<EventPrizeWithdrawalResponse> => {
-    for (let authAttempt = 0; authAttempt < 2; authAttempt++) {
-      try {
-        const token = await tokenProvider(authAttempt === 1);
-        if (controller.signal.aborted) {
-          throw new EventPrizeWithdrawalApiError(
-            "unavailable",
-            "Prize withdrawal timed out.",
-          );
-        }
-        tokenProvider.assertCurrentUser?.();
-        const response = await dependencies.fetcher(
-          `${EVENT_PRIZE_API_ROOT}${path}`,
-          {
-            method: "POST",
-            headers: {
-              Accept: "application/json",
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(body),
-            cache: "no-store",
-            signal: controller.signal,
-          },
-        );
-        if (response.status === 401 && authAttempt === 0) {
-          cancelBody(response);
-          continue;
-        }
-        const payload = await readBoundedJson(response);
-        if (!response.ok) throw responseError(payload, response.status);
-        if (
-          !isEventPrizeWithdrawalProcessingResponse(payload) &&
-          !isEventPrizeWithdrawalCompletedResponse(payload)
-        ) {
-          throw new EventPrizeWithdrawalApiError(
-            "unavailable",
-            "Prize withdrawal service is unavailable.",
-          );
-        }
-        tokenProvider.assertCurrentUser?.();
-        return payload;
-      } catch (error) {
-        if (error instanceof EventPrizeWithdrawalApiError) throw error;
-        if (isAuthApiError(error)) {
-          throw new EventPrizeWithdrawalApiError(
-            error.code,
-            error.message,
-            error.details,
-          );
-        }
-        throw new EventPrizeWithdrawalApiError(
-          "unavailable",
-          "Prize withdrawal service is unavailable.",
-        );
-      }
-    }
-    throw new EventPrizeWithdrawalApiError(
-      "unauthenticated",
-      "authentication-required",
-    );
-  };
-  try {
-    return await Promise.race([run(), deadline]);
-  } finally {
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
-  }
 }
 
 function wait(milliseconds: number): Promise<void> {

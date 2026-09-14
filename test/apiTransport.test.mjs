@@ -1,0 +1,448 @@
+import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
+import { setImmediate } from "node:timers/promises";
+import test from "node:test";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (
+      context.parentURL?.endsWith(".ts") &&
+      (specifier.startsWith("./") || specifier.startsWith("../")) &&
+      !/\.[^/]+$/.test(specifier)
+    ) {
+      return nextResolve(`${specifier}.ts`, context);
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+const { authenticatedJsonRequest } =
+  await import("../src/services/apiTransport.ts");
+
+class EndpointError extends Error {
+  constructor(code, message, details) {
+    super(message);
+    this.name = "EndpointError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+const errors = {
+  createError: (code, message, details) =>
+    new EndpointError(code, message, details),
+  normalizeError: (error) =>
+    error instanceof EndpointError ? error : undefined,
+  unavailableMessage: "Endpoint unavailable.",
+  timeoutMessage: "Endpoint timed out.",
+};
+const jsonResponse = (body, status = 200) =>
+  new Response(JSON.stringify(body), { status });
+const request = (overrides = {}) =>
+  authenticatedJsonRequest({
+    url: "https://api.mons.link/test",
+    createRequestInit: () => ({ method: "POST", body: "{}" }),
+    tokenProvider: async () => "token",
+    validate: (value) => value?.ok === true,
+    timeoutMs: 100,
+    maxResponseBytes: 128,
+    fetcher: async () => jsonResponse({ ok: true }),
+    errors,
+    ...overrides,
+  });
+const unavailable = {
+  name: "EndpointError",
+  code: "unavailable",
+  message: "Endpoint unavailable.",
+};
+const timeout = {
+  name: "EndpointError",
+  code: "unavailable",
+  message: "Endpoint timed out.",
+};
+
+test("retries one 401 with a fresh token without waiting for cancellation", async () => {
+  const refreshes = [];
+  const calls = [];
+  const sequence = [];
+  let cancellations = 0;
+  const result = await request({
+    tokenProvider: async (refresh) => {
+      refreshes.push(refresh);
+      sequence.push("token");
+      return refresh ? "fresh" : "stale";
+    },
+    createRequestInit: () => {
+      sequence.push("body");
+      return {
+        method: "POST",
+        body: JSON.stringify({ attempt: calls.length }),
+      };
+    },
+    fetcher: async (url, init) => {
+      sequence.push("fetch");
+      calls.push({ url, init });
+      return calls.length === 1
+        ? new Response(
+            new ReadableStream({
+              cancel() {
+                cancellations++;
+                return new Promise(() => {});
+              },
+            }),
+            { status: 401 },
+          )
+        : jsonResponse({ ok: true });
+    },
+  });
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(refreshes, [false, true]);
+  assert.deepEqual(sequence, [
+    "token",
+    "body",
+    "fetch",
+    "token",
+    "body",
+    "fetch",
+  ]);
+  assert.equal(cancellations, 1);
+  assert.deepEqual(
+    calls.map(({ init }) => new Headers(init.headers).get("Authorization")),
+    ["Bearer stale", "Bearer fresh"],
+  );
+  assert.deepEqual(
+    calls.map(({ init }) => JSON.parse(init.body)),
+    [{ attempt: 0 }, { attempt: 1 }],
+  );
+  for (const { url, init } of calls) {
+    assert.equal(url, "https://api.mons.link/test");
+    assert.equal(init.cache, "no-store");
+    assert.equal(new Headers(init.headers).get("Accept"), "application/json");
+    assert.equal(
+      new Headers(init.headers).get("Content-Type"),
+      "application/json",
+    );
+    assert.ok(init.signal instanceof AbortSignal);
+  }
+  assert.equal(calls[0].init.signal, calls[1].init.signal);
+});
+
+test("preserves request options and omits Content-Type on GET", async () => {
+  await request({
+    createRequestInit: () => ({ method: "GET", keepalive: true }),
+    fetcher: async (_url, init) => {
+      assert.equal(init.method, "GET");
+      assert.equal(init.keepalive, true);
+      assert.equal(init.body, undefined);
+      assert.equal(new Headers(init.headers).get("Content-Type"), null);
+      return jsonResponse({ ok: true });
+    },
+  });
+});
+
+test("never retries server, network, parsing, or validation failures", async (t) => {
+  for (const [name, respond, expected] of [
+    [
+      "server",
+      () =>
+        jsonResponse(
+          { error: " busy ", message: " Try later. ", details: { retry: 5 } },
+          503,
+        ),
+      { code: "busy", message: "Try later.", details: { retry: 5 } },
+    ],
+    [
+      "network",
+      () => {
+        throw new TypeError("offline");
+      },
+      unavailable,
+    ],
+    ["JSON", () => new Response("{"), unavailable],
+    ["validation", () => jsonResponse({ ok: false }), unavailable],
+  ]) {
+    await t.test(name, async () => {
+      const refreshes = [];
+      let calls = 0;
+      await assert.rejects(
+        request({
+          tokenProvider: async (refresh) => {
+            refreshes.push(refresh);
+            return "token";
+          },
+          fetcher: async () => {
+            calls++;
+            return respond();
+          },
+        }),
+        expected,
+      );
+      assert.equal(calls, 1);
+      assert.deepEqual(refreshes, [false]);
+    });
+  }
+});
+
+test("stops after a second 401 and uses the endpoint error fallback", async () => {
+  const refreshes = [];
+  await assert.rejects(
+    request({
+      tokenProvider: async (refresh) => {
+        refreshes.push(refresh);
+        return "token";
+      },
+      fetcher: async () => jsonResponse({ error: "  ", message: null }, 401),
+    }),
+    { ...unavailable, code: "unauthenticated" },
+  );
+  assert.deepEqual(refreshes, [false, true]);
+  await assert.rejects(
+    request({ fetcher: async () => jsonResponse([], 500) }),
+    unavailable,
+  );
+});
+
+test("normalizes token errors without starting requests", async () => {
+  const normalized = new EndpointError("unauthenticated", "Session changed.");
+  for (const [thrown, expected] of [
+    [normalized, normalized],
+    [new Error("unknown"), unavailable],
+  ]) {
+    let calls = 0;
+    await assert.rejects(
+      request({
+        tokenProvider: async () => {
+          throw thrown;
+        },
+        fetcher: async () => {
+          calls++;
+          return jsonResponse({ ok: true });
+        },
+      }),
+      expected instanceof Error ? (error) => error === expected : expected,
+    );
+    assert.equal(calls, 0);
+  }
+});
+
+test("bounds stalled token, fetch, and body work with the same deadline", async (t) => {
+  for (const stage of ["token", "fetch", "body"]) {
+    await t.test(stage, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const started = Promise.withResolvers();
+      let signal;
+      let body;
+      let cancellations = 0;
+      const pending = request({
+        tokenProvider: () => {
+          if (stage === "token") {
+            started.resolve();
+            return new Promise(() => {});
+          }
+          return Promise.resolve("token");
+        },
+        fetcher: async (_url, init) => {
+          signal = init.signal;
+          if (stage === "fetch") {
+            started.resolve();
+            return new Promise(() => {});
+          }
+          body = new ReadableStream({
+            pull() {
+              started.resolve();
+              return new Promise(() => {});
+            },
+            cancel() {
+              cancellations++;
+              return new Promise(() => {});
+            },
+          });
+          return new Response(body);
+        },
+      });
+      const rejected = assert.rejects(pending, timeout);
+      await started.promise;
+      t.mock.timers.tick(100);
+      await rejected;
+      if (signal) assert.equal(signal.aborted, true);
+      if (body) {
+        await setImmediate();
+        assert.equal(cancellations, 1);
+        assert.equal(body.locked, false);
+      }
+    });
+  }
+});
+
+test("a late token never starts a request after the deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const token = Promise.withResolvers();
+  let calls = 0;
+  const pending = request({
+    tokenProvider: () => token.promise,
+    fetcher: async () => {
+      calls++;
+      return jsonResponse({ ok: true });
+    },
+  });
+  const rejected = assert.rejects(pending, timeout);
+  t.mock.timers.tick(100);
+  await rejected;
+  token.resolve("late-token");
+  await setImmediate();
+  assert.equal(calls, 0);
+});
+
+test("401 refresh and body reading share the original request deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const tokens = [Promise.withResolvers(), Promise.withResolvers()];
+  const refreshStarted = Promise.withResolvers();
+  const readStarted = Promise.withResolvers();
+  let calls = 0;
+  let settled = false;
+  const pending = request({
+    tokenProvider: (refresh) => {
+      if (refresh) refreshStarted.resolve();
+      return tokens[Number(refresh)].promise;
+    },
+    fetcher: async () => {
+      calls++;
+      return calls === 1
+        ? jsonResponse({}, 401)
+        : new Response(
+            new ReadableStream({
+              pull() {
+                readStarted.resolve();
+                return new Promise(() => {});
+              },
+            }),
+          );
+    },
+  });
+  pending.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  const rejected = assert.rejects(pending, timeout);
+  t.mock.timers.tick(30);
+  tokens[0].resolve("stale");
+  await refreshStarted.promise;
+  t.mock.timers.tick(40);
+  tokens[1].resolve("fresh");
+  await readStarted.promise;
+  t.mock.timers.tick(29);
+  await setImmediate();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  await rejected;
+  assert.equal(calls, 2);
+});
+
+test("accepts valid multibyte UTF-8 split across chunks at the exact byte limit", async () => {
+  const payload = { ok: true, text: "☃" };
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  const result = await request({
+    maxResponseBytes: bytes.byteLength,
+    fetcher: async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+            controller.close();
+          },
+        }),
+      ),
+  });
+  assert.deepEqual(result, payload);
+});
+
+test("rejects missing, malformed, invalid UTF-8, and failed response bodies", async (t) => {
+  for (const [name, response] of [
+    ["missing", () => new Response(null)],
+    ["empty", () => new Response("")],
+    ["JSON", () => new Response("{bad}")],
+    ["UTF-8", () => new Response(Uint8Array.of(0xff))],
+    ["truncated UTF-8", () => new Response(Uint8Array.of(0xe2, 0x98))],
+    [
+      "stream failure",
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error("read failed"));
+            },
+          }),
+        ),
+    ],
+  ]) {
+    await t.test(name, async () => {
+      await assert.rejects(
+        request({ fetcher: async () => response() }),
+        unavailable,
+      );
+    });
+  }
+});
+
+test("cancels oversized declared and streamed bodies without waiting", async (t) => {
+  for (const declared of [true, false]) {
+    await t.test(declared ? "declared" : "streamed", async () => {
+      let cancellations = 0;
+      await assert.rejects(
+        request({
+          maxResponseBytes: 4,
+          fetcher: async () =>
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode('{"ok":true}'));
+                },
+                cancel() {
+                  cancellations++;
+                  return new Promise(() => {});
+                },
+              }),
+              declared ? { headers: { "Content-Length": "5" } } : undefined,
+            ),
+        }),
+        unavailable,
+      );
+      assert.equal(cancellations, 1);
+    });
+  }
+});
+
+test("clears the request timer after success and failure", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const success of [true, false]) {
+    let signal;
+    const pending = request({
+      fetcher: async (_url, init) => {
+        signal = init.signal;
+        return jsonResponse({ ok: success });
+      },
+    });
+    if (success) await pending;
+    else await assert.rejects(pending, unavailable);
+    t.mock.timers.runAll();
+    assert.equal(signal.aborted, false);
+  }
+});
+
+test("uses a caller-supplied timeout code", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pending = request({
+    tokenProvider: () => new Promise(() => {}),
+    errors: { ...errors, timeoutCode: "deadline-exceeded" },
+  });
+  const rejected = assert.rejects(pending, {
+    ...timeout,
+    code: "deadline-exceeded",
+  });
+  t.mock.timers.tick(100);
+  await rejected;
+});

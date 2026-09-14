@@ -17,6 +17,7 @@ registerHooks({
 
 const { MiningApiError, mineRockViaApi } =
   await import("../src/services/miningApi.ts");
+const { AuthApiError } = await import("../src/services/authApi.ts");
 
 const originalFetch = globalThis.fetch;
 const request = {
@@ -97,6 +98,56 @@ test("refreshes the session token exactly once after a 401", async () => {
   );
   assert.deepEqual(refreshes, [false, true]);
   assert.deepEqual(tokens, ["Bearer stale-token", "Bearer fresh-token"]);
+});
+
+test("serializes mining input after acquiring each attempt's token", async () => {
+  const input = { ...request, materials: { ...request.materials } };
+  const bodies = [];
+  const refreshes = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return bodies.length === 1
+      ? jsonResponse({ ok: false }, 401)
+      : jsonResponse(success);
+  };
+
+  await mineRockViaApi(input, async (forceRefresh) => {
+    refreshes.push(forceRefresh);
+    input.materials.dust = forceRefresh ? 3 : 2;
+    return "token";
+  });
+
+  assert.deepEqual(refreshes, [false, true]);
+  assert.deepEqual(bodies, [
+    { ...request, materials: { ...request.materials, dust: 2 } },
+    { ...request, materials: { ...request.materials, dust: 3 } },
+  ]);
+});
+
+test("masks auth token failures as mining service errors", async () => {
+  let fetches = 0;
+  let tokenCalls = 0;
+  globalThis.fetch = async () => {
+    fetches++;
+    throw new Error("unexpected-fetch");
+  };
+
+  await assert.rejects(
+    mineRockViaApi(request, async () => {
+      tokenCalls++;
+      throw new AuthApiError("unauthenticated", "authentication-changed", {
+        reason: "private-session-detail",
+      });
+    }),
+    (error) =>
+      error instanceof MiningApiError &&
+      error.name === "MiningApiError" &&
+      error.code === "unavailable" &&
+      error.message === "Mining service is unavailable." &&
+      error.details === undefined,
+  );
+  assert.equal(tokenCalls, 1);
+  assert.equal(fetches, 0);
 });
 
 test("does not retry mutations after non-authentication failures", async () => {

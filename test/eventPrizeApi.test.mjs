@@ -1,10 +1,26 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import test from "node:test";
-import {
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (
+      context.parentURL?.endsWith(".ts") &&
+      (specifier.startsWith("./") || specifier.startsWith("../")) &&
+      !/\.[^/]+$/.test(specifier)
+    ) {
+      return nextResolve(`${specifier}.ts`, context);
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+const {
+  EVENT_PRIZE_API_DEADLINE_MS,
   EventPrizeWithdrawalApiError,
   withdrawEventPrizeViaApi,
-} from "../src/services/eventPrizeApi.ts";
-import { AuthApiError } from "../src/services/authApi.ts";
+} = await import("../src/services/eventPrizeApi.ts");
+const { AuthApiError } = await import("../src/services/authApi.ts");
 
 const eventId = "NN3eRzoZo80";
 const prizeId = "1092";
@@ -36,6 +52,7 @@ const jsonResponse = (body, status = 200) =>
 
 test("returns an immediately completed Worker withdrawal", async () => {
   const calls = [];
+  const requests = [];
   const result = await withdrawEventPrizeViaApi(
     eventId,
     prizeId,
@@ -44,10 +61,33 @@ test("returns an immediately completed Worker withdrawal", async () => {
       calls.push(forceRefresh);
       return "token";
     },
-    { fetcher: async () => jsonResponse(completed) },
+    {
+      fetcher: async (input, init) => {
+        requests.push({ input, init });
+        return jsonResponse(completed);
+      },
+    },
   );
   assert.deepEqual(result, completed);
   assert.deepEqual(calls, [false]);
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0].input,
+    "https://api.mons.link/events/prizes/withdrawals",
+  );
+  const { init } = requests[0];
+  assert.equal(init.method, "POST");
+  assert.equal(init.cache, "no-store");
+  assert.ok(init.signal instanceof AbortSignal);
+  assert.deepEqual(JSON.parse(init.body), {
+    eventId,
+    prizeId,
+    solanaAddress: recipientAddress,
+  });
+  const headers = new Headers(init.headers);
+  assert.equal(headers.get("Authorization"), "Bearer token");
+  assert.equal(headers.get("Content-Type"), "application/json");
+  assert.equal(headers.get("Accept"), "application/json");
 });
 
 test("polls processing operations and tolerates transient status failures", async () => {
@@ -178,8 +218,9 @@ test("times out locally without cancelling the Workflow", async () => {
   );
 });
 
-test("bounds stalled session token acquisition", async () => {
-  await assert.rejects(
+test("bounds stalled session token acquisition", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const rejection = assert.rejects(
     withdrawEventPrizeViaApi(
       eventId,
       prizeId,
@@ -195,8 +236,243 @@ test("bounds stalled session token acquisition", async () => {
     ),
     (error) =>
       error instanceof EventPrizeWithdrawalApiError &&
-      error.code === "unavailable",
+      error.code === "unavailable" &&
+      error.message === "Prize withdrawal timed out.",
   );
+  t.mock.timers.tick(5);
+  await rejection;
+});
+
+test("clips polling request timeouts to the remaining overall deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 0;
+  let signal;
+  let pollingStarted;
+  const started = new Promise((resolve) => {
+    pollingStarted = resolve;
+  });
+  const paths = [];
+  const sleeps = [];
+  const withdrawal = withdrawEventPrizeViaApi(
+    eventId,
+    prizeId,
+    recipientAddress,
+    async () => "token",
+    {
+      deadlineMs: 900,
+      requestTimeoutMs: 500,
+      pollIntervalMs: 700,
+      now: () => now,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+      },
+      fetcher: async (input, init) => {
+        paths.push(new URL(input).pathname);
+        if (paths.length === 1) return jsonResponse(processing, 202);
+        assert.deepEqual(JSON.parse(init.body), {
+          eventId,
+          operationId,
+          prizeId,
+        });
+        signal = init.signal;
+        pollingStarted();
+        return new Promise(() => undefined);
+      },
+    },
+  );
+  const rejection = assert.rejects(
+    withdrawal,
+    (error) =>
+      error instanceof EventPrizeWithdrawalApiError &&
+      error.code === "deadline-exceeded" &&
+      error.message === "Prize withdrawal timed out.",
+  );
+  await started;
+  t.mock.timers.tick(199);
+  assert.equal(signal.aborted, false);
+  t.mock.timers.tick(1);
+  await rejection;
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(sleeps, [700]);
+  assert.deepEqual(paths, [
+    "/events/prizes/withdrawals",
+    "/events/prizes/withdrawals/status",
+  ]);
+});
+
+test("keeps the default overall withdrawal deadline at 135 seconds", async () => {
+  assert.equal(EVENT_PRIZE_API_DEADLINE_MS, 135_000);
+  let now = 0;
+  const sleeps = [];
+  const paths = [];
+  await assert.rejects(
+    withdrawEventPrizeViaApi(
+      eventId,
+      prizeId,
+      recipientAddress,
+      async () => "token",
+      {
+        now: () => now,
+        pollIntervalMs: 100_000,
+        sleep: async (milliseconds) => {
+          sleeps.push(milliseconds);
+          now += milliseconds;
+        },
+        fetcher: async (input) => {
+          paths.push(new URL(input).pathname);
+          return jsonResponse(processing, 202);
+        },
+      },
+    ),
+    (error) =>
+      error instanceof EventPrizeWithdrawalApiError &&
+      error.code === "deadline-exceeded",
+  );
+  assert.equal(now, 135_000);
+  assert.deepEqual(sleeps, [100_000, 35_000]);
+  assert.deepEqual(paths, [
+    "/events/prizes/withdrawals",
+    "/events/prizes/withdrawals/status",
+  ]);
+});
+
+test("converts auth token errors and masks unrelated token failures", async () => {
+  const authError = new AuthApiError(
+    "unauthenticated",
+    "authentication-changed",
+    { reason: "session-replaced" },
+  );
+  let fetches = 0;
+  for (const failure of [authError, new Error("private-token-detail")]) {
+    await assert.rejects(
+      withdrawEventPrizeViaApi(
+        eventId,
+        prizeId,
+        recipientAddress,
+        async () => {
+          throw failure;
+        },
+        {
+          fetcher: async () => {
+            fetches++;
+            throw new Error("unexpected-fetch");
+          },
+        },
+      ),
+      (error) => {
+        assert.ok(error instanceof EventPrizeWithdrawalApiError);
+        assert.equal(error.name, "EventPrizeWithdrawalApiError");
+        if (failure === authError) {
+          assert.equal(error.code, authError.code);
+          assert.equal(error.message, authError.message);
+          assert.equal(error.details, authError.details);
+        } else {
+          assert.equal(error.code, "unavailable");
+          assert.equal(
+            error.message,
+            "Prize withdrawal service is unavailable.",
+          );
+          assert.equal(error.details, undefined);
+        }
+        return true;
+      },
+    );
+  }
+  assert.equal(fetches, 0);
+});
+
+test("preserves withdrawal stream errors but masks auth stream failures", async () => {
+  const withdrawalError = new EventPrizeWithdrawalApiError(
+    "failed-precondition",
+    "withdrawal-interrupted",
+    { terminal: true },
+  );
+  const authError = new AuthApiError(
+    "unauthenticated",
+    "authentication-changed",
+    { reason: "private-session-detail" },
+  );
+  for (const failure of [withdrawalError, authError]) {
+    let fetches = 0;
+    const sleeps = [];
+    await assert.rejects(
+      withdrawEventPrizeViaApi(
+        eventId,
+        prizeId,
+        recipientAddress,
+        async () => "token",
+        {
+          fetcher: async () => {
+            fetches++;
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.error(failure);
+                },
+              }),
+            );
+          },
+          sleep: async (milliseconds) => {
+            sleeps.push(milliseconds);
+          },
+        },
+      ),
+      (error) => {
+        if (failure === withdrawalError) {
+          assert.equal(error, withdrawalError);
+        } else {
+          assert.ok(error instanceof EventPrizeWithdrawalApiError);
+          assert.equal(error.code, "unavailable");
+          assert.equal(
+            error.message,
+            "Prize withdrawal service is unavailable.",
+          );
+          assert.equal(error.details, undefined);
+        }
+        return true;
+      },
+    );
+    assert.equal(fetches, 1);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("rejects a session change after token acquisition before submitting", async () => {
+  let current = true;
+  let fetches = 0;
+  const tokenProvider = Object.assign(
+    async () => {
+      current = false;
+      return "token";
+    },
+    {
+      assertCurrentUser: () => {
+        if (!current) {
+          throw new AuthApiError("unauthenticated", "authentication-changed");
+        }
+      },
+    },
+  );
+  await assert.rejects(
+    withdrawEventPrizeViaApi(
+      eventId,
+      prizeId,
+      recipientAddress,
+      tokenProvider,
+      {
+        fetcher: async () => {
+          fetches++;
+          return jsonResponse(completed);
+        },
+      },
+    ),
+    (error) =>
+      error instanceof EventPrizeWithdrawalApiError &&
+      error.code === "unauthenticated" &&
+      error.message === "authentication-changed",
+  );
+  assert.equal(fetches, 0);
 });
 
 test("rejects a response after the authenticated user changes", async () => {

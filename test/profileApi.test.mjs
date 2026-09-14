@@ -24,6 +24,7 @@ const {
   readLeaderboardViaApi,
   updateProfileCustomizationViaApi,
 } = await import("../src/services/profileApi.ts");
+const { AuthApiError } = await import("../src/services/authApi.ts");
 const {
   getProfileFallbackEmojiId,
   isLeaderboardReadRequest,
@@ -282,6 +283,56 @@ test("refreshes once after 401 and preserves missing-login compatibility", async
       error.code === "not-found" &&
       error.message === "Profile not found",
   );
+});
+
+test("serializes profile edits after each token and retains keepalive", async () => {
+  const request = { field: "profileMons", value: "1,2" };
+  const calls = [];
+  const refreshes = [];
+  globalThis.fetch = async (_input, init) => {
+    calls.push({ body: JSON.parse(init.body), keepalive: init.keepalive });
+    return calls.length === 1
+      ? jsonResponse({ ok: false }, 401)
+      : jsonResponse({ ok: true });
+  };
+
+  await updateProfileCustomizationViaApi(request, async (forceRefresh) => {
+    refreshes.push(forceRefresh);
+    request.value = forceRefresh ? "3,4" : "2,3";
+    return "token";
+  });
+
+  assert.deepEqual(refreshes, [false, true]);
+  assert.deepEqual(calls, [
+    { body: { field: "profileMons", value: "2,3" }, keepalive: true },
+    { body: { field: "profileMons", value: "3,4" }, keepalive: true },
+  ]);
+});
+
+test("masks auth token failures as profile service errors", async () => {
+  let fetches = 0;
+  let tokenCalls = 0;
+  globalThis.fetch = async () => {
+    fetches++;
+    throw new Error("unexpected-fetch");
+  };
+
+  await assert.rejects(
+    getProfileByIdViaApi("profile-1", async () => {
+      tokenCalls++;
+      throw new AuthApiError("unauthenticated", "authentication-changed", {
+        reason: "private-session-detail",
+      });
+    }),
+    (error) =>
+      error instanceof ProfileApiError &&
+      error.name === "ProfileApiError" &&
+      error.code === "unavailable" &&
+      error.message === "Profile service is unavailable." &&
+      error.details === undefined,
+  );
+  assert.equal(tokenCalls, 1);
+  assert.equal(fetches, 0);
 });
 
 test("rejects malformed, oversized, failed, and timed-out responses", async () => {
