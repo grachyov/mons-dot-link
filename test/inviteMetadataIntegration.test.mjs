@@ -84,6 +84,8 @@ const names = [
   "confirmRematchEndFromMetadata",
   "rematchSeriesEndIsIndicated",
   "subscribeToAuthChanges",
+  "signIn",
+  "waitForInitialAuthState",
   "surrender",
   "moveDeliveryScope",
   "isCurrentMoveBoard",
@@ -620,6 +622,108 @@ function harness({
     },
   };
 }
+
+function signInHarness({ synchronousUser = null } = {}) {
+  const h = harness();
+  const creation = deferred();
+  const listeners = new Set();
+  let creates = 0;
+  let unsubscribes = 0;
+  h.instance.auth = {
+    currentUser: null,
+    authStateReady: async () => {},
+    onAuthStateChanged(listener) {
+      listeners.add(listener);
+      if (synchronousUser) h.instance.auth.currentUser = synchronousUser;
+      listener(h.instance.auth.currentUser);
+      return () => {
+        unsubscribes++;
+        listeners.delete(listener);
+      };
+    },
+    signInAnonymously() {
+      creates++;
+      return creation.promise;
+    },
+  };
+  return {
+    ...h,
+    creation,
+    listeners,
+    creates: () => creates,
+    unsubscribes: () => unsubscribes,
+    publish(user) {
+      h.instance.auth.currentUser = user;
+      for (const listener of listeners) listener(user);
+    },
+  };
+}
+
+test("sign-in waiters return a published replacement while anonymous creation is still pending", async () => {
+  for (const lateFailure of [false, true]) {
+    const h = signInHarness();
+    let result = "pending";
+    const signingIn = h.instance.signIn().then((uid) => {
+      result = uid;
+      return uid;
+    });
+    try {
+      await settle();
+      assert.equal(h.creates(), 1);
+      assert.equal(h.listeners.size, 1);
+      assert.equal(result, "pending");
+      h.publish({ uid: "replacement" });
+      await settle();
+      assert.equal(result, "replacement");
+      assert.equal(await signingIn, "replacement");
+      assert.equal(h.listeners.size, 0);
+      assert.equal(h.unsubscribes(), 1);
+      if (lateFailure)
+        h.creation.reject(new Error("old-anonymous-create-failed"));
+      else h.creation.resolve();
+      await settle();
+      assert.equal(result, "replacement");
+      assert.deepEqual(h.events.errors, []);
+    } finally {
+      h.creation.resolve();
+      await signingIn;
+    }
+  }
+});
+
+test("a failed anonymous creation without a published user releases the sign-in listener", async () => {
+  const h = signInHarness();
+  const signingIn = h.instance.signIn();
+  await settle();
+  assert.equal(h.listeners.size, 1);
+  h.creation.reject(new Error("anonymous-create-unavailable"));
+  assert.equal(await signingIn, undefined);
+  assert.equal(h.listeners.size, 0);
+  assert.equal(h.unsubscribes(), 1);
+  assert.equal(h.events.errors.length, 1);
+  assert.match(h.events.errors[0][1].message, /anonymous-create-unavailable/);
+});
+
+test("a synchronous auth notification also releases the sign-in listener", async () => {
+  const h = signInHarness({ synchronousUser: { uid: "replacement" } });
+  let result = "pending";
+  const signingIn = h.instance.signIn().then((uid) => {
+    result = uid;
+    return uid;
+  });
+  try {
+    await settle();
+    assert.equal(result, "replacement");
+    assert.equal(h.listeners.size, 0);
+    assert.equal(h.unsubscribes(), 1);
+    h.creation.resolve();
+    assert.equal(await signingIn, "replacement");
+    assert.deepEqual(h.events.errors, []);
+  } finally {
+    h.creation.resolve();
+    await signingIn;
+  }
+});
 
 test("game bootstrap preserves linked-login actors and recovers before independent wagers", async () => {
   const wagers = { invite: { agreed: { count: 3 } } };

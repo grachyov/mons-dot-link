@@ -1262,7 +1262,17 @@ class Connection {
       if (this.auth.currentUser && this.auth.currentUser.uid) {
         return this.auth.currentUser.uid;
       }
-      await this.auth.signInAnonymously();
+      let unsubscribe = () => {};
+      const userAvailable = new Promise<void>((resolve) => {
+        unsubscribe = this.auth.onAuthStateChanged((user) => {
+          if (user?.uid) resolve();
+        });
+      });
+      try {
+        await Promise.race([this.auth.signInAnonymously(), userAvailable]);
+      } finally {
+        unsubscribe();
+      }
       const uid = this.auth.currentUser?.uid;
       return uid;
     } catch (error) {

@@ -33,10 +33,16 @@ export type SessionUser = {
   getIdToken: (forceRefresh?: boolean) => Promise<string>;
 };
 
+export type InitialGameSessionOwner = Pick<
+  SessionUser,
+  "sessionId" | "generation"
+>;
+
 type InitialGameIntent = {
   inviteId: string;
   signal: AbortSignal;
   selectionForUid: (uid: string) => SessionBootstrapTarget["selection"];
+  onSessionBound?: (owner: InitialGameSessionOwner) => void;
   target: SessionBootstrapTarget | null;
   generation: string | null;
   sessionId: string | null;
@@ -242,6 +248,7 @@ export class SessionAuth {
     options: {
       selectionForUid: InitialGameIntent["selectionForUid"];
       signal: AbortSignal;
+      onSessionBound?: InitialGameIntent["onSessionBound"];
     },
   ): Promise<InitialGameSession> {
     const intent: InitialGameIntent = {
@@ -268,14 +275,29 @@ export class SessionAuth {
     options.signal.addEventListener("abort", cancel, { once: true });
     const run = async (): Promise<InitialGameSession> => {
       await this.authStateReady();
+      if (
+        this.state?.session &&
+        !this.bindInitialGameSession(
+          intent,
+          this.state.session,
+          this.state.generation,
+        )
+      )
+        throw this.changed();
       if (!this.currentUser) await this.signInAnonymously();
       const user = this.currentUser;
-      if (!user) throw this.changed();
+      if (!user || !this.bindInitialGameSession(intent, user, user.generation))
+        throw this.changed();
       await user.getIdToken();
       this.assertUser(user);
       if (options.signal.aborted)
         throw new Error("initial-game-bootstrap-canceled");
-      if (intent.user && intent.user !== user) throw this.changed();
+      if (
+        intent.sessionId !== user.sessionId ||
+        intent.generation !== user.generation ||
+        (intent.user && intent.user !== user)
+      )
+        throw this.changed();
       const selection = options.selectionForUid(user.uid);
       return {
         user,
@@ -293,6 +315,24 @@ export class SessionAuth {
     });
   }
 
+  private bindInitialGameSession(
+    intent: InitialGameIntent,
+    session: Pick<StoredSession, "sessionId">,
+    generation: string,
+  ): boolean {
+    if (this.initialGameIntent !== intent || intent.signal.aborted)
+      return false;
+    if (intent.sessionId !== null)
+      return (
+        intent.sessionId === session.sessionId &&
+        intent.generation === generation
+      );
+    intent.sessionId = session.sessionId;
+    intent.generation = generation;
+    intent.onSessionBound?.({ sessionId: session.sessionId, generation });
+    return this.initialGameIntent === intent && !intent.signal.aborted;
+  }
+
   private claimInitialGame(
     session: StoredSession,
     generation: string,
@@ -300,7 +340,7 @@ export class SessionAuth {
     const intent = this.initialGameIntent;
     if (
       !intent ||
-      intent.signal.aborted ||
+      !this.bindInitialGameSession(intent, session, generation) ||
       intent.target ||
       (this.access &&
         this.access.accessDeadlineMs >
@@ -320,8 +360,6 @@ export class SessionAuth {
       return null;
     }
     intent.target = target;
-    intent.generation = generation;
-    intent.sessionId = session.sessionId;
     return intent;
   }
 

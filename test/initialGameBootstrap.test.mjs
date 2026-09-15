@@ -16,6 +16,7 @@ registerHooks({
 
 const { createInitialGameBootstrap, getInitialGameBootstrapSelection } =
   await import("../src/services/initialGameBootstrap.ts");
+const { SessionAuth } = await import("../src/session/sessionAuth.ts");
 const { readPendingRematchEnd, rematchEndDeliveryStorageKey } =
   await import("../src/connection/rematchEndDelivery.ts");
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -66,6 +67,10 @@ function fixture({
     async prepareInitialGame(inviteId, options) {
       preparations.push({ inviteId, options });
       if (!auth.currentUser) await auth.signInAnonymously();
+      options.onSessionBound?.({
+        sessionId: auth.currentUser.sessionId,
+        generation: auth.currentUser.generation,
+      });
       return {
         user: auth.currentUser,
         selection: options.selectionForUid(auth.currentUser.uid),
@@ -118,6 +123,214 @@ function fixture({
   };
 }
 
+function anonymousSessionFixture() {
+  const uid = "a".repeat(28);
+  const originalSessionId = crypto.randomUUID();
+  const requested = deferred();
+  const responseGate = deferred();
+  const inlineGame = { ok: true, schemaVersion: 1 };
+  let state = {
+    initialized: true,
+    generation: crypto.randomUUID(),
+    revision: 1,
+    revocations: [],
+    session: null,
+  };
+  const creates = [];
+  const refreshes = [];
+  const reads = [];
+  const preparations = [];
+  const token = (session) => ({
+    ok: true,
+    uid: session.uid,
+    sessionId: session.sessionId,
+    accessToken: `token-${session.sessionId}`,
+    accessExpiresAtMs: 1_300_000,
+    accessDeadlineMs: 1_300_000,
+  });
+  const auth = new SessionAuth({
+    store: {
+      async update(change) {
+        state = structuredClone(change(structuredClone(state)));
+        return state;
+      },
+    },
+    api: {
+      async create(session, target) {
+        creates.push({ sessionId: session.sessionId, target });
+        requested.resolve();
+        await responseGate.promise;
+        return {
+          ...token({ ...session, uid }),
+          ...(target
+            ? { gameBootstrap: { ...target, result: inlineGame } }
+            : {}),
+        };
+      },
+      async refresh(session, target) {
+        refreshes.push({ sessionId: session.sessionId, target });
+        return token(session);
+      },
+      async revoke() {},
+    },
+    now: () => 1_000_000,
+    createSession: () => ({
+      sessionId: originalSessionId,
+      uid: null,
+      refreshSecret: "refresh",
+      revokeSecret: "revoke",
+    }),
+    newGeneration: () => crypto.randomUUID(),
+  });
+  const prepare = auth.prepareInitialGame.bind(auth);
+  auth.prepareInitialGame = (inviteId, options) => {
+    preparations.push(options);
+    return prepare(inviteId, options);
+  };
+  const bootstrap = createInitialGameBootstrap({
+    auth,
+    route: invite,
+    subscribeRoute: () => () => {},
+    selection: () => "current",
+    async read(inviteId, tokenProvider) {
+      reads.push({ inviteId, token: await tokenProvider(false) });
+      return inlineGame;
+    },
+  });
+  return {
+    auth,
+    bootstrap,
+    requested,
+    responseGate,
+    creates,
+    refreshes,
+    reads,
+    preparations,
+    inlineGame,
+    uid,
+    start: () => bootstrap.start(invite()),
+    async replace(nextUid, pendingFirst = false) {
+      state = {
+        ...state,
+        generation: crypto.randomUUID(),
+        revision: state.revision + 1,
+        session: {
+          ...state.session,
+          sessionId: crypto.randomUUID(),
+          uid: pendingFirst ? null : nextUid,
+        },
+      };
+      await auth.reconcile();
+      if (pendingFirst) {
+        assert.equal(auth.currentUser, null);
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          session: { ...state.session, uid: nextUid },
+        };
+        await auth.reconcile();
+      }
+      return auth.currentUser;
+    },
+  };
+}
+
+test("a fresh anonymous inline game is adoptable as its first user is published", async () => {
+  const h = anonymousSessionFixture();
+  let taken;
+  const unsubscribe = h.auth.onAuthStateChanged((user) => {
+    if (user) taken = h.bootstrap.take("match-a", user);
+  });
+  try {
+    h.start();
+    await h.requested.promise;
+    assert.equal(h.auth.currentUser, null);
+    h.responseGate.resolve();
+    await flush();
+    assert.ok(taken);
+    assert.equal(await taken.promise, h.inlineGame);
+    assert.equal(h.bootstrap.take("match-a", h.auth.currentUser), null);
+    assert.equal(h.creates.length, 1);
+    assert.deepEqual(h.creates[0].target, {
+      inviteId: "match-a",
+      selection: "current",
+    });
+    assert.equal(h.refreshes.length, 0);
+    assert.equal(h.reads.length, 0);
+  } finally {
+    unsubscribe();
+    h.responseGate.resolve();
+    await flush();
+  }
+});
+
+for (const joinedExistingCreation of [false, true]) {
+  test(`the first replacement user cannot adopt ${joinedExistingCreation ? "an already-dispatched" : "a combined"} anonymous creation`, async () => {
+    for (const sameUid of [false, true]) {
+      for (const lateFailure of [false, true]) {
+        const h = anonymousSessionFixture();
+        let creation;
+        if (joinedExistingCreation) {
+          creation = h.auth.signInAnonymously();
+          void creation.catch(() => undefined);
+          await h.requested.promise;
+        }
+        h.start();
+        try {
+          await h.requested.promise;
+          await flush();
+          assert.equal(h.auth.currentUser, null);
+          const replacement = await h.replace(
+            sameUid ? h.uid : "b".repeat(28),
+            sameUid,
+          );
+          const taken = h.bootstrap.take("match-a", replacement);
+          void taken?.promise.catch(() => undefined);
+          assert.equal(taken, null);
+          assert.equal(h.preparations[0].signal.aborted, true);
+          const replacementToken = await replacement.getIdToken();
+          assert.equal(replacementToken, `token-${replacement.sessionId}`);
+          assert.deepEqual(h.refreshes, [
+            { sessionId: replacement.sessionId, target: undefined },
+          ]);
+          if (lateFailure)
+            h.responseGate.reject(new Error("old-session-unavailable"));
+          else h.responseGate.resolve();
+          await creation?.catch(() => undefined);
+          await flush();
+          assert.equal(h.auth.currentUser, replacement);
+          assert.equal(await replacement.getIdToken(), replacementToken);
+          assert.equal(h.creates.length, 1);
+          assert.equal(h.refreshes.length, 1);
+          assert.equal(h.reads.length, 0);
+          assert.equal(h.bootstrap.take("match-a", replacement), null);
+        } finally {
+          h.responseGate.resolve();
+          await creation?.catch(() => undefined);
+          await flush();
+        }
+      }
+    }
+  });
+}
+
+test("adoption checks a bound anonymous owner even without an auth notification", async () => {
+  const h = fixture({ anonymous: true, combined: true });
+  h.auth.prepareInitialGame = (_inviteId, options) => {
+    options.onSessionBound?.({
+      sessionId: h.user.sessionId,
+      generation: h.user.generation,
+    });
+    return h.response.promise;
+  };
+  h.start();
+  h.auth.currentUser = { ...h.user, sessionId: "replacement" };
+  assert.equal(h.bootstrap.take("match-a", h.auth.currentUser), null);
+  h.response.resolve({ user: h.user, selection: "current", bootstrap: null });
+  await flush();
+  assert.equal(h.requests.length, 0);
+});
+
 test("initial request starts independently and is adopted exactly once, before or after response", async () => {
   for (const completedFirst of [false, true]) {
     const h = fixture();
@@ -157,6 +370,128 @@ test("combined session results are adopted once without a separate game read", a
     assert.equal(await taken.promise, value);
     assert.equal(h.bootstrap.take("match-a", h.user), null);
     assert.equal(h.requests.length, 0);
+  }
+});
+
+test("an already-restored user owns the pending combined request before adoption", async () => {
+  const h = fixture({ combined: true });
+  h.start();
+  h.changeUser({ ...h.user, generation: "replacement" });
+  assert.equal(h.bootstrap.take("match-a", h.auth.currentUser), null);
+  assert.equal(h.preparations[0].options.signal.aborted, true);
+  h.response.resolve({ ok: true });
+  await flush();
+  assert.equal(h.requests.length, 0);
+});
+
+test("session replacement during restoration cannot adopt the previous user's combined request", async () => {
+  for (const sameUid of [false, true]) {
+    const uid = "a".repeat(28);
+    const sessionId = crypto.randomUUID();
+    let state = {
+      initialized: true,
+      generation: crypto.randomUUID(),
+      revision: 1,
+      revocations: [],
+      session: {
+        sessionId,
+        uid,
+        refreshSecret: "refresh",
+        revokeSecret: "revoke",
+      },
+    };
+    const requested = deferred();
+    const response = deferred();
+    const refreshes = [];
+    const auth = new SessionAuth({
+      store: {
+        async update(change) {
+          state = structuredClone(change(structuredClone(state)));
+          return state;
+        },
+      },
+      api: {
+        async create() {
+          throw new Error("unexpected-create");
+        },
+        async refresh(session, target) {
+          refreshes.push({ sessionId: session.sessionId, target });
+          if (session.sessionId === sessionId) {
+            requested.resolve();
+            await response.promise;
+          }
+          return {
+            ok: true,
+            uid: session.uid,
+            sessionId: session.sessionId,
+            accessToken: `token-${session.sessionId}`,
+            accessExpiresAtMs: 1_300_000,
+            accessDeadlineMs: 1_300_000,
+            ...(target
+              ? {
+                  gameBootstrap: {
+                    ...target,
+                    result: { ok: false, status: 404 },
+                  },
+                }
+              : {}),
+          };
+        },
+        async revoke() {},
+      },
+      now: () => 1_000_000,
+      createSession: () => {
+        throw new Error("unexpected-create");
+      },
+      newGeneration: () => crypto.randomUUID(),
+    });
+    const bootstrap = createInitialGameBootstrap({
+      auth,
+      route: invite,
+      subscribeRoute: () => () => {},
+      selection: () => "current",
+      read: async () => {
+        throw new Error("unexpected-old-game-read");
+      },
+    });
+    bootstrap.start(invite());
+    try {
+      await requested.promise;
+      const previous = auth.currentUser;
+      state = {
+        ...state,
+        generation: crypto.randomUUID(),
+        revision: state.revision + 1,
+        session: {
+          ...state.session,
+          sessionId: crypto.randomUUID(),
+          uid: sameUid ? uid : "b".repeat(28),
+        },
+      };
+      await auth.reconcile();
+      const replacement = auth.currentUser;
+      assert.notEqual(replacement, previous);
+      const taken = bootstrap.take("match-a", replacement);
+      void taken?.promise.catch(() => undefined);
+      assert.equal(taken, null);
+      assert.equal(
+        await replacement.getIdToken(),
+        `token-${replacement.sessionId}`,
+      );
+      assert.equal(refreshes.length, 2);
+      assert.equal(refreshes[1].target, undefined);
+      response.resolve();
+      await flush();
+      assert.equal(auth.currentUser, replacement);
+      assert.equal(
+        await replacement.getIdToken(),
+        `token-${replacement.sessionId}`,
+      );
+      assert.equal(refreshes.length, 2);
+    } finally {
+      response.resolve();
+      await flush();
+    }
   }
 });
 

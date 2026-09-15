@@ -138,6 +138,10 @@ async function fixture(
     healthyCoreSockets = false,
     sessionMode = "fresh",
     sessionBootstrapResult = "success",
+    holdSessionBootstrap = false,
+    initialSessionUid = spectator ? "s".repeat(28) : hostId,
+    initialSessionStatus = 200,
+    initialSessionGame,
   } = {},
 ) {
   const currentMetadata = {
@@ -166,6 +170,9 @@ async function fixture(
   });
   const assetsGate = deferred();
   const bootstrapGate = deferred();
+  const sessionBootstrapGate = holdSessionBootstrap
+    ? deferred()
+    : bootstrapGate;
   const extrasGate = deferred();
   const bootstrapRequested = deferred();
   const selectedAssetsRequested = deferred();
@@ -176,6 +183,7 @@ async function fixture(
   const resources = [];
   const pageErrors = [];
   const sessions = new Set();
+  const sessionUids = new Map();
   let closed = false;
   if (!holdAssets) assetsGate.resolve();
   if (!holdBootstrap) bootstrapGate.resolve();
@@ -230,6 +238,7 @@ async function fixture(
         at: Date.now(),
       });
       let body;
+      let status;
       if (
         url.pathname === "/auth/session/anonymous" ||
         url.pathname === "/auth/session/refresh"
@@ -240,33 +249,41 @@ async function fixture(
             : request.headers().authorization.split(".")[1];
         if (url.pathname === "/auth/session/anonymous") sessions.add(sessionId);
         assert.ok(sessions.has(sessionId));
+        const uid = sessionUids.get(sessionId) ?? initialSessionUid;
         const expiresAt = Math.floor(Date.now() / 1000) + 300;
         body = {
           ok: true,
           sessionId,
-          uid: spectator ? "s".repeat(28) : hostId,
-          accessToken: `header.${Buffer.from(JSON.stringify({ iat: expiresAt - 300, exp: expiresAt })).toString("base64url")}.signature`,
+          uid,
+          accessToken: `header.${Buffer.from(JSON.stringify({ sub: uid, sid: sessionId, iat: expiresAt - 300, exp: expiresAt })).toString("base64url")}.signature`,
           accessExpiresAtMs: expiresAt * 1000,
         };
         if (url.searchParams.has("bootstrapInviteId")) {
           assert.equal(url.searchParams.get("bootstrapInviteId"), inviteId);
           assert.equal(url.searchParams.get("bootstrapSelection"), "current");
           bootstrapRequested.resolve();
-          await bootstrapGate.promise;
+          await sessionBootstrapGate.promise;
           if (sessionBootstrapResult !== "missing")
             body.gameBootstrap = {
               inviteId,
               selection: "current",
               result:
                 sessionBootstrapResult === "success"
-                  ? {
+                  ? (initialSessionGame ?? {
                       ...bootstrap,
                       metadata: currentMetadata,
                       viewer: currentViewer,
                       match: currentMatch,
                       hasPendingProposal: pendingRematch,
-                    }
+                    })
                   : sessionBootstrapResult,
+            };
+          status = initialSessionStatus;
+          if (status !== 200)
+            body = {
+              ok: false,
+              error: "unavailable",
+              message: "Old session fixture failure",
             };
         }
       } else if (url.pathname === `/invites/${inviteId}/bootstrap`) {
@@ -303,7 +320,7 @@ async function fixture(
       if (apiDelayMs) await new Promise((done) => setTimeout(done, apiDelayMs));
       if (closed) return;
       await route.fulfill({
-        status: body ? 200 : 503,
+        status: status ?? (body ? 200 : 503),
         headers,
         json: body || {
           ok: false,
@@ -367,7 +384,7 @@ async function fixture(
               transaction.onerror = () => reject(transaction.error);
             };
           }),
-        { sessionId, uid: spectator ? "s".repeat(28) : hostId },
+        { sessionId, uid: initialSessionUid },
       );
       requests.length = 0;
       resources.length = 0;
@@ -381,11 +398,16 @@ async function fixture(
       page,
       context,
       sessions,
+      registerSession(sessionId, uid) {
+        sessions.add(sessionId);
+        sessionUids.set(sessionId, uid);
+      },
       requests,
       sockets,
       resources,
       assetsGate,
       bootstrapGate,
+      sessionBootstrapGate,
       extrasGate,
       bootstrapRequested,
       selectedAssetsRequested,
@@ -397,6 +419,7 @@ async function fixture(
     closed = true;
     assetsGate.resolve();
     bootstrapGate.resolve();
+    sessionBootstrapGate.resolve();
     extrasGate.resolve();
     await browser.close();
     await server.close();
@@ -746,70 +769,229 @@ test(
   },
 );
 
-test(
-  "a replaced restored session rejects the old inline game before the next navigation",
-  {
-    skip: benchmark || Boolean(process.env.MONS_LOADING_BUILD),
-    timeout: 60_000,
-  },
-  async () => {
-    await fixture(
-      async ({
-        page,
-        sessions,
-        requests,
-        bootstrapRequested,
-        bootstrapGate,
-      }) => {
-        await withinDeadline(bootstrapRequested.promise);
-        await page.waitForSelector("#monsboard");
-        const replacementId = crypto.randomUUID();
-        sessions.add(replacementId);
-        await page.evaluate(async (replacementId) => {
-          const { sessionAuth } = await import("/src/session/sessionAuth.ts");
-          const previous = sessionAuth.currentUser;
-          await sessionAuth.dependencies.store.update((state) => ({
-            ...state,
-            revision: state.revision + 1,
-            generation: crypto.randomUUID(),
-            session: { ...state.session, sessionId: replacementId },
-          }));
-          await sessionAuth.reconcile();
-          if (sessionAuth.currentUser === previous)
-            throw new Error("session-object-was-not-replaced");
-          globalThis.loadingSessionAuth = sessionAuth;
-        }, replacementId);
-        const completed = page.waitForResponse((response) => {
-          const url = new URL(response.url());
-          return (
-            url.pathname === "/auth/session/refresh" &&
-            url.searchParams.has("bootstrapInviteId")
-          );
-        });
-        bootstrapGate.resolve();
-        await (await completed).finished();
-        await page.evaluate(async () => {
-          await globalThis.loadingSessionAuth.currentUser.getIdToken();
-          await new Promise(requestAnimationFrame);
-        });
-        const active = await page.evaluate(async () => {
-          const { connection } = await import("/src/connection/connection.ts");
-          return connection.getActiveContextSnapshot();
-        });
-        assert.equal(active, null);
-        assert.equal(await page.locator("#itemsLayer .item").count(), 0);
-        await navigateWithinApp(page, "/");
-        await navigateWithinApp(page, `/${inviteId}`);
-        await assertBoardAcceptsInput(page);
-        assert.equal(
-          requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
-          1,
-        );
-      },
-      { holdBootstrap: true, sessionMode: "restored" },
+async function readReplacementState(page) {
+  return page.evaluate(async () => {
+    const { sessionAuth } = await import("/src/session/sessionAuth.ts");
+    const { connection } = await import("/src/connection/connection.ts");
+    const { getMainGameLoadState } =
+      await import("/src/game/mainGameLoadState.ts");
+    const token = await sessionAuth.currentUser.getIdToken();
+    const claims = JSON.parse(
+      atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")),
     );
+    return {
+      sessionId: sessionAuth.currentUser.sessionId,
+      uid: sessionAuth.currentUser.uid,
+      tokenSessionId: claims.sid,
+      context: connection.getActiveContextSnapshot(),
+      loginUid: connection.activeContext?.loginUid,
+      actorUid: connection.activeContext?.actorUid,
+      color: connection.myMatch?.color,
+      fen: connection.myMatch?.fen,
+      canPlay: getMainGameLoadState().canPlay,
+    };
+  });
+}
+
+for (const {
+  name,
+  sessionMode,
+  initialSessionStatus,
+  uiReadyBeforeReplacement = false,
+} of [
+  {
+    name: "a session replaced before board assets load fetches its own game",
+    sessionMode: "restored",
+    initialSessionStatus: 200,
   },
-);
+  {
+    name: "a fresh anonymous session replacement stays playable after the old create succeeds",
+    sessionMode: "fresh",
+    initialSessionStatus: 200,
+  },
+  {
+    name: "a fresh anonymous session replacement stays playable after the old create fails",
+    sessionMode: "fresh",
+    initialSessionStatus: 503,
+  },
+  {
+    name: "an initialized UI keeps an anonymous session replacement playable after the old create succeeds",
+    sessionMode: "fresh",
+    initialSessionStatus: 200,
+    uiReadyBeforeReplacement: true,
+  },
+  {
+    name: "an initialized UI keeps an anonymous session replacement playable after the old create fails",
+    sessionMode: "fresh",
+    initialSessionStatus: 503,
+    uiReadyBeforeReplacement: true,
+  },
+]) {
+  test(
+    name,
+    {
+      skip: benchmark || Boolean(process.env.MONS_LOADING_BUILD),
+      timeout: 60_000,
+    },
+    async () => {
+      await fixture(
+        async ({
+          page,
+          registerSession,
+          requests,
+          bootstrapRequested,
+          bootstrapGate,
+          sessionBootstrapGate,
+          selectedAssetsRequested,
+          assetsGate,
+        }) => {
+          await withinDeadline(
+            Promise.all([
+              bootstrapRequested.promise,
+              selectedAssetsRequested.promise,
+            ]),
+          );
+          assert.equal(await page.locator("#monsboard").count(), 0);
+          if (uiReadyBeforeReplacement) {
+            assetsGate.resolve();
+            await page.waitForFunction(
+              () =>
+                performance.getEntriesByName("main-game:route-prepared")
+                  .length > 0,
+            );
+            assert.equal(await page.locator("#monsboard").count(), 1);
+            assert.equal(await page.locator("#itemsLayer .item").count(), 0);
+            assert.equal(
+              requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
+              0,
+            );
+          }
+          const replacementId = crypto.randomUUID();
+          registerSession(replacementId, hostId);
+          const replacementRead = page.waitForRequest(
+            (request) =>
+              request.method() === "GET" &&
+              new URL(request.url()).pathname ===
+                `/invites/${inviteId}/bootstrap`,
+          );
+          await page.evaluate(
+            async ({ replacementId, uid, sessionMode }) => {
+              const { sessionAuth } =
+                await import("/src/session/sessionAuth.ts");
+              const previous = sessionAuth.currentUser;
+              if (sessionMode === "fresh" && previous !== null)
+                throw new Error(
+                  "anonymous-user-published-before-create-response",
+                );
+              const originalRequest =
+                sessionMode === "fresh"
+                  ? sessionAuth.signingIn
+                  : sessionAuth.refreshing?.promise;
+              if (!originalRequest)
+                throw new Error("original-session-request-missing");
+              globalThis.oldSessionRequestSettled = false;
+              const settled = () => {
+                globalThis.oldSessionRequestSettled = true;
+              };
+              void originalRequest.then(settled, settled);
+              await sessionAuth.dependencies.store.update((state) => ({
+                ...state,
+                revision: state.revision + 1,
+                generation: crypto.randomUUID(),
+                session: {
+                  sessionId: replacementId,
+                  uid,
+                  refreshSecret: "c".repeat(42) + "A",
+                  revokeSecret: "d".repeat(42) + "A",
+                },
+              }));
+              await sessionAuth.reconcile();
+              if (sessionAuth.currentUser === previous)
+                throw new Error("session-object-was-not-replaced");
+            },
+            { replacementId, uid: hostId, sessionMode },
+          );
+          assetsGate.resolve();
+          const request = await replacementRead;
+          const claims = JSON.parse(
+            Buffer.from(
+              request.headers().authorization.split(".")[1],
+              "base64url",
+            ),
+          );
+          assert.equal(claims.sid, replacementId);
+          assert.equal(claims.sub, hostId);
+          bootstrapGate.resolve();
+          await assertBoardAcceptsInput(page);
+          const before = await readReplacementState(page);
+          assert.equal(before.sessionId, replacementId);
+          assert.equal(before.tokenSessionId, replacementId);
+          assert.equal(before.uid, hostId);
+          assert.equal(before.loginUid, hostId);
+          assert.equal(before.actorUid, hostId);
+          assert.equal(before.context.canWrite, true);
+          assert.equal(before.color, "white");
+          assert.equal(before.fen, fen);
+          assert.equal(before.canPlay, true);
+          assert.equal(
+            await page.evaluate(() => globalThis.oldSessionRequestSettled),
+            false,
+          );
+          const completed = page.waitForResponse((response) => {
+            const url = new URL(response.url());
+            return (
+              url.pathname ===
+                `/auth/session/${sessionMode === "fresh" ? "anonymous" : "refresh"}` &&
+              url.searchParams.has("bootstrapInviteId")
+            );
+          });
+          sessionBootstrapGate.resolve();
+          const oldResponse = await completed;
+          assert.equal(oldResponse.status(), initialSessionStatus);
+          await page.waitForFunction(
+            () => globalThis.oldSessionRequestSettled === true,
+          );
+          assert.deepEqual(await readReplacementState(page), before);
+          await page.evaluate(async () => {
+            const { didClickOutsideBoard } =
+              await import("/src/game/gameController.ts");
+            didClickOutsideBoard();
+          });
+          assert.equal(await page.locator("#highlightsLayer > *").count(), 0);
+          await assertBoardAcceptsInput(page);
+          assert.equal(
+            requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
+            1,
+          );
+          assert.equal(
+            requests.filter(({ path }) => path.startsWith("/auth/session/"))
+              .length,
+            2,
+          );
+        },
+        {
+          holdBootstrap: true,
+          holdSessionBootstrap: true,
+          holdAssets: true,
+          sessionMode,
+          initialSessionUid: sessionMode === "fresh" ? guestId : hostId,
+          initialSessionStatus,
+          initialSessionGame:
+            sessionMode === "fresh"
+              ? {
+                  ...bootstrap,
+                  viewer: {
+                    role: "guest",
+                    actorUid: guestId,
+                    automatchOperationId: null,
+                  },
+                }
+              : undefined,
+        },
+      );
+    },
+  );
+}
 
 test(
   "production loading benchmark",

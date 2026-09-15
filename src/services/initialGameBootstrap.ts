@@ -7,6 +7,7 @@ import {
 } from "../navigation/routeState";
 import {
   sessionAuth,
+  type InitialGameSessionOwner,
   type SessionAuth,
   type SessionUser,
 } from "../session/sessionAuth";
@@ -42,6 +43,7 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
         inviteId: string;
         user: SessionUser | null;
         selection: Selection | null;
+        isOwnedBy: (user: SessionUser) => boolean;
         cleanup: () => void;
       })
     | null = null;
@@ -67,9 +69,17 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
       }
       const inviteId = route.inviteId;
       const controller = new AbortController();
+      let owner: InitialGameSessionOwner | null = null;
+      const isOwnedBy = (user: SessionUser) =>
+        owner === null ||
+        (owner.sessionId === user.sessionId &&
+          owner.generation === user.generation);
       const preparation = dependencies.auth.prepareInitialGame(inviteId, {
         selectionForUid: (uid) => dependencies.selection(inviteId, { uid }),
         signal: controller.signal,
+        onSessionBound: (session) => {
+          owner ??= session;
+        },
       });
       let explicitGameError = false;
       let unsubscribeAuth = () => {};
@@ -87,8 +97,9 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
         target.mode === "invite" && target.inviteId === inviteId;
       const request: NonNullable<typeof initial> = {
         inviteId,
-        user: null,
+        user: dependencies.auth.currentUser,
         selection: null,
+        isOwnedBy,
         abort,
         cleanup,
         promise: preparation
@@ -99,6 +110,8 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
             ) {
               throw new Error("initial-game-bootstrap-canceled");
             }
+            if (!isOwnedBy(user))
+              throw new Error("initial-game-bootstrap-changed");
             request.user = user;
             request.selection = selection;
             const tokenProvider = createUserBoundAuthTokenProvider(
@@ -136,7 +149,12 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
       };
       initial = request;
       unsubscribeAuth = dependencies.auth.onAuthStateChanged((user) => {
-        if (request.user && user !== request.user) abort();
+        if (
+          (request.user && user !== request.user) ||
+          (user && !isOwnedBy(user))
+        )
+          abort();
+        else request.user = user;
       });
       unsubscribeRoute = dependencies.subscribeRoute((target) => {
         if (!matchesRoute(target)) abort();
@@ -155,6 +173,7 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
       if (
         request.inviteId !== inviteId ||
         dependencies.auth.currentUser !== user ||
+        !request.isOwnedBy(user) ||
         (request.user !== null && request.user !== user) ||
         selected !== selection ||
         dependencies.route().mode !== "invite" ||
@@ -168,7 +187,7 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
       return {
         abort: request.abort,
         promise: request.promise.then((result) => {
-          if (request.user !== user) {
+          if (request.user !== user || !request.isOwnedBy(user)) {
             throw new Error("initial-game-bootstrap-changed");
           }
           if (request.selection !== selection)
