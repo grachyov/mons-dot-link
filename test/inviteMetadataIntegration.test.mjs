@@ -729,6 +729,75 @@ test("prefetched bootstrap is reused only while no matching move recovery has st
   }
 });
 
+test("selection drift after adopting the initial request refetches once with the current choice", async () => {
+  for (const original of ["current", "approved"]) {
+    const pending = deferred();
+    let pendingEnd = original === "approved";
+    let adoptions = 0;
+    const h = harness({
+      initial: response(snapshot({ hostRematches: "1" })),
+      takeBootstrap: () => {
+        adoptions++;
+        return { promise: pending.promise, abort: () => {} };
+      },
+    });
+    h.instance.isRematchEndPending = () => pendingEnd;
+    h.instance.connectToGame("login", "invite", false);
+    await settle();
+    pendingEnd = !pendingEnd;
+    pending.reject(
+      new GameBootstrapApiError("initial-game-bootstrap-selection-changed"),
+    );
+    await settle();
+    assert.deepEqual(h.events.errors, []);
+    assert.equal(adoptions, 1);
+    assert.equal(h.events.bootstrapReads.length, 1);
+    assert.equal(
+      h.events.bootstrapReads[0].selection,
+      pendingEnd ? "approved" : "current",
+    );
+    assert.equal(
+      h.instance.activeContext.matchId,
+      pendingEnd ? "invite" : "invite1",
+    );
+    h.instance.detachFromMatchSession();
+  }
+});
+
+test("explicit adopted game failures do not trigger selection recovery reads", async () => {
+  for (const status of [404, 429]) {
+    const pending = deferred();
+    const h = harness({
+      takeBootstrap: () => ({ promise: pending.promise, abort: () => {} }),
+    });
+    h.instance.connectToGame("login", "invite", false);
+    pending.reject(new GameBootstrapApiError(`http-${status}`, status));
+    await settle();
+    assert.equal(h.events.bootstrapReads.length, 0);
+    assert.equal(h.instance.activeContext, null);
+    assert.ok(
+      h.events.ui.includes(status === 404 ? "not-found" : "load-failed"),
+    );
+  }
+});
+
+test("a selection change from a canceled initial attempt cannot read or install a game", async () => {
+  const pending = deferred();
+  const h = harness({
+    takeBootstrap: () => ({ promise: pending.promise, abort: () => {} }),
+  });
+  h.instance.connectToGame("login", "invite", false);
+  h.instance.detachFromMatchSession();
+  pending.reject(
+    new GameBootstrapApiError("initial-game-bootstrap-selection-changed"),
+  );
+  await settle();
+  assert.deepEqual(h.events.errors, []);
+  assert.equal(h.events.bootstrapReads.length, 0);
+  assert.equal(h.events.observed.length, 0);
+  assert.equal(h.instance.activeContext, null);
+});
+
 test("a loaded game remains available while wagers are unknown and rejects wager writes", async () => {
   const pending = deferred();
   const h = harness({ readWagers: () => pending.promise });

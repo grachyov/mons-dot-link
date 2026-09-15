@@ -40,6 +40,7 @@ function fixture({
   mode = "invite",
   selection = "current",
   anonymous = false,
+  combined = false,
 } = {}) {
   const response = deferred();
   const user = {
@@ -53,6 +54,7 @@ function fixture({
   let route =
     mode === "invite" ? invite() : { ...invite(), mode, inviteId: null };
   const requests = [];
+  const preparations = [];
   let anonymousStarts = 0;
   const auth = {
     currentUser: anonymous ? null : user,
@@ -60,6 +62,15 @@ function fixture({
     signInAnonymously: async () => {
       anonymousStarts += 1;
       auth.currentUser = user;
+    },
+    async prepareInitialGame(inviteId, options) {
+      preparations.push({ inviteId, options });
+      if (!auth.currentUser) await auth.signInAnonymously();
+      return {
+        user: auth.currentUser,
+        selection: options.selectionForUid(auth.currentUser.uid),
+        bootstrap: combined ? await response.promise : null,
+      };
     },
     onAuthStateChanged(listener) {
       authListeners.add(listener);
@@ -86,12 +97,16 @@ function fixture({
     user,
     auth,
     requests,
+    preparations,
     routeListeners,
     authListeners,
     start() {
       bootstrap.start(route);
     },
     anonymousStarts: () => anonymousStarts,
+    setSelection(next) {
+      selection = next;
+    },
     navigate(next) {
       route = next;
       routeListeners.forEach((listener) => listener(route));
@@ -124,6 +139,87 @@ test("initial request starts independently and is adopted exactly once, before o
     assert.equal(await taken.promise, value);
     assert.equal(h.requests.length, 1);
   }
+});
+
+test("combined session results are adopted once without a separate game read", async () => {
+  for (const completedFirst of [false, true]) {
+    const h = fixture({ combined: true });
+    h.start();
+    assert.equal(h.preparations.length, 1);
+    const value = { ok: true, schemaVersion: 1 };
+    if (completedFirst) {
+      h.response.resolve(value);
+      await flush();
+    }
+    const taken = h.bootstrap.take("match-a", h.user);
+    assert.ok(taken);
+    h.response.resolve(value);
+    assert.equal(await taken.promise, value);
+    assert.equal(h.bootstrap.take("match-a", h.user), null);
+    assert.equal(h.requests.length, 0);
+  }
+});
+
+test("selection changes after early adoption are distinguished from authentication changes", async () => {
+  for (const original of ["current", "approved"]) {
+    const latest = original === "current" ? "approved" : "current";
+    const h = fixture({ selection: original });
+    const preparation = deferred();
+    h.auth.prepareInitialGame = () => preparation.promise;
+    h.start();
+    const taken = h.bootstrap.take("match-a", h.user, original);
+    assert.ok(taken);
+    h.setSelection(latest);
+    const rejected = assert.rejects(taken.promise, {
+      name: "GameBootstrapApiError",
+      code: "initial-game-bootstrap-selection-changed",
+    });
+    preparation.resolve({ user: h.user, selection: latest, bootstrap: null });
+    h.response.resolve({ ok: true });
+    await rejected;
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].options.selection, latest);
+    assert.equal(h.bootstrap.take("match-a", h.user, latest), null);
+  }
+});
+
+test("explicit combined game failures remain adoptable before and after session completion", async () => {
+  for (const completedFirst of [false, true]) {
+    const h = fixture({ combined: true });
+    h.start();
+    const failure = { ok: false, status: 429, retryAfterMs: 3000 };
+    if (completedFirst) {
+      h.response.resolve(failure);
+      await flush();
+      assert.equal(h.routeListeners.size, 1);
+      assert.equal(h.authListeners.size, 1);
+    }
+    const taken = h.bootstrap.take("match-a", h.user);
+    assert.ok(taken);
+    const rejected = assert.rejects(taken.promise, {
+      name: "GameBootstrapApiError",
+      code: "http-429",
+      status: 429,
+      retryAfterMs: 3000,
+    });
+    h.response.resolve(failure);
+    await rejected;
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.bootstrap.take("match-a", h.user), null);
+    assert.equal(h.routeListeners.size, 0);
+    assert.equal(h.authListeners.size, 0);
+  }
+});
+
+test("navigation discards a combined failure before it can be adopted", async () => {
+  const h = fixture({ combined: true });
+  h.start();
+  h.navigate(invite("match-b"));
+  h.response.resolve({ ok: false, status: 404 });
+  await flush();
+  assert.equal(h.bootstrap.take("match-a", h.user), null);
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.preparations[0].options.signal.aborted, true);
 });
 
 test("completed response is discarded when leaving and returning to the initial invite", async () => {

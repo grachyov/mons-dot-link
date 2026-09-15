@@ -439,24 +439,32 @@ export function isInviteSourceRevisionConflict(error: unknown): boolean {
   );
 }
 
+export function prepareInviteSourceSnapshotRead(
+  db: Pick<D1Database, "prepare">,
+  inviteId: string,
+): D1PreparedStatement {
+  requireId(inviteId);
+  return db
+    .prepare(
+      "SELECT source_json, revision FROM invite_sources WHERE invite_id = ?",
+    )
+    .bind(inviteId);
+}
+
 export async function readInviteSourceSnapshot(
   db: D1Database,
   inviteId: string,
   signal?: AbortSignal,
 ): Promise<InviteSourceSnapshot> {
-  requireId(inviteId);
-  const row = await db
-    .withSession("first-primary")
-    .prepare(
-      "SELECT source_json, revision FROM invite_sources WHERE invite_id = ?",
-    )
-    .bind(inviteId)
-    .first<{ source_json: string; revision: number }>();
+  const row = await prepareInviteSourceSnapshotRead(
+    db.withSession("first-primary"),
+    inviteId,
+  ).first<{ source_json: string; revision: number }>();
   signal?.throwIfAborted();
   return decodeInviteSourceSnapshot(inviteId, row);
 }
 
-function decodeInviteSourceSnapshot(
+export function decodeInviteSourceSnapshot(
   inviteId: string,
   row: unknown,
 ): InviteSourceSnapshot {

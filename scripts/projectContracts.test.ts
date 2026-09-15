@@ -562,6 +562,7 @@ test("shared package preserves every direct export subpath", () => {
     "./reactions": "./reactions.js",
     "./rematches": "./rematches.js",
     "./session-auth": "./session-auth.js",
+    "./session-bootstrap": "./session-bootstrap.js",
     "./solana": "./solana.js",
     "./timers": "./timers.js",
     "./usernames": "./usernames.js",

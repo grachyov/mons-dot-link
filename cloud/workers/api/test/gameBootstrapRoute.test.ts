@@ -139,6 +139,7 @@ function setup(source = metadata(), caller = "host-login") {
   let at = 0;
   const dependencies: GameBootstrapRouteDependencies = {
     repository,
+    readAdmission: (id, signal) => repository.readInviteMetadata(id, signal),
     room,
     verifyIdentity: async (incoming) => {
       calls.auth++;

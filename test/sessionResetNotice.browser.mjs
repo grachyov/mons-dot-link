@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createServer } from "vite";
+import { createBrowserViteServer as createServer } from "./browserViteServer.mjs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MONS_PLAYWRIGHT_PATH || "playwright");

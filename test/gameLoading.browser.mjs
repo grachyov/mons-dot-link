@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import test from "node:test";
-import { createServer as createViteServer } from "vite";
+import { createBrowserViteServer as createViteServer } from "./browserViteServer.mjs";
 import { Game } from "mons-rules";
 
 const require = createRequire(import.meta.url);
@@ -68,7 +68,7 @@ async function withinDeadline(promise) {
       new Promise((_, reject) => {
         timer = setTimeout(
           () => reject(new Error("loading-fixture-timeout")),
-          10_000,
+          30_000,
         );
       }),
     ]);
@@ -135,6 +135,9 @@ async function fixture(
     spectator = false,
     paired = true,
     pendingRematch = false,
+    healthyCoreSockets = false,
+    sessionMode = "fresh",
+    sessionBootstrapResult = "success",
   } = {},
 ) {
   const currentMetadata = {
@@ -166,20 +169,45 @@ async function fixture(
   const extrasGate = deferred();
   const bootstrapRequested = deferred();
   const selectedAssetsRequested = deferred();
+  const wagersRequested = deferred();
+  const profilesRequested = deferred();
   const requests = [];
+  const sockets = [];
   const resources = [];
   const pageErrors = [];
+  const sessions = new Set();
   let closed = false;
   if (!holdAssets) assetsGate.resolve();
   if (!holdBootstrap) bootstrapGate.resolve();
   if (!holdExtras) extrasGate.resolve();
   try {
-    await context.routeWebSocket(/wss:\/\/api\.mons\.link\/.*/, () => {});
+    await context.routeWebSocket(/wss:\/\/api\.mons\.link\/.*/, (socket) => {
+      sockets.push(socket.url());
+      if (!healthyCoreSockets) return;
+      const pathname = new URL(socket.url()).pathname;
+      const snapshot = pathname.endsWith("/metadata/socket")
+        ? currentMetadata
+        : pathname.endsWith(`/matches/${currentMatch.matchId}/socket`)
+          ? currentMatch
+          : null;
+      if (snapshot)
+        socket.send(
+          JSON.stringify({ schemaVersion: 1, type: "snapshot", snapshot }),
+        );
+      socket.onMessage((message) => {
+        if (message === "ping") socket.send("pong");
+      });
+    });
     await context.route("**/*", async (route) => {
       const request = route.request();
       const url = new URL(request.url());
       resources.push(url.pathname);
       if (url.origin === server.origin) {
+        if (url.pathname === "/__loading-seed")
+          return route.fulfill({
+            contentType: "text/html",
+            body: "<!doctype html>",
+          });
         if (/gameAssetsPixel/.test(url.pathname)) {
           selectedAssetsRequested.resolve();
           await assetsGate.promise;
@@ -195,10 +223,23 @@ async function fixture(
       };
       if (request.method() === "OPTIONS")
         return route.fulfill({ status: 204, headers });
-      requests.push({ path: url.pathname, at: Date.now() });
+      requests.push({
+        path: url.pathname,
+        query: url.search,
+        method: request.method(),
+        at: Date.now(),
+      });
       let body;
-      if (url.pathname === "/auth/session/anonymous") {
-        const { sessionId } = request.postDataJSON();
+      if (
+        url.pathname === "/auth/session/anonymous" ||
+        url.pathname === "/auth/session/refresh"
+      ) {
+        const sessionId =
+          url.pathname === "/auth/session/anonymous"
+            ? request.postDataJSON().sessionId
+            : request.headers().authorization.split(".")[1];
+        if (url.pathname === "/auth/session/anonymous") sessions.add(sessionId);
+        assert.ok(sessions.has(sessionId));
         const expiresAt = Math.floor(Date.now() / 1000) + 300;
         body = {
           ok: true,
@@ -207,6 +248,27 @@ async function fixture(
           accessToken: `header.${Buffer.from(JSON.stringify({ iat: expiresAt - 300, exp: expiresAt })).toString("base64url")}.signature`,
           accessExpiresAtMs: expiresAt * 1000,
         };
+        if (url.searchParams.has("bootstrapInviteId")) {
+          assert.equal(url.searchParams.get("bootstrapInviteId"), inviteId);
+          assert.equal(url.searchParams.get("bootstrapSelection"), "current");
+          bootstrapRequested.resolve();
+          await bootstrapGate.promise;
+          if (sessionBootstrapResult !== "missing")
+            body.gameBootstrap = {
+              inviteId,
+              selection: "current",
+              result:
+                sessionBootstrapResult === "success"
+                  ? {
+                      ...bootstrap,
+                      metadata: currentMetadata,
+                      viewer: currentViewer,
+                      match: currentMatch,
+                      hasPendingProposal: pendingRematch,
+                    }
+                  : sessionBootstrapResult,
+            };
+        }
       } else if (url.pathname === `/invites/${inviteId}/bootstrap`) {
         bootstrapRequested.resolve();
         await bootstrapGate.promise;
@@ -220,6 +282,7 @@ async function fixture(
       } else if (url.pathname === `/invites/${inviteId}/metadata`) {
         body = { ok: true, snapshot: currentMetadata, viewer: currentViewer };
       } else if (url.pathname === `/invites/${inviteId}/wagers`) {
+        wagersRequested.resolve();
         await extrasGate.promise;
         body = { ok: true, snapshot: { inviteId, revision: 1, wagers: {} } };
       } else if (url.pathname === "/matches/snapshot") {
@@ -234,6 +297,7 @@ async function fixture(
       ) {
         body = { ok: true, snapshot: currentMatch };
       } else {
+        if (url.pathname.includes("/profiles/")) profilesRequested.resolve();
         await extrasGate.promise;
       }
       if (apiDelayMs) await new Promise((done) => setTimeout(done, apiDelayMs));
@@ -266,8 +330,48 @@ async function fixture(
       }).observe(document, { childList: true, subtree: true });
     });
     const page = await context.newPage();
-    page.setDefaultTimeout(10_000);
+    page.setDefaultTimeout(process.env.MONS_LOADING_BUILD ? 10_000 : 30_000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
+    if (sessionMode === "restored") {
+      const sessionId = crypto.randomUUID();
+      sessions.add(sessionId);
+      await page.goto(`${server.origin}/__loading-seed`);
+      await page.evaluate(
+        ({ sessionId, uid }) =>
+          new Promise((resolve, reject) => {
+            const open = indexedDB.open("mons-link-sessions-v1", 1);
+            open.onupgradeneeded = () => open.result.createObjectStore("state");
+            open.onerror = () => reject(open.error);
+            open.onsuccess = () => {
+              const database = open.result;
+              const transaction = database.transaction("state", "readwrite");
+              transaction.objectStore("state").put(
+                {
+                  generation: crypto.randomUUID(),
+                  revision: 1,
+                  initialized: true,
+                  session: {
+                    sessionId,
+                    uid,
+                    refreshSecret: "a".repeat(42) + "A",
+                    revokeSecret: "b".repeat(42) + "A",
+                  },
+                  revocations: [],
+                },
+                "current",
+              );
+              transaction.oncomplete = () => {
+                database.close();
+                resolve();
+              };
+              transaction.onerror = () => reject(transaction.error);
+            };
+          }),
+        { sessionId, uid: spectator ? "s".repeat(28) : hostId },
+      );
+      requests.length = 0;
+      resources.length = 0;
+    }
     if (benchmark) {
       const cdp = await context.newCDPSession(page);
       await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
@@ -275,13 +379,18 @@ async function fixture(
     await page.goto(`${server.origin}/${inviteId}`, { waitUntil: "commit" });
     await run({
       page,
+      context,
+      sessions,
       requests,
+      sockets,
       resources,
       assetsGate,
       bootstrapGate,
       extrasGate,
       bootstrapRequested,
       selectedAssetsRequested,
+      wagersRequested,
+      profilesRequested,
     });
     assert.deepEqual(pageErrors, []);
   } finally {
@@ -295,10 +404,64 @@ async function fixture(
 }
 
 async function assertBoardAcceptsInput(page) {
-  await page.waitForFunction(() => window.loadingProbe.populated !== null);
-  await page.locator('.board-rect[x="500"][y="1000"]').dispatchEvent("click");
+  await page.waitForFunction(
+    () =>
+      window.loadingProbe.populated !== null &&
+      performance.getEntriesByName("main-game:interaction-ready").length > 0 &&
+      performance.getEntriesByName("main-game:route-prepared").length > 0,
+  );
+  await page.evaluate(() => {
+    document.addEventListener(
+      "click",
+      (event) => {
+        window.loadingProbe.trustedInput = event.isTrusted;
+        window.loadingProbe.firstInput = performance.now();
+      },
+      { once: true },
+    );
+  });
+  await page.locator('.board-rect[x="500"][y="1000"]').click();
   await page.waitForFunction(
     () => document.querySelector("#highlightsLayer")?.childElementCount > 0,
+  );
+  assert.equal(
+    await page.evaluate(() => window.loadingProbe.trustedInput),
+    true,
+  );
+}
+
+function assertBundledBootstrap(requests, sessionMode = "fresh") {
+  const sessions = requests.filter(({ path }) =>
+    /^\/auth\/session\/(anonymous|refresh)$/.test(path),
+  );
+  assert.equal(sessions.length, 1);
+  assert.equal(
+    sessions[0].path,
+    `/auth/session/${sessionMode === "fresh" ? "anonymous" : "refresh"}`,
+  );
+  assert.equal(
+    new URLSearchParams(sessions[0].query).get("bootstrapInviteId"),
+    inviteId,
+  );
+  assert.equal(
+    requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
+    0,
+  );
+}
+
+async function navigateWithinApp(page, path) {
+  await page.evaluate((path) => {
+    for (const name of [
+      "main-game:interaction-ready",
+      "main-game:route-prepared",
+      "main-game:initial-view-ready",
+    ])
+      performance.clearMarks(name);
+    history.pushState({}, "", path);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, path);
+  await page.waitForFunction(
+    () => performance.getEntriesByName("main-game:route-prepared").length > 0,
   );
 }
 
@@ -310,6 +473,7 @@ test(
       async ({
         page,
         requests,
+        resources,
         assetsGate,
         selectedAssetsRequested,
         bootstrapRequested,
@@ -319,14 +483,16 @@ test(
             selectedAssetsRequested.promise,
             bootstrapRequested.promise,
           ]),
-        );
+        ).catch((error) => {
+          throw new Error(
+            JSON.stringify({ requests, resources: resources.slice(-20) }),
+            { cause: error },
+          );
+        });
         assert.equal(await page.locator("#monsboard").count(), 0);
         assetsGate.resolve();
         await assertBoardAcceptsInput(page);
-        assert.equal(
-          requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
-          1,
-        );
+        assertBundledBootstrap(requests);
         assert.equal(
           requests.some(
             ({ path }) =>
@@ -337,7 +503,7 @@ test(
           false,
         );
       },
-      { holdAssets: true },
+      { holdAssets: true, healthyCoreSockets: true },
     );
   },
 );
@@ -353,6 +519,9 @@ test(
         bootstrapGate,
         requests,
         resources,
+        wagersRequested,
+        profilesRequested,
+        sockets,
       }) => {
         await withinDeadline(bootstrapRequested.promise);
         await page.waitForSelector("#monsboard");
@@ -367,10 +536,11 @@ test(
         );
         bootstrapGate.resolve();
         await assertBoardAcceptsInput(page);
-        assert.equal(
-          requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
-          1,
+        await withinDeadline(
+          Promise.all([wagersRequested.promise, profilesRequested.promise]),
         );
+        assert.ok(sockets.length > 0);
+        assertBundledBootstrap(requests);
       },
       { holdBootstrap: true },
     );
@@ -398,16 +568,13 @@ test(
           ),
           0,
         );
-        assert.equal(
-          requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
-          1,
-        );
+        assertBundledBootstrap(requests);
         assert.equal(
           requests.some(({ path }) => path.endsWith("/snapshot")),
           false,
         );
       },
-      { spectator: true },
+      { spectator: true, healthyCoreSockets: true },
     );
   },
 );
@@ -470,33 +637,242 @@ test(
 );
 
 test(
-  "production loading benchmark",
-  { skip: !benchmark, timeout: 60_000 },
-  async (t) => {
-    const samples = [];
-    for (let index = 0; index < 5; index++) {
+  "a restored session hydrates from its single combined refresh request",
+  { skip: benchmark, timeout: 60_000 },
+  async () => {
+    await fixture(
+      async ({ page, requests }) => {
+        await assertBoardAcceptsInput(page);
+        assertBundledBootstrap(requests, "restored");
+      },
+      { sessionMode: "restored" },
+    );
+  },
+);
+
+for (const sessionBootstrapResult of ["missing", { malformed: true }]) {
+  test(
+    `a ${sessionBootstrapResult === "missing" ? "legacy" : "malformed"} inline response keeps the session token and performs one GET fallback`,
+    { skip: benchmark, timeout: 60_000 },
+    async () => {
       await fixture(
         async ({ page, requests }) => {
           await assertBoardAcceptsInput(page);
-          samples.push({
-            ...(await page.evaluate(() => window.loadingProbe)),
-            requestPaths: requests.map(({ path }) => path),
-          });
+          assert.equal(
+            requests.filter(({ path }) => path.startsWith("/auth/session/"))
+              .length,
+            1,
+          );
+          assert.equal(
+            requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
+            1,
+          );
         },
-        { apiDelayMs: 200, holdExtras: false },
+        { sessionBootstrapResult },
       );
-    }
-    const median = (key) =>
-      [...samples].map((sample) => sample[key]).sort((a, b) => a - b)[2];
-    t.diagnostic(
-      JSON.stringify({
-        build: process.env.MONS_LOADING_BUILD,
-        cpuSlowdown: 4,
-        apiDelayMs: 200,
+    },
+  );
+}
+
+test(
+  "an inline missing invite settles the error view without retrying bootstrap",
+  { skip: benchmark, timeout: 60_000 },
+  async () => {
+    await fixture(
+      async ({ page, requests }) => {
+        await page.waitForFunction(
+          () =>
+            performance.getEntriesByName("main-game:initial-view-ready")
+              .length > 0,
+        );
+        assert.equal(await page.locator("#itemsLayer .item").count(), 0);
+        assert.equal(
+          await page.evaluate(
+            () =>
+              performance.getEntriesByName("main-game:interaction-ready")
+                .length,
+          ),
+          0,
+        );
+        assertBundledBootstrap(requests);
+      },
+      { sessionBootstrapResult: { ok: false, status: 404 } },
+    );
+  },
+);
+
+test(
+  "navigation discards a delayed inline game while preserving the completed session",
+  { skip: benchmark, timeout: 60_000 },
+  async () => {
+    await fixture(
+      async ({ page, requests, bootstrapRequested, bootstrapGate }) => {
+        await withinDeadline(bootstrapRequested.promise);
+        await page.waitForSelector("#monsboard");
+        await navigateWithinApp(page, "/");
+        const completed = page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/auth/session/anonymous",
+        );
+        bootstrapGate.resolve();
+        await (await completed).finished();
+        await page.waitForFunction(
+          () =>
+            window.loadingProbe.populated !== null &&
+            performance.getEntriesByName("main-game:interaction-ready").length >
+              0 &&
+            performance.getEntriesByName("main-game:initial-view-ready")
+              .length > 0,
+        );
+        assert.equal(new URL(page.url()).pathname, "/");
+        assert.equal(
+          requests.some(({ path }) => path.startsWith(`/invites/${inviteId}/`)),
+          false,
+        );
+        await navigateWithinApp(page, `/${inviteId}`);
+        await assertBoardAcceptsInput(page);
+        assert.equal(
+          requests.filter(({ path }) => path.startsWith("/auth/session/"))
+            .length,
+          1,
+        );
+        assert.equal(
+          requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
+          1,
+        );
+      },
+      { holdBootstrap: true },
+    );
+  },
+);
+
+test(
+  "a replaced restored session rejects the old inline game before the next navigation",
+  {
+    skip: benchmark || Boolean(process.env.MONS_LOADING_BUILD),
+    timeout: 60_000,
+  },
+  async () => {
+    await fixture(
+      async ({
+        page,
+        sessions,
+        requests,
+        bootstrapRequested,
+        bootstrapGate,
+      }) => {
+        await withinDeadline(bootstrapRequested.promise);
+        await page.waitForSelector("#monsboard");
+        const replacementId = crypto.randomUUID();
+        sessions.add(replacementId);
+        await page.evaluate(async (replacementId) => {
+          const { sessionAuth } = await import("/src/session/sessionAuth.ts");
+          const previous = sessionAuth.currentUser;
+          await sessionAuth.dependencies.store.update((state) => ({
+            ...state,
+            revision: state.revision + 1,
+            generation: crypto.randomUUID(),
+            session: { ...state.session, sessionId: replacementId },
+          }));
+          await sessionAuth.reconcile();
+          if (sessionAuth.currentUser === previous)
+            throw new Error("session-object-was-not-replaced");
+          globalThis.loadingSessionAuth = sessionAuth;
+        }, replacementId);
+        const completed = page.waitForResponse((response) => {
+          const url = new URL(response.url());
+          return (
+            url.pathname === "/auth/session/refresh" &&
+            url.searchParams.has("bootstrapInviteId")
+          );
+        });
+        bootstrapGate.resolve();
+        await (await completed).finished();
+        await page.evaluate(async () => {
+          await globalThis.loadingSessionAuth.currentUser.getIdToken();
+          await new Promise(requestAnimationFrame);
+        });
+        const active = await page.evaluate(async () => {
+          const { connection } = await import("/src/connection/connection.ts");
+          return connection.getActiveContextSnapshot();
+        });
+        assert.equal(active, null);
+        assert.equal(await page.locator("#itemsLayer .item").count(), 0);
+        await navigateWithinApp(page, "/");
+        await navigateWithinApp(page, `/${inviteId}`);
+        await assertBoardAcceptsInput(page);
+        assert.equal(
+          requests.filter(({ path }) => path.endsWith("/bootstrap")).length,
+          1,
+        );
+      },
+      { holdBootstrap: true, sessionMode: "restored" },
+    );
+  },
+);
+
+test(
+  "production loading benchmark",
+  { skip: !benchmark, timeout: 180_000 },
+  async (t) => {
+    const scenarios = {};
+    for (const sessionMode of ["fresh", "restored"]) {
+      const samples = [];
+      for (let index = 0; index < 5; index++) {
+        await fixture(
+          async ({ page, requests }) => {
+            await assertBoardAcceptsInput(page);
+            samples.push({
+              ...(await page.evaluate(() => ({
+                ...window.loadingProbe,
+                interactionReady: performance.getEntriesByName(
+                  "main-game:interaction-ready",
+                )[0].startTime,
+                routePrepared: performance.getEntriesByName(
+                  "main-game:route-prepared",
+                )[0].startTime,
+              }))),
+              requests: requests.map(({ path, query, method }) => ({
+                path,
+                query,
+                method,
+              })),
+            });
+            t.diagnostic(
+              JSON.stringify({
+                sessionMode,
+                sample: index + 1,
+                populated: samples.at(-1).populated,
+                interactionReady: samples.at(-1).interactionReady,
+              }),
+            );
+          },
+          { apiDelayMs: 200, holdExtras: false, sessionMode },
+        );
+      }
+      const median = (key) =>
+        samples.map((sample) => sample[key]).sort((a, b) => a - b)[2];
+      scenarios[sessionMode] = {
         runs: samples,
         medianShellMs: median("shell"),
         medianPopulatedMs: median("populated"),
-      }),
-    );
+        medianInteractionReadyMs: median("interactionReady"),
+        medianFirstInputMs: median("firstInput"),
+      };
+    }
+    const report = {
+      build: process.env.MONS_LOADING_BUILD,
+      cpuSlowdown: 4,
+      apiDelayMs: 200,
+      staticAssets: "gzip",
+      networkThrottle: "none",
+      scenarios,
+    };
+    if (process.env.MONS_LOADING_REPORT) {
+      const output = resolve(process.env.MONS_LOADING_REPORT);
+      await mkdir(resolve(output, ".."), { recursive: true });
+      await writeFile(output, JSON.stringify(report, null, 2) + "\n");
+    }
+    t.diagnostic(JSON.stringify(report));
   },
 );

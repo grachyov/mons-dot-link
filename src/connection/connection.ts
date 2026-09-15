@@ -4596,6 +4596,13 @@ class Connection {
             delivery.scope.inviteId === inviteId,
         );
         return hasMoveRecovery ? readBootstrap() : bootstrap;
+      } catch (error) {
+        if (
+          error instanceof GameBootstrapApiError &&
+          error.code === "initial-game-bootstrap-selection-changed"
+        )
+          return readBootstrap();
+        throw error;
       } finally {
         controller.signal.removeEventListener("abort", abort);
       }

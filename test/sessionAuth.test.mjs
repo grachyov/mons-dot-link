@@ -327,6 +327,225 @@ test("refresh is single-flight within a tab and independent across tabs", async 
   assert.equal(h.revokes.length, 0);
 });
 
+const initialGameOptions = (
+  controller = new AbortController(),
+  selectionForUid = () => "current",
+) => ({
+  signal: controller.signal,
+  selectionForUid,
+});
+const attachInitialGame = (response, target) => ({
+  ...response,
+  ...(target
+    ? { gameBootstrap: { ...target, result: { ok: false, status: 404 } } }
+    : {}),
+});
+
+test("initial game intent joins anonymous creation without retaining game data in auth state", async () => {
+  const h = harness();
+  const auth = h.make();
+  const create = h.api.create;
+  const targets = [];
+  h.api.create = async (session, target) => {
+    targets.push(target);
+    return attachInitialGame(await create(session), target);
+  };
+  const prepared = auth.prepareInitialGame("game-a", initialGameOptions());
+  await Promise.all([auth.signInAnonymously(), auth.signInAnonymously()]);
+  const result = await prepared;
+  assert.equal(result.user, auth.currentUser);
+  assert.deepEqual(result.bootstrap, { ok: false, status: 404 });
+  assert.deepEqual(targets, [{ inviteId: "game-a", selection: "current" }]);
+  assert.equal(h.creates.length, 1);
+  assert.equal(h.refreshes.length, 0);
+  assert.equal("gameBootstrap" in auth.access, false);
+  assert.equal(JSON.stringify(h.store.read()).includes("gameBootstrap"), false);
+  assert.equal(auth.initialGameIntent, null);
+});
+
+test("a cold session refresh attaches the initial intent even when an auth listener requests a token first", async () => {
+  const h = harness();
+  await h.make().signInAnonymously();
+  const auth = h.make();
+  const refresh = h.api.refresh;
+  const targets = [];
+  const tokens = [];
+  h.api.refresh = async (session, target) => {
+    targets.push(target);
+    return attachInitialGame(await refresh(session), target);
+  };
+  auth.onAuthStateChanged((user) => {
+    if (user) tokens.push(user.getIdToken(true), user.getIdToken());
+  });
+  const result = await auth.prepareInitialGame(
+    "game-a",
+    initialGameOptions(undefined, () => "approved"),
+  );
+  await Promise.all(tokens);
+  assert.equal(result.user, auth.currentUser);
+  assert.equal(result.selection, "approved");
+  assert.deepEqual(result.bootstrap, { ok: false, status: 404 });
+  assert.deepEqual(targets, [{ inviteId: "game-a", selection: "approved" }]);
+  assert.equal(h.refreshes.length, 1);
+  assert.equal("gameBootstrap" in auth.access, false);
+});
+
+test("valid memory tokens skip combined refresh and already-dispatched refreshes are reused", async () => {
+  const h = harness();
+  const first = h.make();
+  await first.signInAnonymously();
+  assert.equal(
+    (await first.prepareInitialGame("game-a", initialGameOptions())).bootstrap,
+    null,
+  );
+  assert.equal(h.refreshes.length, 0);
+  const auth = h.make();
+  await auth.authStateReady();
+  const wait = deferred();
+  const refresh = h.api.refresh;
+  const targets = [];
+  h.api.refresh = async (session, target) => {
+    targets.push(target);
+    await wait.promise;
+    return attachInitialGame(await refresh(session), target);
+  };
+  const token = auth.currentUser.getIdToken();
+  await flush();
+  const prepared = auth.prepareInitialGame("game-a", initialGameOptions());
+  await flush();
+  wait.resolve();
+  await token;
+  assert.equal((await prepared).bootstrap, null);
+  assert.deepEqual(targets, [undefined]);
+  assert.equal(h.refreshes.length, 1);
+});
+
+test("a concurrent forced refresh with a valid memory token does not claim the initial game", async () => {
+  const h = harness();
+  const auth = h.make();
+  await auth.signInAnonymously();
+  const refresh = h.api.refresh;
+  const targets = [];
+  h.api.refresh = async (session, target) => {
+    targets.push(target);
+    return attachInitialGame(await refresh(session), target);
+  };
+  const prepared = auth.prepareInitialGame("game-a", initialGameOptions());
+  await auth.currentUser.getIdToken(true);
+  assert.equal((await prepared).bootstrap, null);
+  assert.deepEqual(targets, [undefined]);
+});
+
+test("route cancellation drops its game while a shared refresh still serves token callers", async () => {
+  const h = harness();
+  await h.make().signInAnonymously();
+  const auth = h.make();
+  const wait = deferred();
+  const refresh = h.api.refresh;
+  h.api.refresh = async (session, target) => {
+    await wait.promise;
+    return attachInitialGame(await refresh(session), target);
+  };
+  const controller = new AbortController();
+  const prepared = auth.prepareInitialGame(
+    "game-a",
+    initialGameOptions(controller),
+  );
+  const rejected = assert.rejects(prepared, /initial-game-bootstrap-canceled/);
+  await flush();
+  const token = auth.currentUser.getIdToken(true);
+  controller.abort();
+  await rejected;
+  wait.resolve();
+  assert.equal(await token, auth.access.accessToken);
+  assert.equal(h.refreshes.length, 1);
+  assert.equal("gameBootstrap" in auth.access, false);
+  assert.equal(auth.initialGameIntent, null);
+});
+
+test("canceling before dispatch omits game input without aborting ordinary session creation", async () => {
+  const h = harness();
+  const auth = h.make();
+  const create = h.api.create;
+  const targets = [];
+  h.api.create = async (session, target) => {
+    targets.push(target);
+    return create(session);
+  };
+  const controller = new AbortController();
+  const prepared = auth.prepareInitialGame(
+    "game-a",
+    initialGameOptions(controller),
+  );
+  controller.abort();
+  await assert.rejects(prepared, /initial-game-bootstrap-canceled/);
+  await auth.signInAnonymously();
+  assert.deepEqual(targets, [undefined]);
+  assert.ok(auth.currentUser);
+});
+
+test("a pending rematch-end appearing during session refresh discards the current-match result", async () => {
+  const h = harness();
+  await h.make().signInAnonymously();
+  const auth = h.make();
+  const wait = deferred();
+  const refresh = h.api.refresh;
+  let selection = "current";
+  let requested;
+  h.api.refresh = async (session, target) => {
+    requested = target;
+    await wait.promise;
+    return attachInitialGame(await refresh(session), target);
+  };
+  const prepared = auth.prepareInitialGame(
+    "game-a",
+    initialGameOptions(undefined, () => selection),
+  );
+  await flush();
+  selection = "approved";
+  wait.resolve();
+  const result = await prepared;
+  assert.equal(requested.selection, "current");
+  assert.equal(result.selection, "approved");
+  assert.equal(result.bootstrap, null);
+  assert.equal(h.refreshes.length, 1);
+});
+
+test("logout and same-UID generation replacement reject in-flight combined game data", async () => {
+  for (const replacement of [false, true]) {
+    const h = harness();
+    await h.make().signInAnonymously();
+    const auth = h.make();
+    const wait = deferred();
+    const refresh = h.api.refresh;
+    h.api.refresh = async (session, target) => {
+      const result = await refresh(session);
+      await wait.promise;
+      return attachInitialGame(result, target);
+    };
+    const prepared = auth.prepareInitialGame("game-a", initialGameOptions());
+    const rejected = assert.rejects(prepared, /authentication-changed/);
+    await flush();
+    const original = auth.currentUser;
+    if (replacement) {
+      await h.store.update((state) => ({
+        ...state,
+        generation: crypto.randomUUID(),
+        revision: state.revision + 1,
+      }));
+      await auth.reconcile();
+      assert.equal(auth.currentUser.uid, original.uid);
+      assert.notEqual(auth.currentUser, original);
+    } else {
+      await auth.signOut();
+    }
+    wait.resolve();
+    await rejected;
+    assert.equal(auth.access, null);
+    assert.equal(auth.initialGameIntent, null);
+  }
+});
+
 test("logout revokes an in-flight create before it can publish a user", async () => {
   const h = harness();
   const wait = deferred();

@@ -16,6 +16,10 @@ registerHooks({
 
 const { sessionApi, SessionApiError } =
   await import("../src/services/sessionApi.ts");
+const {
+  SESSION_BOOTSTRAP_MAX_RESPONSE_BYTES,
+  SESSION_BOOTSTRAP_REQUEST_TIMEOUT_MS,
+} = await import("@mons/shared/session-bootstrap");
 const originalFetch = globalThis.fetch;
 const originalDateNow = Date.now;
 test.afterEach(() => {
@@ -83,6 +87,175 @@ test("session endpoints send exact independent capabilities without ambient cook
     assert.equal(call.options.cache, "no-store");
     assert.equal(call.options.redirect, "error");
   }
+});
+
+test("optional bootstrap uses only validated query parameters on session create and refresh", async () => {
+  const target = { inviteId: "game-a", selection: "approved" };
+  const gameBootstrap = { ...target, result: { ok: false, status: 404 } };
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return json({ ...response(), gameBootstrap });
+  };
+  for (const operation of [sessionApi.create, sessionApi.refresh]) {
+    const result = await operation(session, target);
+    assert.deepEqual(result.gameBootstrap, gameBootstrap);
+    assert.equal(result.uid, response().uid);
+  }
+  for (const call of calls) {
+    const url = new URL(call.url);
+    assert.equal(
+      url.search,
+      "?bootstrapInviteId=game-a&bootstrapSelection=approved",
+    );
+    assert.equal(url.href.includes(session.refreshSecret), false);
+    assert.equal(url.href.includes(session.revokeSecret), false);
+  }
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    sessionId: session.sessionId,
+    refreshSecret: session.refreshSecret,
+    revokeSecret: session.revokeSecret,
+  });
+  assert.equal(calls[1].options.body, undefined);
+  assert.equal(new Headers(calls[1].options.headers).get("Content-Type"), null);
+  await assert.rejects(
+    sessionApi.create(session, { ...target, inviteId: "bad/invite" }),
+    { code: "unavailable" },
+  );
+  assert.equal(calls.length, 2);
+});
+
+test("missing or malformed optional games preserve valid tokens while legacy validation stays strict", async () => {
+  const target = { inviteId: "game-a", selection: "current" };
+  for (const gameBootstrap of [
+    undefined,
+    null,
+    {},
+    { ...target, result: { ok: false, status: 401 } },
+    { ...target, inviteId: "foreign", result: { ok: false, status: 404 } },
+    { ...target, selection: "approved", result: { ok: false, status: 404 } },
+    { ...target, result: { ok: false, status: 404, secret: "private" } },
+  ]) {
+    globalThis.fetch = async () =>
+      json({
+        ...response(),
+        ...(gameBootstrap === undefined ? {} : { gameBootstrap }),
+      });
+    const result = await sessionApi.refresh(session, target);
+    assert.equal(result.gameBootstrap, undefined);
+    assert.equal(result.uid, response().uid);
+  }
+  globalThis.fetch = async () =>
+    json({
+      ...response(),
+      gameBootstrap: { ...target, result: { ok: false, status: 404 } },
+    });
+  await assert.rejects(sessionApi.refresh(session), { code: "unavailable" });
+  globalThis.fetch = async () =>
+    json({ ...response(), secret: "private", gameBootstrap: null });
+  await assert.rejects(sessionApi.refresh(session, target), {
+    code: "unavailable",
+  });
+});
+
+test("combined responses accept a validated game larger than the legacy token response cap", async () => {
+  const target = { inviteId: "game-a", selection: "current" };
+  const match = (color) => ({
+    version: 2,
+    color,
+    emojiId: 1,
+    aura: "",
+    gameVariant: "Classic",
+    fen: "a".repeat(9000),
+    status: "",
+    flatMovesString: "",
+    timer: "",
+  });
+  const result = {
+    ok: true,
+    schemaVersion: 1,
+    hasPendingProposal: false,
+    metadata: {
+      inviteId: target.inviteId,
+      revision: 1,
+      hostId: "host",
+      guestId: "guest",
+      hostColor: "white",
+      hostRematches: "",
+      guestRematches: "",
+      automatchStateHint: null,
+      eventId: null,
+      eventOwned: false,
+    },
+    viewer: { role: "watch", actorUid: null, automatchOperationId: null },
+    match: {
+      inviteId: target.inviteId,
+      matchId: target.inviteId,
+      revision: 1,
+      hostPlayerId: "host",
+      guestPlayerId: "guest",
+      hostMatch: match("white"),
+      guestMatch: match("black"),
+    },
+  };
+  const gameBootstrap = { ...target, result };
+  const payload = { ...response(), gameBootstrap };
+  assert.ok(JSON.stringify(payload).length > 16_384);
+  globalThis.fetch = async () => json(payload);
+  assert.deepEqual(
+    (await sessionApi.refresh(session, target)).gameBootstrap,
+    gameBootstrap,
+  );
+});
+
+test("combined response size is bounded and its single deadline spans network and body", async (t) => {
+  const target = { inviteId: "game-a", selection: "current" };
+  let canceled = 0;
+  for (const headers of [
+    { "Content-Length": String(SESSION_BOOTSTRAP_MAX_RESPONSE_BYTES + 1) },
+    {},
+  ]) {
+    globalThis.fetch = async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new Uint8Array(SESSION_BOOTSTRAP_MAX_RESPONSE_BYTES + 1),
+            );
+          },
+          cancel() {
+            canceled++;
+          },
+        }),
+        { headers },
+      );
+    await assert.rejects(sessionApi.refresh(session, target), {
+      code: "unavailable",
+    });
+  }
+  assert.equal(canceled, 2);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let resolveNetwork;
+  globalThis.fetch = () =>
+    new Promise((resolve) => {
+      resolveNetwork = resolve;
+    });
+  const pending = sessionApi.refresh(session, target);
+  const rejected = assert.rejects(pending, { code: "unavailable" });
+  t.mock.timers.tick(20_000);
+  resolveNetwork(
+    new Response(
+      new ReadableStream({
+        cancel() {
+          canceled++;
+        },
+      }),
+    ),
+  );
+  await new Promise(setImmediate);
+  t.mock.timers.tick(SESSION_BOOTSTRAP_REQUEST_TIMEOUT_MS - 20_000);
+  await rejected;
+  assert.equal(canceled, 3);
 });
 
 test("logout only acknowledges the exact 204 response contract", async () => {

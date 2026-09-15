@@ -11,7 +11,10 @@ import {
   type SessionUser,
 } from "../session/sessionAuth";
 import { createUserBoundAuthTokenProvider } from "./authApi";
-import { readGameBootstrapViaApi } from "./gameBootstrapApi";
+import {
+  GameBootstrapApiError,
+  readGameBootstrapViaApi,
+} from "./gameBootstrapApi";
 
 type Selection = "current" | "approved";
 type InitialGameBootstrap = {
@@ -25,11 +28,12 @@ type Dependencies = {
     | "authStateReady"
     | "signInAnonymously"
     | "onAuthStateChanged"
+    | "prepareInitialGame"
   >;
   read: typeof readGameBootstrapViaApi;
   route: () => RouteState;
   subscribeRoute: (listener: (route: RouteState) => void) => () => void;
-  selection: (inviteId: string, user: SessionUser) => Selection;
+  selection: (inviteId: string, user: Pick<SessionUser, "uid">) => Selection;
 };
 
 export function createInitialGameBootstrap(dependencies: Dependencies) {
@@ -57,13 +61,17 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
     start(route: RouteState): void {
       if (started) return;
       started = true;
-      const userPromise = ensureUser();
       if (route.mode !== "invite" || !route.inviteId) {
-        void userPromise.catch(() => undefined);
+        void ensureUser().catch(() => undefined);
         return;
       }
       const inviteId = route.inviteId;
       const controller = new AbortController();
+      const preparation = dependencies.auth.prepareInitialGame(inviteId, {
+        selectionForUid: (uid) => dependencies.selection(inviteId, { uid }),
+        signal: controller.signal,
+      });
+      let explicitGameError = false;
       let unsubscribeAuth = () => {};
       let unsubscribeRoute = () => {};
       const cleanup = () => {
@@ -83,8 +91,8 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
         selection: null,
         abort,
         cleanup,
-        promise: userPromise
-          .then(async (user) => {
+        promise: preparation
+          .then(async ({ user, selection, bootstrap }) => {
             if (
               controller.signal.aborted ||
               !matchesRoute(dependencies.route())
@@ -92,15 +100,26 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
               throw new Error("initial-game-bootstrap-canceled");
             }
             request.user = user;
-            request.selection = dependencies.selection(inviteId, user);
+            request.selection = selection;
             const tokenProvider = createUserBoundAuthTokenProvider(
               user,
               () => dependencies.auth.currentUser,
             );
-            const result = await dependencies.read(inviteId, tokenProvider, {
-              signal: controller.signal,
-              selection: request.selection,
-            });
+            tokenProvider.assertCurrentUser();
+            if (bootstrap && !bootstrap.ok) {
+              explicitGameError = true;
+              throw new GameBootstrapApiError(
+                `http-${bootstrap.status}`,
+                bootstrap.status,
+                bootstrap.retryAfterMs,
+              );
+            }
+            const result =
+              bootstrap ??
+              (await dependencies.read(inviteId, tokenProvider, {
+                signal: controller.signal,
+                selection: request.selection,
+              }));
             tokenProvider.assertCurrentUser();
             if (
               controller.signal.aborted ||
@@ -111,7 +130,7 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
             return result;
           })
           .catch((error: unknown) => {
-            abort();
+            if (!explicitGameError || controller.signal.aborted) abort();
             throw error;
           }),
       };
@@ -149,9 +168,13 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
       return {
         abort: request.abort,
         promise: request.promise.then((result) => {
-          if (request.user !== user || request.selection !== selection) {
+          if (request.user !== user) {
             throw new Error("initial-game-bootstrap-changed");
           }
+          if (request.selection !== selection)
+            throw new GameBootstrapApiError(
+              "initial-game-bootstrap-selection-changed",
+            );
           return result;
         }),
       };
@@ -161,7 +184,7 @@ export function createInitialGameBootstrap(dependencies: Dependencies) {
 
 export function getInitialGameBootstrapSelection(
   inviteId: string,
-  user: SessionUser,
+  user: Pick<SessionUser, "uid">,
 ): Selection {
   try {
     return readPendingRematchEnd(

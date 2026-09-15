@@ -100,6 +100,8 @@ async function bootstrap(
     ctx,
     {
       repository: state.repository,
+      readAdmission: (id, signal) =>
+        state.repository.readInviteMetadata(id, signal),
       room: state.room,
       verifyIdentity: async () => socketTestIdentity(caller),
     },

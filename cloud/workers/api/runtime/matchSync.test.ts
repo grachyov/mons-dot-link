@@ -493,7 +493,7 @@ describe("live match snapshots", () => {
   it.each(["notification", "alarm"] as const)(
     "keeps healthy sockets through a pending transition and recovers by %s",
     async (recovery) => {
-      vi.spyOn(Date, "now").mockReturnValue(Date.now());
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
       const { room, inviteId, source } = await fixture(false);
       const channel = await connect(room, inviteId);
       const initial = await channel.snapshot();
