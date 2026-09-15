@@ -1060,6 +1060,7 @@ test("legacy retirement clears identity and old pending actions, preserves prefe
   });
   globalThis.sessionStorage = browserStorage({
     "mons:pending-moves:v1:old": "move",
+    "mons:pending-rematch-ends:v1:old": "end",
     appleIntentByStateV1: "intent",
   });
   try {

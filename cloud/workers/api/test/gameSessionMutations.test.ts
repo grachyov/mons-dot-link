@@ -806,6 +806,165 @@ test("surfaces release failure after successful leased work", async () => {
   });
 });
 
+test("ending waits for a competing invite mutation and reads its committed rematches", async () => {
+  const inviteId = "abcdefghijk";
+  const invite = {
+    version: 2,
+    hostId: identity.uid,
+    guestId: "guest-login",
+    hostColor: "white",
+  };
+  const state = repository({ [`invites/${inviteId}`]: invite });
+  const stores = coordination(state.repository);
+  let nowMs = 1_000;
+  await stores.mutationLocks.acquire(
+    { lockId: inviteId, operationId: ids.proposeGuest },
+    "other-owner",
+    nowMs,
+  );
+  const waits: number[] = [];
+  const request = { operationId: ids.end, inviteId };
+  const dependencies = {
+    createOwnerId: () => "end-owner",
+    now: () => nowMs,
+    wait: async (milliseconds: number) => {
+      assert.equal(stores.lockRows.get(inviteId)?.ownerId, "other-owner");
+      assert.equal(state.patches.length, 0);
+      waits.push(milliseconds);
+      nowMs += milliseconds;
+      if (waits.length === 2) {
+        state.values.set(`invites/${inviteId}`, {
+          ...invite,
+          hostRematches: "1",
+          guestRematches: "1",
+        });
+        await stores.mutationLocks.release(
+          { lockId: inviteId, operationId: ids.proposeGuest },
+          "other-owner",
+        );
+      }
+    },
+  };
+  const response = await endRematchSeries(
+    identity,
+    request,
+    state.repository,
+    dependencies,
+  );
+  assert.deepEqual(waits, [100, 200]);
+  assert.equal(response.rematches, "1x");
+  assert.equal(state.patches[0][`invites/${inviteId}/hostRematches`], "1x");
+  assert.equal(stores.lockRows.size, 0);
+  assert.deepEqual(
+    await endRematchSeries(identity, request, state.repository, dependencies),
+    response,
+  );
+  assert.equal(state.patches.length, 1);
+});
+
+test("ending bounds busy retries without stealing the active lease or writing", async () => {
+  const state = repository();
+  const stores = coordination(state.repository);
+  let nowMs = 1_000;
+  await stores.mutationLocks.acquire(
+    { lockId: "abcdefghijk", operationId: ids.proposeGuest },
+    "other-owner",
+    nowMs,
+  );
+  const waits: number[] = [];
+  await assert.rejects(
+    endRematchSeries(
+      identity,
+      { operationId: ids.end, inviteId: "abcdefghijk" },
+      state.repository,
+      {
+        createOwnerId: () => "end-owner",
+        now: () => nowMs,
+        wait: async (milliseconds) => {
+          waits.push(milliseconds);
+          nowMs += milliseconds;
+        },
+      },
+    ),
+    (error: unknown) =>
+      error instanceof AuthApiFailure && error.message === "invite-busy",
+  );
+  assert.equal(
+    waits.reduce((sum, value) => sum + value, 0),
+    5_000,
+  );
+  assert.ok(waits.every((value) => value <= 1_000));
+  assert.equal(stores.lockRows.get("abcdefghijk")?.ownerId, "other-owner");
+  assert.equal(state.patches.length, 0);
+});
+
+test("ending does not retry failed acquisition or work once the lease is acquired", async () => {
+  for (const failurePhase of ["acquire", "work"] as const) {
+    const state = repository();
+    const stores = coordination(state.repository);
+    const error =
+      failurePhase === "acquire"
+        ? new GameSessionMutationLockFailure("acquire")
+        : new AuthApiFailure(409, "aborted", "invite-busy");
+    let attempts = 0;
+    if (failurePhase === "work") {
+      state.repository.readInviteMetadata = async () => {
+        attempts += 1;
+        throw error;
+      };
+    }
+    await assert.rejects(
+      endRematchSeriesImpl(
+        identity,
+        { operationId: ids.end, inviteId: "abcdefghijk" },
+        state.repository,
+        {
+          mutationLocks:
+            failurePhase === "acquire"
+              ? {
+                  ...stores.mutationLocks,
+                  acquire: async () => {
+                    attempts += 1;
+                    throw error;
+                  },
+                }
+              : stores.mutationLocks,
+          now: () => 1_000,
+          wait: async () => assert.fail("must not retry"),
+        },
+      ),
+      (caught: unknown) => caught === error,
+    );
+    assert.equal(attempts, 1);
+    assert.equal(stores.lockRows.size, 0);
+    assert.equal(state.patches.length, 0);
+  }
+});
+
+test("other session mutations still reject contention immediately", async () => {
+  const state = repository();
+  const stores = coordination(state.repository);
+  await stores.mutationLocks.acquire(
+    { lockId: "abcdefghijk", operationId: ids.end },
+    "end-owner",
+    1_000,
+  );
+  await assert.rejects(
+    proposeRematch(
+      identity,
+      { operationId: ids.propose, inviteId: "abcdefghijk", ...presentation() },
+      state.repository,
+      {
+        now: () => 1_000,
+        wait: async () => assert.fail("must not retry"),
+      },
+    ),
+    (error: unknown) =>
+      error instanceof AuthApiFailure && error.message === "invite-busy",
+  );
+  assert.equal(state.patches.length, 0);
+});
+
 test("release failure wins while retaining a leased work failure", async () => {
   const coordination = createMemoryGameplayCoordinationStores();
   const workFailure = new Error("work-failed");
@@ -853,6 +1012,8 @@ test("creates and replays one atomic manual invite mutation", async () => {
   const dependencies = {
     createOwnerId: () => crypto.randomUUID(),
     enqueueProfileGameProjection: async (task: unknown) => {
+      assert.equal(coordination(state.repository).lockRows.size, 0);
+      assert.equal(state.patches.length, 1);
       tasks.push(task);
     },
     now: () => 1_000,

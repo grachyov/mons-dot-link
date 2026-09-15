@@ -76,6 +76,7 @@ const GAME_SESSION_MUTATION_RECEIPT_EXPIRATION_ROOT =
   "gameplayMutationReceiptExpirations";
 const GAME_SESSION_MUTATION_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const GAME_SESSION_MUTATION_RECEIPT_SWEEP_LIMIT = 1000;
+const END_REMATCH_LEASE_RETRY_TIMEOUT_MS = 5_000;
 const gameVariantHelpers = createGameVariantHelpers(monsRules);
 
 type GameSessionMutationKind =
@@ -128,6 +129,7 @@ type GameSessionMutationDependencies = {
   mutationLocks: GameSessionMutationLockStore;
   now?: () => number;
   random?: () => number;
+  wait?: (milliseconds: number) => Promise<void>;
 };
 
 type ParticipantResolution = {
@@ -381,18 +383,47 @@ export async function withGameSessionMutationLease<T>(
   work: (refresh: () => Promise<void>) => Promise<T>,
   dependencies: Pick<
     GameSessionMutationDependencies,
-    "createOwnerId" | "logger" | "now"
-  > = {},
+    "createOwnerId" | "logger" | "now" | "wait"
+  > & { acquireRetryTimeoutMs?: number } = {},
 ): Promise<T> {
   const ownerId = (dependencies.createOwnerId || (() => crypto.randomUUID()))();
   const now = dependencies.now || Date.now;
-  await acquireGameSessionMutationLease(
-    lockId,
-    operationId,
-    ownerId,
-    store,
-    now(),
-  );
+  const retryTimeoutMs = dependencies.acquireRetryTimeoutMs || 0;
+  const retryDeadlineMs = now() + retryTimeoutMs;
+  const wait =
+    dependencies.wait ||
+    ((milliseconds: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let retryDelayMs = 100;
+  let waitedMs = 0;
+  while (true) {
+    try {
+      await acquireGameSessionMutationLease(
+        lockId,
+        operationId,
+        ownerId,
+        store,
+        now(),
+      );
+      break;
+    } catch (error) {
+      const remainingMs = Math.min(
+        retryTimeoutMs - waitedMs,
+        retryDeadlineMs - now(),
+      );
+      if (
+        !(error instanceof AuthApiFailure) ||
+        error.message !== "invite-busy" ||
+        remainingMs <= 0
+      ) {
+        throw error;
+      }
+      const delayMs = Math.min(retryDelayMs, remainingMs);
+      await wait(delayMs);
+      waitedMs += delayMs;
+      retryDelayMs = Math.min(1_000, retryDelayMs * 2);
+    }
+  }
   let workCompleted = false;
   let value: T | undefined;
   let workError: unknown;
@@ -442,7 +473,7 @@ async function runGameSessionMutation<T extends GameSessionResponse>(
   dependencies: GameSessionMutationDependencies,
 ): Promise<T> {
   const fingerprint = await mutationFingerprint(kind, request, requesterUid);
-  return withGameSessionMutationLease(
+  const outcome = await withGameSessionMutationLease(
     request.inviteId,
     request.operationId,
     dependencies.mutationLocks,
@@ -464,14 +495,10 @@ async function runGameSessionMutation<T extends GameSessionResponse>(
         ) {
           throw failedPrecondition("operation-conflict");
         }
-        if (existing.projectionRequestId) {
-          await dispatchProjection(
-            request.inviteId,
-            existing.projectionRequestId,
-            dependencies,
-          );
-        }
-        return existing.response;
+        return {
+          response: existing.response,
+          projectionRequestId: existing.projectionRequestId,
+        };
       }
       const outcome = await build();
       const projectionRequestId = outcome.projectReason
@@ -511,17 +538,22 @@ async function runGameSessionMutation<T extends GameSessionResponse>(
       await dependencies.assertMutationAllowed?.();
       await refresh();
       await repository.commitSessionChanges(changes);
-      if (projectionRequestId) {
-        await dispatchProjection(
-          request.inviteId,
-          projectionRequestId,
-          dependencies,
-        );
-      }
-      return outcome.response;
+      return { response: outcome.response, projectionRequestId };
     },
-    dependencies,
+    {
+      ...dependencies,
+      acquireRetryTimeoutMs:
+        kind === "rematch-end" ? END_REMATCH_LEASE_RETRY_TIMEOUT_MS : 0,
+    },
   );
+  if (outcome.projectionRequestId) {
+    await dispatchProjection(
+      request.inviteId,
+      outcome.projectionRequestId,
+      dependencies,
+    );
+  }
+  return outcome.response;
 }
 
 export async function resolveInviteRole(

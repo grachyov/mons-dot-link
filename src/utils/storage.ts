@@ -497,6 +497,7 @@ export const storage = {
           key === "appleIntentByStateV1" ||
           isRetiredSessionStorageKey(key) ||
           key.startsWith("mons:pending-moves:v1:") ||
+          key.startsWith("mons:pending-rematch-ends:v1:") ||
           key.startsWith(PENDING_AUTOMATCH_OPERATION_PREFIX) ||
           shouldClearExternalUserStorageKey(key),
       );

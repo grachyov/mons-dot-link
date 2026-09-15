@@ -34,7 +34,7 @@ export interface GameConnectionPort {
   setupConnection(autojoin: boolean, routeStateOverride?: RouteState): void;
   tryNavigateWatchOnlyToLatestApprovedMatch(): boolean;
   sendRematchProposal(): void;
-  sendEndMatchIndicator(): void;
+  sendEndMatchIndicator(): boolean;
   surrender(): boolean;
   updateEmoji(
     newId: number,

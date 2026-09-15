@@ -3323,15 +3323,17 @@ function didConfirmRematchProposal() {
   Board.hideBoardPlayersInfo();
 }
 
-export function didClickEndMatchButton() {
+export function didClickEndMatchButton(): boolean {
   if (isReconnect && !didConnect) {
-    return;
+    return false;
+  }
+  if (!connection.sendEndMatchIndicator()) {
+    return false;
   }
   const wasWaitingForRematch =
     isWaitingForRematchResponse && boardViewMode !== "historicalView";
   showPrimaryAction(PrimaryActionType.None);
   setEndMatchConfirmed(true);
-  connection.sendEndMatchIndicator();
   showWaitingStateText("");
   Board.stopMonsBoardAsDisplayAnimations();
   isWaitingForRematchResponse = false;
@@ -3340,6 +3342,7 @@ export function didClickEndMatchButton() {
     navigateFromWaitingLiveToLastCompletedMatch();
   }
   triggerMoveHistoryPopupReload();
+  return true;
 }
 
 export function didClickPrimaryActionButton(action: PrimaryAction) {

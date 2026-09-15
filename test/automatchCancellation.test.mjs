@@ -4,6 +4,7 @@ import test from "node:test";
 import ts from "typescript";
 import { moveDeliveryStorageKey } from "../src/connection/moveDelivery.ts";
 import { isAutoInviteId } from "../cloud/runtime/shared/ids.js";
+import { rematchSeriesEnded } from "../cloud/runtime/shared/rematches.js";
 import { withAutomatchOperationLock } from "../src/connection/automatchOperationLock.ts";
 import { InviteMetadataState } from "../src/connection/inviteMetadataState.ts";
 
@@ -140,6 +141,7 @@ function harness(invite, onMatchRead = () => {}) {
       },
       withAutomatchOperationLock,
       isAutoInviteId,
+      rematchSeriesEnded,
       ref: (_db, path) => path,
       readMatchSnapshotViaApi: async ({ playerId, matchId }, options) => {
         assert.equal(playerId, UID);
@@ -210,6 +212,9 @@ function harness(invite, onMatchRead = () => {}) {
     updateWagerStateForCurrentMatch: noop,
     observeInviteReactions: noop,
     rematchSeriesEndIsIndicatedForInvite: () => false,
+    isRematchEndPending: () => false,
+    getRematchEndDelivery: () => ({ confirm: noop, refresh: noop }),
+    refreshRematchEndDeliveries: noop,
     maybeRefreshContextAfterRematchMetadata: noop,
     observeWagers: noop,
     observeMatch: (uid) => events.matches.push(uid),

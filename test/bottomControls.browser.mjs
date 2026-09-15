@@ -59,7 +59,7 @@ export const didClickAutomoveButton = () => invoke('automove');
 export const didClickHomeButton = () => invoke('home');
 export const didClickInviteActionButtonBeforeThereIsInviteReady = () => {};
 export const didClickStartBotGameButton = () => {};
-export const didClickEndMatchButton = () => {};
+export const didClickEndMatchButton = () => invoke('end');
 export const didClickConfirmResignButton = () => invoke('resign');
 export const playSameCompletedPuzzleAgain = () => {};
 export const didSelectRematchSeriesMatch = () => {};
@@ -413,6 +413,37 @@ test(
       assert.deepEqual(
         await page.evaluate(() => window.harness.environment.calls),
         [["timer"], ["claim"], ["primary", "joinGame"]],
+      );
+    });
+  },
+);
+
+test(
+  "ending a match immediately shows Finished and removes Play Again",
+  { timeout: 60000 },
+  async () => {
+    await fixture(async (page) => {
+      await page.evaluate(() => {
+        const { port, environment, run } = window.harness;
+        environment.callbacks.end = () => {
+          port.showPrimaryAction(port.PrimaryActionType.None);
+          port.setEndMatchConfirmed(true);
+        };
+        run(() => {
+          port.setEndMatchVisible(true);
+          port.showPrimaryAction(port.PrimaryActionType.Rematch);
+        });
+      });
+      assert.equal(await button(page, "End Match").isDisabled(), false);
+      assert.equal(await count(page, "Play Again"), 1);
+      await click(page, "End Match");
+      assert.equal(await button(page, "Finished").isDisabled(), true);
+      assert.equal(await count(page, "End Match"), 0);
+      assert.equal(await count(page, "Play Again"), 0);
+      await click(page, "Finished");
+      assert.deepEqual(
+        await page.evaluate(() => window.harness.environment.calls),
+        [["end"]],
       );
     });
   },

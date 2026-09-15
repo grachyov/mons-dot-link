@@ -801,12 +801,11 @@ export function endRematchViaApi(
   request: EndRematchRequest,
   tokenProvider: AuthTokenProvider,
 ): Promise<EndRematchResponse> {
-  return retryGameSessionMutation(
+  return gameplayMutation(
     "/rematches/end",
     request,
     tokenProvider,
     isEndRematchResponse,
-    true,
   );
 }
 

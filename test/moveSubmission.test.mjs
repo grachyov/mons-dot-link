@@ -7,6 +7,12 @@ import {
   MoveDelivery,
   moveDeliveryStorageKey,
 } from "../src/connection/moveDelivery.ts";
+import {
+  RematchEndDelivery,
+  rematchEndDeliveryStorageKey,
+  REMATCH_END_STORAGE_PREFIX,
+} from "../src/connection/rematchEndDelivery.ts";
+import { rematchSeriesEnded } from "@mons/shared/rematches";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -55,6 +61,10 @@ const names = [
   "claimVictoryByTimer",
   "updateRatings",
   "resolveWagerOutcome",
+  "getRematchEndDelivery",
+  "isRematchEndPending",
+  "refreshRematchEndDeliveries",
+  "submitRematchEnd",
   "sendEndMatchIndicator",
   "sendRematchProposal",
 ];
@@ -110,6 +120,10 @@ function harness({ token, records = new Map(), onTerminal, onReconnect } = {}) {
   const errors = [];
   const bindings = [];
   const localStorage = {
+    get length() {
+      return records.size;
+    },
+    key: (index) => [...records.keys()][index] ?? null,
     getItem: (key) => records.get(key) ?? null,
     setItem: (key, value) => records.set(key, value),
     removeItem: (key) => records.delete(key),
@@ -129,6 +143,10 @@ function harness({ token, records = new Map(), onTerminal, onReconnect } = {}) {
   const dependencies = {
     MoveDelivery,
     moveDeliveryStorageKey,
+    RematchEndDelivery,
+    rematchEndDeliveryStorageKey,
+    REMATCH_END_STORAGE_PREFIX,
+    rematchSeriesEnded,
     GameplayApiError,
     window: { sessionStorage: localStorage },
     navigator: { onLine: true },
@@ -152,6 +170,14 @@ function harness({ token, records = new Map(), onTerminal, onReconnect } = {}) {
       return value;
     },
     readMatchSnapshotViaApi: async () => ({ match: { ...initialMatch } }),
+    readInviteMetadataViaApi: async (_inviteId, provider) => {
+      await provider(false);
+      provider.assertCurrentUser();
+      return {
+        snapshot: { hostRematches: "", guestRematches: "" },
+        viewer: { role: "host", actorUid: scope.playerId },
+      };
+    },
     surrenderMatchViaApi: terminalCall("surrender"),
     startMatchTimerViaApi: terminalCall("timer"),
     claimMatchVictoryByTimerViaApi: terminalCall("claim"),
@@ -184,6 +210,7 @@ function harness({ token, records = new Map(), onTerminal, onReconnect } = {}) {
     myMatch: { ...initialMatch },
     latestInvite: { hostId: scope.playerId, guestId: "opponent" },
     moveDeliveries: new Map(),
+    rematchEndDeliveries: new Map(),
     confirmedSurrenders: new Set(),
     reconcilingMoveKeys: new Set(),
     moveRecoveryTimers: new Map(),
@@ -327,6 +354,10 @@ for (const [method, kind] of [
     const h = harness();
     h.send();
     const result = h.instance[method]();
+    if (kind === "end") {
+      assert.equal(result, true);
+      assert.ok(h.records.has(rematchEndDeliveryStorageKey(scope)));
+    }
     if (kind === "surrender")
       assert.equal(h.instance.myMatch.status, "surrendered");
     await settle();
@@ -337,6 +368,8 @@ for (const [method, kind] of [
     assert.equal(h.terminal.length, 1);
     assert.equal(h.terminal[0].kind, kind);
     if (result instanceof Promise) await result;
+    if (kind === "end")
+      assert.equal(h.records.has(rematchEndDeliveryStorageKey(scope)), false);
     if (kind === "surrender")
       assert.equal(h.instance.myMatch.status, "surrendered");
   });
@@ -376,6 +409,12 @@ for (const [method, kind, expectedRequest] of endingActions) {
       const h = harness();
       h.send();
       const result = h.instance[method]();
+      const acceptedEnd =
+        kind === "end"
+          ? JSON.parse(h.records.get(rematchEndDeliveryStorageKey(scope)))
+              .record
+          : null;
+      if (kind === "end") assert.equal(result, true);
       const completed =
         result instanceof Promise ? result.catch((error) => error) : result;
       await settle();
@@ -397,8 +436,10 @@ for (const [method, kind, expectedRequest] of endingActions) {
       assert.equal(h.terminal.length, 1);
       assert.equal(h.terminal[0].kind, kind);
       const { operationId, ...request } = h.terminal[0].request;
-      if (kind === "end") assert.equal(typeof operationId, "string");
-      else assert.equal(operationId, undefined);
+      if (kind === "end") {
+        assert.equal(operationId, acceptedEnd.operationId);
+        assert.equal(h.records.has(rematchEndDeliveryStorageKey(scope)), false);
+      } else assert.equal(operationId, undefined);
       assert.deepEqual(request, expectedRequest);
       assert.equal(h.records.has(moveDeliveryStorageKey(scope)), false);
       assert.equal(h.instance.myMatch, replacement);
@@ -434,8 +475,12 @@ for (const [method, kind, expectedRequest] of endingActions) {
       await completed;
       assert.equal(h.terminal.length, 0);
       assert.equal(h.reconnects.length, 0);
+      if (kind === "end")
+        assert.ok(h.records.has(rematchEndDeliveryStorageKey(scope)));
       h.instance.refreshMoveDeliveries();
       for (const delivery of h.instance.moveDeliveries.values())
+        delivery.pause();
+      for (const delivery of h.instance.rematchEndDeliveries.values())
         delivery.pause();
     });
   }

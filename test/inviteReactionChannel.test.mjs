@@ -465,6 +465,7 @@ test("the actual session auth callback tears down participant and spectator reso
       unregisterObserverCleanup: (_contextId, key) => observers.delete(key),
       clearEventSyncCaches: () => undefined,
       refreshMoveDeliveries: () => undefined,
+      refreshRematchEndDeliveries: () => undefined,
       getUserBoundAuthTokenProvider(uid) {
         assert.equal(uid, "original-login");
         return Object.assign(

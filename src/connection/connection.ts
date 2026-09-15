@@ -51,6 +51,12 @@ import {
   type MoveDeliveryScope,
   type MoveDeliveryStorage,
 } from "./moveDelivery";
+import {
+  RematchEndDelivery,
+  rematchEndDeliveryStorageKey,
+  REMATCH_END_STORAGE_PREFIX,
+  type PendingRematchEnd,
+} from "./rematchEndDelivery";
 import { generateNewInviteId } from "../utils/misc";
 import {
   getWagerState,
@@ -440,6 +446,7 @@ class Connection {
     EventSyncCooldownCacheEntry
   >();
   private latestObservedEventById = new Map<string, EventRecord | null>();
+  private readonly rematchEndDeliveries = new Map<string, RematchEndDelivery>();
   private readonly moveDeliveries = new Map<string, MoveDelivery>();
   private readonly reconcilingMoveKeys = new Set<string>();
   private readonly confirmedSurrenders = new Set<string>();
@@ -796,6 +803,16 @@ class Connection {
     if (typeof window !== "undefined") {
       window.addEventListener("online", () => this.refreshMoveDeliveries());
       window.addEventListener("pageshow", () => this.refreshMoveDeliveries());
+      window.addEventListener("online", () =>
+        this.refreshRematchEndDeliveries(),
+      );
+      window.addEventListener("pageshow", () =>
+        this.refreshRematchEndDeliveries(),
+      );
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible")
+          this.refreshRematchEndDeliveries();
+      });
     }
     this.eventPollingRegistry = new EventPollingRegistry({
       addVisibilityListener: (listener) => {
@@ -1628,6 +1645,7 @@ class Connection {
       (user) => {
         const newUid = user?.uid ?? null;
         this.refreshMoveDeliveries();
+        this.refreshRematchEndDeliveries();
         if (
           this.inviteBootstrapLoginUid &&
           newUid !== this.inviteBootstrapLoginUid
@@ -1783,68 +1801,186 @@ class Connection {
     return this.latestInvite?.eventOwned === true;
   }
 
-  public sendEndMatchIndicator(): void {
-    const writableContext = this.requireWritableContext(
+  private getRematchEndDelivery(
+    loginUid: string,
+    inviteId: string,
+  ): RematchEndDelivery {
+    const scope = { loginUid, inviteId };
+    const key = rematchEndDeliveryStorageKey(scope);
+    const existing = this.rematchEndDeliveries.get(key);
+    if (existing) return existing;
+    let persistence: MoveDeliveryStorage | null = null;
+    try {
+      if (typeof window !== "undefined") persistence = window.sessionStorage;
+    } catch {}
+    const delivery = new RematchEndDelivery(scope, {
+      storage: persistence,
+      isAuthorized: () => this.isCurrentAuthUser(loginUid),
+      isOnline: () => typeof navigator === "undefined" || navigator.onLine,
+      submit: (record) => this.submitRematchEnd(record),
+      onError: (error) => console.error("Error ending rematch series:", error),
+      onConfirmed: () => {
+        this.notifyNavigationGamesChanged();
+        if (
+          this.activeContext?.inviteId === inviteId &&
+          this.activeContext.loginUid === loginUid &&
+          this.isCurrentAuthUser(loginUid)
+        ) {
+          this.inviteMetadataSubscription?.channel.requestRefresh();
+        }
+      },
+    });
+    this.rematchEndDeliveries.set(key, delivery);
+    return delivery;
+  }
+
+  private isRematchEndPending(
+    inviteId: string,
+    loginUid = this.auth.currentUser?.uid,
+  ): boolean {
+    return (
+      !!loginUid &&
+      this.isCurrentAuthUser(loginUid) &&
+      !!this.getRematchEndDelivery(loginUid, inviteId).pending
+    );
+  }
+
+  private refreshRematchEndDeliveries(): void {
+    const loginUid = this.auth.currentUser?.uid;
+    if (loginUid) {
+      try {
+        const persistence = window.sessionStorage;
+        for (let index = 0; index < persistence.length; index++) {
+          const key = persistence.key(index);
+          if (!key?.startsWith(REMATCH_END_STORAGE_PREFIX)) continue;
+          const scope: unknown = JSON.parse(
+            key.slice(REMATCH_END_STORAGE_PREFIX.length),
+          );
+          if (
+            Array.isArray(scope) &&
+            scope.length === 2 &&
+            scope[0] === loginUid &&
+            typeof scope[1] === "string"
+          )
+            this.getRematchEndDelivery(loginUid, scope[1]);
+        }
+      } catch {}
+    }
+    for (const delivery of this.rematchEndDeliveries.values()) {
+      if (delivery.pending && this.isCurrentAuthUser(delivery.pending.loginUid))
+        delivery.refresh();
+      else delivery.pause();
+    }
+  }
+
+  private confirmRematchEndFromMetadata(
+    loginUid: string,
+    inviteId: string,
+  ): void {
+    const delivery = this.getRematchEndDelivery(loginUid, inviteId);
+    const record = delivery.pending;
+    if (!record) return;
+    const moves = this.moveDeliveries.get(
+      moveDeliveryStorageKey({
+        loginUid,
+        inviteId,
+        matchId: record.matchId,
+        playerId: record.actorUid,
+      }),
+    );
+    if (moves && !moves.hasPendingMoves) delivery.confirm();
+    else delivery.refresh();
+  }
+
+  private async submitRematchEnd(record: PendingRematchEnd): Promise<void> {
+    const tokenProvider = this.getUserBoundAuthTokenProvider(record.loginUid);
+    const currentContext = () => {
+      const context = this.activeContext;
+      return context?.inviteId === record.inviteId &&
+        context.loginUid === record.loginUid &&
+        this.isCurrentAuthUser(record.loginUid)
+        ? context
+        : null;
+    };
+    const scope = {
+      loginUid: record.loginUid,
+      inviteId: record.inviteId,
+      matchId: record.matchId,
+      playerId: record.actorUid,
+    };
+    let moves = this.moveDeliveries.get(moveDeliveryStorageKey(scope));
+    if (!moves) {
+      const snapshot = await readMatchSnapshotViaApi({
+        playerId: record.actorUid,
+        matchId: record.matchId,
+      });
+      tokenProvider.assertCurrentUser();
+      if (!snapshot.match)
+        throw new GameplayApiError(
+          "unavailable",
+          "end-match-moves-unavailable",
+        );
+      moves = this.getMoveDelivery(scope, snapshot.match as Match);
+    }
+    try {
+      await moves.flush();
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "match-move-finished")
+        throw error;
+    }
+    tokenProvider.assertCurrentUser();
+    const metadata = await readInviteMetadataViaApi(
+      record.inviteId,
+      tokenProvider,
+      {},
+    );
+    tokenProvider.assertCurrentUser();
+    if (rematchSeriesEnded(metadata.snapshot)) {
+      const context = currentContext();
+      if (context)
+        this.applyInviteMetadata(context, metadata.snapshot, metadata.viewer);
+      return;
+    }
+    const response = await endRematchViaApi(
+      {
+        operationId: record.operationId,
+        inviteId: record.inviteId,
+      },
+      tokenProvider,
+    );
+    tokenProvider.assertCurrentUser();
+    const context = currentContext();
+    if (context && this.inviteMetadataState) {
+      this.inviteMetadataState.confirmRematches(
+        response.actorUid,
+        response.rematches,
+      );
+      this.applyInviteMetadata(context, this.inviteMetadataState.snapshot);
+    }
+  }
+
+  public sendEndMatchIndicator(): boolean {
+    const context = this.requireWritableContext(
       undefined,
       "sendEndMatchIndicator",
     );
     if (
-      !writableContext ||
+      !context ||
       !this.latestInvite ||
-      this.rematchSeriesEndIsIndicated()
-    ) {
-      return;
-    }
-    const sessionGuard = this.createMatchContextGuard(
-      writableContext.inviteId,
-      writableContext.matchId,
-    );
-    let tokenProvider: AuthTokenProvider & {
-      readonly assertCurrentUser: () => void;
-    };
-    try {
-      tokenProvider = this.getUserBoundAuthTokenProvider(
-        writableContext.loginUid,
-      );
-    } catch {
-      return;
-    }
-    void this.flushPendingMoves(writableContext, {
-      requireCurrentContext: false,
-    })
-      .then(() =>
-        endRematchViaApi(
-          {
-            operationId: crypto.randomUUID(),
-            inviteId: writableContext.inviteId,
-          },
-          tokenProvider,
-        ),
-      )
-      .then((response) => {
-        tokenProvider.assertCurrentUser();
-        this.notifyNavigationGamesChanged();
-        if (!sessionGuard() || !this.latestInvite) {
-          return;
-        }
-        this.inviteMetadataState?.confirmRematches(
-          response.actorUid,
-          response.rematches,
-        );
-        if (this.inviteMetadataState) {
-          this.applyInviteMetadata(
-            writableContext,
-            this.inviteMetadataState.snapshot,
-          );
-        }
-      })
-      .catch((error) => {
-        console.error("Error ending rematch series:", error);
-      })
-      .finally(() => {
-        if (sessionGuard())
-          this.inviteMetadataSubscription?.channel.requestRefresh();
-      });
+      !this.isCurrentAuthUser(context.loginUid)
+    )
+      return false;
+    if (this.rematchSeriesEndIsIndicated()) return true;
+    return this.getRematchEndDelivery(
+      context.loginUid,
+      context.inviteId,
+    ).accept({
+      loginUid: context.loginUid,
+      inviteId: context.inviteId,
+      matchId: context.matchId,
+      actorUid: context.actorUid,
+      operationId: crypto.randomUUID(),
+    });
   }
 
   public sendRematchProposal(): void {
@@ -1908,6 +2044,20 @@ class Connection {
       if (!sessionGuard()) {
         return;
       }
+      if (this.rematchSeriesEndIsIndicated()) {
+        this.inviteMetadataState?.confirmRematches(
+          response.actorUid,
+          response.rematches,
+        );
+        if (this.inviteMetadataState) {
+          this.applyInviteMetadata(
+            writableContext,
+            this.inviteMetadataState.snapshot,
+          );
+        }
+        this.inviteMetadataSubscription?.channel.requestRefresh();
+        return;
+      }
       this.stopObservingAllMatches();
       this.cleanupInviteMetadataObserver();
       this.cleanupInviteReactionObserver();
@@ -1953,6 +2103,7 @@ class Connection {
         return;
       }
       this.inviteMetadataSubscription?.channel.requestRefresh();
+      if (this.rematchSeriesEndIsIndicated()) return;
       this.maybeRefreshContextAfterRematchMetadata(writableContext);
       if (!sessionGuard()) {
         return;
@@ -1964,7 +2115,10 @@ class Connection {
 
   public rematchSeriesEndIsIndicated(): boolean | null {
     if (!this.latestInvite) return null;
-    return rematchSeriesEnded(this.latestInvite);
+    return (
+      rematchSeriesEnded(this.latestInvite) ||
+      (!!this.inviteId && this.isRematchEndPending(this.inviteId))
+    );
   }
 
   private approvedRematchIndices(
@@ -4252,7 +4406,11 @@ class Connection {
     let rematchIndex =
       this.getLatestBothSidesApprovedRematchIndexForInvite(invite);
     let hasPendingProposal = false;
-    if (!this.rematchSeriesEndIsIndicatedForInvite(invite) && actorUid) {
+    if (
+      !this.rematchSeriesEndIsIndicatedForInvite(invite) &&
+      !this.isRematchEndPending(inviteId) &&
+      actorUid
+    ) {
       const hostHasPending =
         invite.hostId === actorUid && hostIndices.length > guestIndices.length;
       const guestHasPending =
@@ -4286,7 +4444,10 @@ class Connection {
     if (!context.canWrite || !context.actorUid) {
       return;
     }
-    if (this.rematchSeriesEndIsIndicatedForInvite(this.latestInvite)) {
+    if (
+      this.rematchSeriesEndIsIndicatedForInvite(this.latestInvite) ||
+      this.isRematchEndPending(context.inviteId, context.loginUid)
+    ) {
       return;
     }
     const next = this.getLatestMatchIdForActor(
@@ -4530,6 +4691,9 @@ class Connection {
         }
 
         const { actorUid, role } = viewer;
+        if (rematchSeriesEnded(metadata.snapshot)) {
+          this.confirmRematchEndFromMetadata(uid, inviteId);
+        }
         if (!isConnectActive()) {
           return;
         }
@@ -4688,6 +4852,10 @@ class Connection {
         }
 
         didRecoverMyMatch(myMatch!, matchId);
+        if (this.isRematchEndPending(inviteId, uid)) {
+          didReceiveRematchesSeriesEndIndicator();
+          this.getRematchEndDelivery(uid, inviteId).refresh();
+        }
         if (hasPendingProposal) {
           didDiscoverExistingRematchProposalWaitingForResponse();
         }
@@ -4797,6 +4965,9 @@ class Connection {
       return;
     }
     if (viewer) this.inviteMetadataViewer = viewer;
+    if (rematchSeriesEnded(snapshot)) {
+      this.confirmRematchEndFromMetadata(context.loginUid, context.inviteId);
+    }
     const next = state.snapshot;
     this.latestInvite = { ...next, wagers: previous.wagers };
     this.reconcilePendingAutomatchRequest(

@@ -60,11 +60,16 @@ function memoryState() {
   return { values, patches, client };
 }
 
-function persistence(client: StateRepository, database = db) {
+function persistence(
+  client: StateRepository,
+  database = db,
+  onCommitted?: (inviteId: string) => Promise<void>,
+) {
   const persistence = createAutomatchPersistence(
     database,
     matchTestPort(client),
     {
+      onCommitted,
       async prepareMatchPresentations(creations) {
         return creations.map((creation) => ({
           ...creation,
@@ -175,20 +180,150 @@ describe("automatch persistence integration", () => {
     ).toBe(0);
   });
 
+  it("releases the invite before waiting for a slow notification", async () => {
+    const notificationStarted = Promise.withResolvers<void>();
+    const finishNotification = Promise.withResolvers<void>();
+    const notifications: string[] = [];
+    let notified = false;
+    const runtime = persistence(memoryState().client, db, async (inviteId) => {
+      notifications.push(inviteId);
+      notificationStarted.resolve();
+      await finishNotification.promise;
+      notified = true;
+    });
+    const base = createGameSessionMutationLockStore(db);
+    const locks = runtime.decorateLocks(base);
+    const lock = { lockId: "invite-one", operationId: "operation-one" };
+    const nextLock = { ...lock, operationId: "operation-two" };
+    await locks.acquire(lock, "owner", Date.now());
+    const commit = runtime.client.patchRoot({
+      "invites/invite-one": { hostId: "host" },
+      "automatch/invite-one": { uid: "host" },
+    });
+    let release: Promise<void> | undefined;
+    try {
+      expect(
+        await Promise.race([
+          commit.then(() => "committed"),
+          notificationStarted.promise.then(() => "notifying"),
+        ]),
+      ).toBe("committed");
+      expect(notifications).toEqual([]);
+      release = locks.release(lock, "owner");
+      await notificationStarted.promise;
+      await base.acquire(nextLock, "next-owner", Date.now());
+      expect(notified).toBe(false);
+      expect(await runtime.client.getPath("invites/invite-one")).toMatchObject({
+        hostId: "host",
+      });
+    } finally {
+      finishNotification.resolve();
+      await commit;
+      await (release || locks.release(lock, "owner"));
+      await base.release(nextLock, "next-owner");
+    }
+    expect(notifications).toEqual(["invite-one"]);
+    expect(notified).toBe(true);
+  });
+
+  it("coalesces commits until the outer automatch lease is also released", async () => {
+    const notifications: string[] = [];
+    const lockCounts: (number | null)[] = [];
+    const observedInvites: unknown[] = [];
+    const runtime = persistence(memoryState().client, db, async (inviteId) => {
+      notifications.push(inviteId);
+      lockCounts.push(
+        await db
+          .prepare("SELECT COUNT(*) AS n FROM game_session_mutation_locks")
+          .first<number>("n"),
+      );
+      observedInvites.push(await runtime.client.getPath("invites/invite-one"));
+    });
+    const locks = runtime.decorateLocks(createGameSessionMutationLockStore(db));
+    const outer = { lockId: "automatch-owner", operationId: "owner-operation" };
+    const inner = { lockId: "invite-one", operationId: "operation-one" };
+    await locks.acquire(outer, "outer-owner", Date.now());
+    await locks.acquire(inner, "inner-owner", Date.now());
+    await runtime.client.patchRoot({
+      "invites/invite-one": { hostId: "host" },
+      "automatch/invite-one": { uid: "host" },
+    });
+    await runtime.client.patchRoot({
+      "invites/invite-one/hostRematches": "1",
+      "automatch/invite-one": { uid: "host" },
+    });
+    expect(notifications).toEqual([]);
+    await locks.release(inner, "inner-owner");
+    expect(notifications).toEqual([]);
+    await locks.release(outer, "outer-owner");
+    expect(notifications).toEqual(["invite-one"]);
+    expect(lockCounts).toEqual([0]);
+    expect(observedInvites).toMatchObject([{ hostRematches: "1" }]);
+  });
+
+  it.each(["synchronous", "asynchronous"])(
+    "preserves release outcomes when the notification has a %s failure",
+    async (failure) => {
+      for (const releaseFails of [false, true]) {
+        const notifications: string[] = [];
+        const runtime = persistence(memoryState().client, db, (inviteId) => {
+          notifications.push(inviteId);
+          if (failure === "synchronous") throw new Error("notification-failed");
+          return Promise.reject(new Error("notification-failed"));
+        });
+        const base = createGameSessionMutationLockStore(db);
+        const releaseError = new Error("release-outcome-unknown");
+        const locks = runtime.decorateLocks({
+          ...base,
+          async release(lock, ownerId) {
+            await base.release(lock, ownerId);
+            if (releaseFails) throw releaseError;
+          },
+        });
+        const lock = { lockId: "invite-one", operationId: "operation-one" };
+        await locks.acquire(lock, "owner", Date.now());
+        await runtime.client.patchRoot({
+          "invites/invite-one": { hostId: "host" },
+          "automatch/invite-one": { uid: "host" },
+        });
+        expect(notifications).toEqual([]);
+        if (releaseFails) {
+          await expect(locks.release(lock, "owner")).rejects.toBe(releaseError);
+        } else {
+          await expect(locks.release(lock, "owner")).resolves.toBeUndefined();
+        }
+        expect(notifications).toEqual(["invite-one"]);
+      }
+    },
+  );
+
   it("recovers an uncertain match creation before admitting a competing session and preserves moves", async () => {
     const raw = memoryState();
     let failCreation = true;
-    const runtime = persistence({
-      ...raw.client,
-      async transactPath(path, updater, signal) {
-        const result = await raw.client.transactPath(path, updater, signal);
-        if (failCreation) {
-          failCreation = false;
-          throw new Error("connection-lost");
-        }
-        return result;
+    const notifications: string[] = [];
+    const lockCounts: (number | null)[] = [];
+    const runtime = persistence(
+      {
+        ...raw.client,
+        async transactPath(path, updater, signal) {
+          const result = await raw.client.transactPath(path, updater, signal);
+          if (failCreation) {
+            failCreation = false;
+            throw new Error("connection-lost");
+          }
+          return result;
+        },
       },
-    });
+      db,
+      async (inviteId) => {
+        notifications.push(inviteId);
+        lockCounts.push(
+          await db
+            .prepare("SELECT COUNT(*) AS n FROM game_session_mutation_locks")
+            .first<number>("n"),
+        );
+      },
+    );
     const locks = runtime.decorateLocks(createGameSessionMutationLockStore(db));
     const lock = { lockId: "invite-one", operationId: "operation-one" };
     await locks.acquire(lock, "owner", Date.now());
@@ -208,6 +343,7 @@ describe("automatch persistence integration", () => {
       }),
     ).rejects.toThrow("connection-lost");
     await locks.release(lock, "owner");
+    expect(notifications).toEqual([]);
     const match = raw.values.get("players/host/matches/invite-one") as Record<
       string,
       unknown
@@ -222,6 +358,8 @@ describe("automatch persistence integration", () => {
       "next",
       Date.now(),
     );
+    expect(notifications).toEqual(["invite-one"]);
+    expect(lockCounts).toEqual([0]);
     expect(raw.values.get("players/host/matches/invite-one")).toMatchObject({
       fen: "advanced",
       flatMovesString: "move",

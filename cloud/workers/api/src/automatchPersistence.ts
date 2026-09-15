@@ -48,6 +48,24 @@ export function createAutomatchPersistence(
   } = {},
 ) {
   const held = new Map<string, GameSessionLeaseProof>();
+  const pendingNotifications = new Set<string>();
+  const flushNotifications = async (): Promise<void> => {
+    if (held.size || !pendingNotifications.size) return;
+    const inviteIds = [...pendingNotifications];
+    pendingNotifications.clear();
+    await Promise.all(
+      inviteIds.map(async (inviteId) => {
+        try {
+          await onCommitted?.(inviteId);
+        } catch {}
+      }),
+    );
+  };
+  const notifyCommitted = async (inviteId: string): Promise<void> => {
+    if (!onCommitted) return;
+    pendingNotifications.add(inviteId);
+    await flushNotifications();
+  };
   const store = createAutomatchD1Store(db, { now });
   const inviteStore = createInviteSourceD1Store(db, { now });
   const reader = createGameSessionTransitions({
@@ -55,7 +73,7 @@ export function createAutomatchPersistence(
     state: raw,
     store,
     now,
-    onCommitted,
+    onCommitted: notifyCommitted,
     prepareMatchPresentations,
   });
 
@@ -135,7 +153,7 @@ export function createAutomatchPersistence(
           state: raw,
           store,
           now,
-          onCommitted,
+          onCommitted: notifyCommitted,
           prepareMatchPresentations,
           writeGuards: () => automatchAdmissionGuardStatements(db, admission),
           inviteAdmission,
@@ -291,7 +309,7 @@ export function createAutomatchPersistence(
               state: raw,
               store,
               now,
-              onCommitted,
+              onCommitted: notifyCommitted,
               prepareMatchPresentations,
               writeGuards: guards,
               inviteAdmission,
@@ -372,7 +390,7 @@ export function createAutomatchPersistence(
           state: raw,
           store,
           now,
-          onCommitted,
+          onCommitted: notifyCommitted,
           prepareMatchPresentations,
           writeGuards: () => automatchAdmissionGuardStatements(db, admission),
           inviteAdmission,
@@ -395,6 +413,7 @@ export function createAutomatchPersistence(
           } finally {
             if (held.get(lock.lockId)?.ownerId === ownerId)
               held.delete(lock.lockId);
+            await flushNotifications();
           }
         },
         deleteExpired: (nowMs) => base.deleteExpired(nowMs),

@@ -2111,6 +2111,30 @@ test("retries busy and ambiguous failures with the same operation ID", async () 
   assert.deepEqual(bodies, [request, request, request]);
 });
 
+test("end transport leaves busy and unavailable retries to the durable delivery", async () => {
+  for (const [status, error, message] of [
+    [409, "aborted", "invite-busy"],
+    [503, "unavailable", "gameplay-service-unavailable"],
+  ]) {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return jsonResponse({ error, message }, status);
+    };
+    await assert.rejects(
+      endRematchViaApi(
+        {
+          inviteId: "abcdefghijk",
+          operationId: "00000000-0000-4000-8000-000000000001",
+        },
+        async () => "token",
+      ),
+      (value) => value instanceof GameplayApiError && value.message === message,
+    );
+    assert.equal(calls, 1);
+  }
+});
+
 test("bounds structural retries to one request deadline", async (t) => {
   let calls = 0;
   let nowCalls = 0;

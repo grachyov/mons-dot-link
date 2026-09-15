@@ -218,6 +218,7 @@ function harness({
     cleanupInviteReactionObserver: noop,
     clearEventSyncCaches: noop,
     refreshMoveDeliveries: noop,
+    refreshRematchEndDeliveries: noop,
     beginConnectAttempt: noop,
     bumpSessionEpoch() {
       this.sessionEpoch++;

@@ -6,6 +6,11 @@ import { InviteMetadataState } from "../src/connection/inviteMetadataState.ts";
 import { InviteMetadataApiError } from "../src/services/inviteMetadataApi.ts";
 import { withAutomatchOperationLock } from "../src/connection/automatchOperationLock.ts";
 import { moveDeliveryStorageKey } from "../src/connection/moveDelivery.ts";
+import {
+  RematchEndDelivery,
+  rematchEndDeliveryStorageKey,
+  REMATCH_END_STORAGE_PREFIX,
+} from "../src/connection/rematchEndDelivery.ts";
 import { isAutoInviteId } from "../cloud/runtime/shared/ids.js";
 import {
   parseRematchIndices,
@@ -68,6 +73,11 @@ const names = [
   "tryNavigateWatchOnlyToLatestApprovedMatch",
   "sendRematchProposal",
   "sendEndMatchIndicator",
+  "getRematchEndDelivery",
+  "isRematchEndPending",
+  "refreshRematchEndDeliveries",
+  "submitRematchEnd",
+  "confirmRematchEndFromMetadata",
   "rematchSeriesEndIsIndicated",
   "subscribeToAuthChanges",
   "surrender",
@@ -89,6 +99,50 @@ const { outputText } = ts.transpileModule(
   ),
   { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
 );
+const controllerSource = ts.createSourceFile(
+  "gameController.ts",
+  readFileSync(
+    new URL("../src/game/gameController.ts", import.meta.url),
+    "utf8",
+  ),
+  ts.ScriptTarget.Latest,
+  true,
+);
+const endMatchHandler = controllerSource.statements.find(
+  (node) =>
+    ts.isFunctionDeclaration(node) &&
+    node.name?.text === "didClickEndMatchButton",
+);
+const { outputText: endMatchHandlerOutput } = ts.transpileModule(
+  endMatchHandler.getText(controllerSource).replace(/^export /, ""),
+  { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+);
+
+function clickEndMatch(h) {
+  const dependencies = {
+    connection: h.instance,
+    isReconnect: false,
+    didConnect: true,
+    isWaitingForRematchResponse: true,
+    boardViewMode: "waitingLive",
+    pendingRematchNavigationToLiveBoard: false,
+    PrimaryActionType: { None: "none" },
+    showPrimaryAction: () => h.events.ui.push("hide-primary"),
+    setEndMatchConfirmed: () => {
+      assert.ok(h.instance.rematchSeriesEndIsIndicated());
+      h.events.ui.push("optimistic-ended");
+    },
+    showWaitingStateText: () => {},
+    Board: { stopMonsBoardAsDisplayAnimations: () => {} },
+    navigateFromWaitingLiveToLastCompletedMatch: () =>
+      h.events.ui.push("return-to-completed"),
+    triggerMoveHistoryPopupReload: () => {},
+  };
+  return new Function(
+    ...Object.keys(dependencies),
+    `${endMatchHandlerOutput}\nreturn didClickEndMatchButton();`,
+  )(...Object.values(dependencies));
+}
 
 const snapshot = (overrides = {}) => ({
   inviteId: "invite",
@@ -147,6 +201,7 @@ function harness({
   readMatch,
   ensureMatch,
   surrender,
+  records = new Map(),
 } = {}) {
   const events = {
     reads: [],
@@ -177,6 +232,21 @@ function harness({
   let publishedWagerState = null;
   const noop = () => undefined;
   const dependencies = {
+    navigator: { onLine: true },
+    RematchEndDelivery,
+    rematchEndDeliveryStorageKey,
+    REMATCH_END_STORAGE_PREFIX,
+    window: {
+      sessionStorage: {
+        getItem: (key) => records.get(key) ?? null,
+        setItem: (key, value) => records.set(key, value),
+        removeItem: (key) => records.delete(key),
+        key: (index) => [...records.keys()][index] ?? null,
+        get length() {
+          return records.size;
+        },
+      },
+    },
     moveDeliveryStorageKey,
     InviteMetadataState,
     InviteMetadataApiError,
@@ -285,7 +355,7 @@ function harness({
       events.legacyReads.push(path);
       assert.fail(`unexpected legacy read: ${path}`);
     },
-    readMatchSnapshotViaApi: async (input, options) => {
+    readMatchSnapshotViaApi: async (input, options = {}) => {
       events.matchReads.push({ ...input, ...options });
       return {
         ok: true,
@@ -369,6 +439,7 @@ function harness({
     connectAttemptId: 0,
     nextContextId: 1,
     activeContext: null,
+    rematchEndDeliveries: new Map(),
     moveDeliveries: new Map(),
     reconcilingMoveKeys: new Set(),
     confirmedSurrenders: new Set(),
@@ -377,10 +448,18 @@ function harness({
     moveReconnectLastAttemptAt: 0,
     moveReconnectInFlight: false,
     reconnectAfterMatchUpdateFailure: noop,
-    getMoveDelivery: (_scope, match) => ({
-      reconcile: () => match,
-      resume: noop,
-    }),
+    getMoveDelivery: (scope, match) => {
+      const delivery = {
+        reconcile: () => match,
+        resume: noop,
+        suspend: noop,
+        pause: noop,
+        flush: async () => {},
+        hasPendingMoves: false,
+      };
+      instance.moveDeliveries.set(moveDeliveryStorageKey(scope), delivery);
+      return delivery;
+    },
     flushPendingMoves: async () => {},
     refreshMoveDeliveries: noop,
     matchRefs: {},
@@ -439,6 +518,10 @@ function harness({
   });
   return {
     instance,
+    records,
+    pauseEnds: () => {
+      for (const item of instance.rematchEndDeliveries.values()) item.pause();
+    },
     events,
     counters,
     operations,
@@ -750,17 +833,318 @@ test("a pending local proposal defers context rotation and preserves a committed
   h.instance.detachFromMatchSession();
 });
 
-test("end responses close the UI immediately and accept the opponent's canonical end marker", async () => {
-  const h = harness();
+test("end intent is durable before optimistic Finished and survives busy rejection and reload", async () => {
+  const pending = deferred();
+  const records = new Map();
+  let originalRequest;
+  const h = harness({
+    records,
+    end: (request) => {
+      originalRequest = request;
+      return pending.promise;
+    },
+  });
   await h.connect();
-  h.instance.sendEndMatchIndicator();
-  await settle();
-  assert.equal(h.events.ui.filter((value) => value === "ended").length, 1);
-  assert.equal(h.channel().refreshes, 1);
-  h.channel().emit(snapshot({ revision: 2, guestRematches: "x" }));
+  assert.equal(clickEndMatch(h), true);
+  assert.ok(h.events.ui.includes("optimistic-ended"));
   assert.equal(h.instance.latestInvite.hostRematches, "");
+  assert.equal(h.instance.rematchSeriesEndIsIndicated(), true);
+  assert.equal(records.size, 1);
+  await settle();
+  pending.reject(Object.assign(new Error("invite-busy"), { code: "aborted" }));
+  await settle();
+  assert.equal(records.size, 1);
+  assert.equal(h.instance.rematchSeriesEndIsIndicated(), true);
+  h.channel().emit(snapshot({ revision: 2 }));
+  assert.equal(records.size, 1);
+  h.pauseEnds();
+  h.instance.detachFromMatchSession();
+
+  const resumed = deferred();
+  let resumedRequest;
+  const reloaded = harness({
+    records,
+    end: (request) => {
+      resumedRequest = request;
+      return resumed.promise;
+    },
+  });
+  await reloaded.connect();
+  assert.ok(reloaded.events.ui.includes("ended"));
+  assert.equal(reloaded.instance.rematchSeriesEndIsIndicated(), true);
+  await settle();
+  assert.deepEqual(resumedRequest, originalRequest);
+  resumed.resolve({
+    ok: true,
+    inviteId: "invite",
+    actorUid: "host",
+    rematches: "x",
+  });
+  await settle();
+  assert.equal(records.size, 0);
+  assert.equal(reloaded.instance.latestInvite.hostRematches, "x");
+  reloaded.instance.detachFromMatchSession();
+});
+
+test("an end still finishes optimistically and saves when browser storage is full", async () => {
+  const records = new Map();
+  records.set = () => {
+    throw new Error("storage-full");
+  };
+  const pending = deferred();
+  let request;
+  const h = harness({
+    records,
+    end: (value) => {
+      request = value;
+      return pending.promise;
+    },
+  });
+  await h.connect();
+  assert.equal(clickEndMatch(h), true);
+  assert.ok(h.events.ui.includes("optimistic-ended"));
+  assert.equal(h.instance.rematchSeriesEndIsIndicated(), true);
+  await settle();
+  assert.equal(request.inviteId, "invite");
+  pending.resolve({
+    ok: true,
+    inviteId: "invite",
+    actorUid: "host",
+    rematches: "x",
+  });
+  await settle();
+  assert.equal(h.instance.latestInvite.hostRematches, "x");
+  assert.equal(
+    h.instance.getRematchEndDelivery("login", "invite").pending,
+    null,
+  );
+  assert.equal(records.size, 0);
+  h.instance.detachFromMatchSession();
+});
+
+test("a late failure cannot undo authoritative end confirmation or restore its journal", async () => {
+  const pending = deferred();
+  const h = harness({ end: () => pending.promise });
+  await h.connect();
+  assert.equal(clickEndMatch(h), true);
+  await settle();
+  h.channel().emit(snapshot({ revision: 2, guestRematches: "x" }));
+  assert.equal(h.records.size, 0);
+  pending.reject(new Error("network-error"));
+  await settle();
+  assert.equal(h.records.size, 0);
   assert.equal(h.instance.latestInvite.guestRematches, "x");
   h.instance.detachFromMatchSession();
+});
+
+test("a successful end updates the current context after same-invite reconnect", async () => {
+  const pending = deferred();
+  const h = harness({ end: () => pending.promise });
+  await h.connect();
+  clickEndMatch(h);
+  await settle();
+  const originalChannel = h.channel();
+  await h.connect();
+  pending.resolve({
+    ok: true,
+    inviteId: "invite",
+    actorUid: "host",
+    rematches: "x",
+  });
+  await settle();
+  assert.equal(h.instance.latestInvite.hostRematches, "x");
+  assert.equal(h.records.size, 0);
+  assert.equal(originalChannel.refreshes, 0);
+  assert.ok(h.channel().refreshes >= 1);
+  h.instance.detachFromMatchSession();
+});
+
+test("accepted end survives navigation without finishing the replacement invite", async () => {
+  const pending = deferred();
+  const h = harness({ end: () => pending.promise });
+  await h.connect();
+  clickEndMatch(h);
+  await settle();
+  h.setResponse(response(snapshot({ inviteId: "other" })));
+  h.instance.connectToGame("login", "other", false);
+  await settle();
+  pending.resolve({
+    ok: true,
+    inviteId: "invite",
+    actorUid: "host",
+    rematches: "x",
+  });
+  await settle();
+  assert.equal(h.instance.latestInvite.hostRematches, "");
+  assert.equal(h.records.size, 0);
+  assert.equal(h.channel().refreshes, 0);
+  h.instance.detachFromMatchSession();
+});
+
+test("auth replacement retains the original pending end without changing the new account's invite", async () => {
+  const pending = deferred();
+  const h = harness({ end: () => pending.promise });
+  await h.connect();
+  clickEndMatch(h);
+  await settle();
+  h.instance.auth.currentUser = { uid: "replacement" };
+  pending.resolve({
+    ok: true,
+    inviteId: "invite",
+    actorUid: "host",
+    rematches: "x",
+  });
+  await settle();
+  assert.equal(h.instance.latestInvite.hostRematches, "");
+  assert.equal(h.instance.rematchSeriesEndIsIndicated(), false);
+  assert.equal(h.records.size, 1);
+  h.pauseEnds();
+  h.instance.detachFromMatchSession();
+});
+
+for (const rejected of [false, true]) {
+  test(`a late ${rejected ? "failed" : "successful"} rematch proposal cannot reopen an optimistically ended series`, async () => {
+    const proposal = deferred();
+    const ending = deferred();
+    const h = harness({
+      propose: () => proposal.promise,
+      end: () => ending.promise,
+    });
+    await h.connect();
+    const context = h.instance.activeContext;
+    h.instance.sendRematchProposal();
+    assert.equal(clickEndMatch(h), true);
+    await settle();
+    if (rejected) proposal.reject(new Error("proposal-unavailable"));
+    else
+      proposal.resolve({
+        ok: true,
+        inviteId: "invite",
+        actorUid: "host",
+        matchId: "invite1",
+        rematches: "1",
+        match,
+      });
+    await settle();
+    assert.equal(h.instance.activeContext, context);
+    assert.equal(h.events.ui.includes("proposal-created"), false);
+    assert.equal(h.events.ui.includes("proposal-failed"), false);
+    assert.equal(h.instance.rematchSeriesEndIsIndicated(), true);
+    ending.resolve({
+      ok: true,
+      inviteId: "invite",
+      actorUid: "host",
+      rematches: rejected ? "x" : "1x",
+    });
+    await settle();
+    assert.equal(h.records.size, 0);
+    h.instance.detachFromMatchSession();
+  });
+}
+
+test("reload restores Finished on the completed board while flushing the original pending-rematch scope", async () => {
+  const record = {
+    loginUid: "login",
+    inviteId: "invite",
+    actorUid: "host",
+    matchId: "invite1",
+    operationId: "00000000-0000-4000-8000-000000000123",
+  };
+  const records = new Map([
+    [
+      rematchEndDeliveryStorageKey(record),
+      JSON.stringify({ version: 1, record }),
+    ],
+  ]);
+  const ending = deferred();
+  const h = harness({
+    records,
+    initial: response(snapshot({ hostRematches: "1" })),
+    end: () => ending.promise,
+  });
+  await h.connect();
+  assert.equal(h.instance.activeContext.matchId, "invite");
+  assert.ok(h.events.ui.includes("ended"));
+  assert.equal(h.events.ui.includes("pending-rematch"), false);
+  assert.ok(h.events.matchReads.some((value) => value.matchId === "invite1"));
+  ending.resolve({
+    ok: true,
+    inviteId: "invite",
+    actorUid: "host",
+    rematches: "1x",
+  });
+  await settle();
+  assert.equal(records.size, 0);
+  h.instance.detachFromMatchSession();
+});
+
+test("an authenticated wake resumes a stored end even without reopening that invite", async () => {
+  const record = {
+    loginUid: "login",
+    inviteId: "invite",
+    actorUid: "host",
+    matchId: "invite",
+    operationId: "00000000-0000-4000-8000-000000000124",
+  };
+  const records = new Map([
+    [
+      rematchEndDeliveryStorageKey(record),
+      JSON.stringify({ version: 1, record }),
+    ],
+  ]);
+  let request;
+  const h = harness({
+    records,
+    end: (value) => {
+      request = value;
+      return { ok: true, inviteId: "invite", actorUid: "host", rematches: "x" };
+    },
+  });
+  h.instance.refreshRematchEndDeliveries();
+  await settle();
+  assert.equal(request.operationId, record.operationId);
+  assert.equal(records.size, 0);
+  assert.equal(h.events.ui.includes("ended"), false);
+});
+
+test("saved end metadata cannot discard the original move barrier after reload on another route", async () => {
+  const record = {
+    loginUid: "login",
+    inviteId: "invite",
+    actorUid: "host",
+    matchId: "invite1",
+    operationId: "00000000-0000-4000-8000-000000000125",
+  };
+  const records = new Map([
+    [
+      rematchEndDeliveryStorageKey(record),
+      JSON.stringify({ version: 1, record }),
+    ],
+  ]);
+  const barrier = deferred();
+  let endRequests = 0;
+  const h = harness({
+    records,
+    initial: response(snapshot({ hostRematches: "1x" })),
+    end: () => {
+      endRequests++;
+    },
+  });
+  const moves = { hasPendingMoves: true, flush: () => barrier.promise };
+  h.instance.getMoveDelivery = (scope) => {
+    assert.equal(scope.matchId, "invite1");
+    h.instance.moveDeliveries.set(moveDeliveryStorageKey(scope), moves);
+    return moves;
+  };
+  h.instance.refreshRematchEndDeliveries();
+  await settle();
+  h.instance.confirmRematchEndFromMetadata("login", "invite");
+  assert.equal(records.size, 1);
+  moves.hasPendingMoves = false;
+  barrier.resolve();
+  await settle();
+  assert.equal(records.size, 0);
+  assert.equal(endRequests, 0);
 });
 
 test("auth replacement tears down host and spectator metadata resources before callbacks", async () => {
