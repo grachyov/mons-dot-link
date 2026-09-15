@@ -3,13 +3,14 @@ import {
   didOutsideTapDismissWindowPass,
   rewindOutsideTapDismissedAtForReset,
 } from "./controlTiming";
-let latestModalOutsideTapDismissDate = Date.now();
+let latestModalOutsideTapDismissDate: number | null = null;
 
 export const didDismissSomethingWithOutsideTapJustNow = (): void => {
   latestModalOutsideTapDismissDate = Date.now();
 };
 
 export const resetOutsideTapDismissTimeout = (): void => {
+  if (latestModalOutsideTapDismissDate === null) return;
   latestModalOutsideTapDismissDate = rewindOutsideTapDismissedAtForReset(
     latestModalOutsideTapDismissDate,
     isMobile,
@@ -17,6 +18,7 @@ export const resetOutsideTapDismissTimeout = (): void => {
 };
 
 export const didNotDismissAnythingWithOutsideTapJustNow = (): boolean => {
+  if (latestModalOutsideTapDismissDate === null) return true;
   return didOutsideTapDismissWindowPass(
     latestModalOutsideTapDismissDate,
     Date.now(),
