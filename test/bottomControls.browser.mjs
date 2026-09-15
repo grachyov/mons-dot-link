@@ -26,6 +26,13 @@ export const environment = {
   automatchRequests: [],
   cancelRequests: [],
   subscriptions: [],
+  eventSubscriptions: [],
+  activeContext: null,
+  inviteEventId: null,
+  inviteEventOwned: false,
+  eventModalState: { isOpen: false, eventId: null, lastCloseReason: null },
+  eventModalListeners: new Set(),
+  navigationListeners: new Set(),
   transientHandlers: new Set(),
 };
 export const pendingGame = (inviteId) => ({
@@ -47,7 +54,8 @@ export const dismissPendingAutomatchTransition = () => invoke('dismiss');
 export const canHandleUndo = () => true;
 export const isGameWithBot = false;
 export const puzzleMode = false;
-export const isOnlineGame = false;
+export let isOnlineGame = false;
+export const setOnlineGame = value => { isOnlineGame = value; };
 export const isWatchOnly = false;
 export const isMatchOver = () => false;
 export const getBoardViewMode = () => 'activeLive';
@@ -82,9 +90,49 @@ export const connection = {
     environment.calls.push(['connect', inviteId]);
     environment.route = { mode: 'invite', inviteId, path: inviteId };
   },
-  getCurrentInviteEventId: () => null,
-  isCurrentInviteEventOwned: () => false,
+  getActiveContextSnapshot: () => environment.activeContext,
+  getCurrentInviteEventId: () => environment.inviteEventId,
+  isCurrentInviteEventOwned: () => environment.inviteEventOwned,
+  subscribeToEvent(eventId, update) {
+    const subscription = { eventId, update, active: true };
+    environment.eventSubscriptions.push(subscription);
+    return () => { subscription.active = false; };
+  },
   rematchSeriesEndIsIndicated: () => false,
+};
+`;
+const appNavigationSource = `
+import { environment } from 'bottom-environment';
+export const setRoute = route => {
+  environment.route = route;
+  environment.navigationListeners.forEach(listener => listener(route, 'push'));
+};
+export const subscribeToNavigationState = listener => {
+  environment.navigationListeners.add(listener);
+  listener(environment.route, 'init');
+  return () => environment.navigationListeners.delete(listener);
+};
+`;
+const eventModalSource = `
+import { environment } from 'bottom-environment';
+import { setRoute } from 'bottom-app-navigation';
+const emit = () => environment.eventModalListeners.forEach(listener => listener(environment.eventModalState));
+export const getEventModalState = () => environment.eventModalState;
+export const subscribeToEventModalState = listener => {
+  environment.eventModalListeners.add(listener);
+  listener(environment.eventModalState);
+  return () => environment.eventModalListeners.delete(listener);
+};
+export const openEventModal = eventId => {
+  environment.calls.push(['openEvent', eventId]);
+  environment.eventModalState = { isOpen: true, eventId, lastCloseReason: null };
+  setRoute({ ...environment.route, eventId });
+  emit();
+};
+export const closeEventModal = (reason = 'dismiss') => {
+  environment.eventModalState = { isOpen: false, eventId: null, lastCloseReason: reason };
+  setRoute({ ...environment.route, eventId: null });
+  emit();
 };
 `;
 const sessionSource = `
@@ -121,6 +169,9 @@ import BottomControls from '/src/ui/BottomControls.tsx';
 import * as port from '/src/ui/controls/bottomControlsPort.ts';
 import { getLifecycleCounters } from '/src/lifecycle/lifecycleDiagnostics.ts';
 import { environment, pendingGame } from 'bottom-environment';
+import { setOnlineGame } from 'bottom-controller';
+import { setRoute } from 'bottom-app-navigation';
+import { openEventModal, closeEventModal } from 'bottom-event-modal';
 let root = createRoot(document.getElementById('root'));
 const run = callback => flushSync(callback);
 const settle = async callback => {
@@ -158,13 +209,71 @@ window.harness = {
   resetMatch() {
     run(() => environment.transientHandlers.forEach(({ close, clear }) => { close(); clear(); }));
   },
+  updateConnection({ inviteId = null, eventId = null, eventOwned = false, online = false } = {}) {
+    environment.activeContext = inviteId ? { inviteId, matchId: inviteId, canWrite: false, contextId: 1 } : null;
+    environment.inviteEventId = eventId;
+    environment.inviteEventOwned = eventOwned;
+    setOnlineGame(online);
+    window.harness.render();
+  },
+  navigate(route) { run(() => setRoute(route)); },
+  openEvent(eventId) { run(() => openEventModal(eventId)); },
+  dismissEvent() { run(() => closeEventModal()); },
+  launchEventGame(inviteId) {
+    run(() => {
+      setRoute({ mode: 'invite', inviteId, path: inviteId });
+      closeEventModal('launch_game');
+    });
+  },
+  publishEvent(eventId, emojiIds) {
+    run(() => environment.eventSubscriptions.findLast(subscription => subscription.active && subscription.eventId === eventId).update({
+      participants: Object.fromEntries(emojiIds.map((emojiId, index) => [index, {
+        profileId: 'participant-' + index, displayName: 'Player ' + index, emojiId, joinedAtMs: index,
+      }])),
+    }));
+  },
   counters: getLifecycleCounters,
   dispose() { run(() => root.unmount()); },
 };
-window.harness.render();
 `;
 
-async function fixture(run) {
+const realNavigationHarnessSource = `
+import * as session from '/src/session/AppSessionManager.ts';
+import * as modal from '/src/ui/event/modalState.ts';
+import * as navigation from '/src/navigation/appNavigation.ts';
+import { getCurrentRouteState, getRoutePathForTarget } from '/src/navigation/routeState.ts';
+import { connection } from 'bottom-connection';
+Object.assign(window.harness, {
+  navigate: route => navigation.pushRoutePath(getRoutePathForTarget(route)),
+  openEvent: modal.openEventModal,
+  dismissEvent: modal.closeEventModal,
+  launchEventGame(inviteId) {
+    const route = getCurrentRouteState();
+    if (route.mode === 'invite' && route.inviteId === inviteId) {
+      return modal.closeEventModal({ reason: 'launch_game' });
+    }
+    modal.prepareEventModalGameLaunch(inviteId);
+    connection.connectToInvite(inviteId);
+  },
+  holdBootstrap(inviteId) {
+    environment.bootstrapGate = { inviteId, ...Promise.withResolvers() };
+  },
+  releaseBootstrap() {
+    environment.bootstrapGate.resolve();
+    environment.bootstrapGate = null;
+  },
+  navigationState: () => ({
+    route: getCurrentRouteState(),
+    modal: modal.getEventModalState(),
+    transitioning: session.isTransitionInProgress(),
+    bootstraps: environment.bootstraps,
+  }),
+});
+navigation.replaceRoutePath('/event-game-1');
+session.initializeAppSessionManager();
+`;
+
+async function fixture(run, { realNavigation = false } = {}) {
   const modules = new Map([
     ["bottom-environment", environmentSource],
     ["bottom-controller", controllerSource],
@@ -172,7 +281,9 @@ async function fixture(run) {
     ["bottom-session", sessionSource],
     ["bottom-transient", transientSource],
     ["bottom-navigation", navigationSource],
-    ["bottom-harness", harnessSource],
+    ["bottom-app-navigation", appNavigationSource],
+    ["bottom-event-modal", eventModalSource],
+    ["bottom-harness", harnessSource + "\nwindow.harness.render();"],
   ]);
   const replacements = new Map([
     ["../game/gameController", "bottom-controller"],
@@ -180,6 +291,8 @@ async function fixture(run) {
     ["../session/AppSessionManager", "bottom-session"],
     ["./uiSession", "bottom-transient"],
     ["./NavigationPicker", "bottom-navigation"],
+    ["../navigation/appNavigation", "bottom-app-navigation"],
+    ["./eventModalController", "bottom-event-modal"],
   ]);
   const stubs = new Map([
     [
@@ -235,16 +348,77 @@ async function fixture(run) {
       "import { environment } from 'bottom-environment'; export const getCurrentRouteState = () => environment.route;",
     ],
     ["../content/problems", "export const problems = [];"],
-    ["../content/emojis", "export const emojis = {};"],
     [
-      "./eventModalController",
-      "export const getEventModalState = () => ({ isOpen: false, eventId: null }); export const openEventModal = () => {}; export const subscribeToEventModalState = () => () => {};",
+      "../content/emojis",
+      "export const emojis = { getEmojiUrl: emojiId => '/__emoji/' + emojiId + '.svg' };",
     ],
   ]);
   for (const [id, source] of stubs) {
     const name = "bottom-stub-" + id;
     replacements.set(id, name);
     modules.set(name, source);
+  }
+  if (realNavigation) {
+    for (const id of [
+      "../session/AppSessionManager",
+      "../navigation/appNavigation",
+      "../navigation/routeState",
+      "./eventModalController",
+    ]) {
+      replacements.delete(id);
+    }
+    modules.set(
+      "bottom-harness",
+      harnessSource +
+        realNavigationHarnessSource +
+        "\nwindow.harness.render();",
+    );
+    modules.set(
+      "bottom-connection",
+      connectionSource +
+        `
+import { transition } from '/src/session/AppSessionManager.ts';
+connection.connectToInvite = inviteId => {
+  environment.calls.push(['connect', inviteId]);
+  void transition({ mode: 'invite', path: inviteId, inviteId,
+    eventId: null, snapshotId: null, autojoin: false });
+};
+`,
+    );
+    modules.set(
+      "bottom-controller",
+      controllerSource +
+        `
+import { setHomeVisible } from '/src/ui/controls/bottomControlsPort.ts';
+environment.bootstraps = [];
+export const go = async target => {
+  environment.bootstraps.push(target.inviteId);
+  isOnlineGame = target.mode === 'invite';
+  setHomeVisible(isOnlineGame);
+  const gate = environment.bootstrapGate;
+  if (gate?.inviteId === target.inviteId) await gate.promise;
+};
+`,
+    );
+    modules.set(
+      "bottom-main-load",
+      "export const markMainGameLoaded = () => {};",
+    );
+    modules.set(
+      "bottom-lifecycle",
+      `
+import { environment } from 'bottom-environment';
+import { setOnlineGame } from 'bottom-controller';
+export const teardownMatchScope = () => {
+  environment.activeContext = null;
+  environment.inviteEventId = null;
+  environment.inviteEventOwned = false;
+  setOnlineGame(false);
+  environment.transientHandlers.forEach(({ close, clear }) => { close(); clear(); });
+};
+export const teardownProfileScope = () => {};
+`,
+    );
   }
   const server = await createServer({
     root: repository,
@@ -268,13 +442,19 @@ async function fixture(run) {
             if (request.url !== "/__bottom") return next();
             response.setHeader("Content-Type", "text/html");
             response.end(
-              '<div id="root"></div><script type="module" src="/__bottom-harness.js"></script>',
+              '<div id="monsboard"></div><div id="root"></div><script type="module" src="/__bottom-harness.js"></script>',
             );
           });
         },
         resolveId(id, importer) {
           if (id === "/__bottom-harness.js") return "\0bottom-harness";
           if (modules.has(id)) return "\0" + id;
+          if (realNavigation && importer?.endsWith("/AppSessionManager.ts")) {
+            if (id === "../game/gameController") return "\0bottom-controller";
+            if (id === "../lifecycle/lifecycleManager")
+              return "\0bottom-lifecycle";
+            if (id === "../game/mainGameLoadState") return "\0bottom-main-load";
+          }
           if (
             importer?.endsWith("/BottomControls.tsx") &&
             replacements.has(id)
@@ -344,6 +524,354 @@ const startAutomatch = async (page) => {
   );
   await click(page, "Automatch");
 };
+const enterEventGame = async (
+  page,
+  inviteId = "event-game-1",
+  eventId = "event-1",
+) => {
+  await page.evaluate(
+    ({ inviteId, eventId }) => {
+      window.harness.navigate({ mode: "invite", inviteId, path: inviteId });
+      window.harness.updateConnection({
+        inviteId,
+        eventId,
+        eventOwned: true,
+        online: true,
+      });
+      window.harness.publishEvent(eventId, [1, 2, 3]);
+    },
+    { inviteId, eventId },
+  );
+};
+const activeEventSubscriptions = (page) =>
+  page.evaluate(() =>
+    window.harness.environment.eventSubscriptions
+      .filter((subscription) => subscription.active)
+      .map((subscription) => subscription.eventId),
+  );
+const rememberEventButton = (page) =>
+  button(page, "Event").evaluate((element) => {
+    window.savedEventButton = element;
+    window.savedEventAvatars = [...element.querySelectorAll("img")];
+    window.savedEventSubscription =
+      window.harness.environment.eventSubscriptions.findLast(
+        (subscription) => subscription.active,
+      );
+    window.savedEventSubscriptionCount =
+      window.harness.environment.eventSubscriptions.length;
+  });
+const assertEventButtonRetained = async (page) => {
+  assert.deepEqual(
+    await button(page, "Event").evaluate((element) => {
+      const avatars = [...element.querySelectorAll("img")];
+      return {
+        sameButton: element === window.savedEventButton,
+        sameAvatars:
+          avatars.length === 3 &&
+          avatars.every(
+            (avatar, index) => avatar === window.savedEventAvatars[index],
+          ),
+        avatarUrls: avatars.map((avatar) => avatar.getAttribute("src")),
+        subscriptionActive: window.savedEventSubscription.active,
+        subscriptionUnchanged:
+          window.harness.environment.eventSubscriptions.length ===
+          window.savedEventSubscriptionCount,
+      };
+    }),
+    {
+      sameButton: true,
+      sameAvatars: true,
+      avatarUrls: ["/__emoji/1.svg", "/__emoji/2.svg", "/__emoji/3.svg"],
+      subscriptionActive: true,
+      subscriptionUnchanged: true,
+    },
+  );
+};
+
+test(
+  "event button survives real session navigation, queued overlays, and browser history while a game loads",
+  { timeout: 60000 },
+  async () => {
+    await fixture(
+      async (page) => {
+        await page.waitForFunction(
+          () => !window.harness.navigationState().transitioning,
+        );
+        await page.evaluate(() => {
+          window.harness.updateConnection({
+            inviteId: "event-game-1",
+            eventId: "event-1",
+            eventOwned: true,
+            online: true,
+          });
+          window.harness.publishEvent("event-1", [1, 2, 3]);
+        });
+        await rememberEventButton(page);
+        await click(page, "Event");
+        await page.evaluate(() => {
+          window.harness.holdBootstrap("event-game-2");
+          window.harness.launchEventGame("event-game-2");
+        });
+        await page.waitForFunction(
+          () =>
+            window.harness.navigationState().bootstraps.at(-1) ===
+            "event-game-2",
+        );
+        assert.deepEqual(
+          await page.evaluate(() => {
+            const { route, modal, transitioning } =
+              window.harness.navigationState();
+            return {
+              inviteId: route.inviteId,
+              closeReason: modal.lastCloseReason,
+              transitioning,
+            };
+          }),
+          {
+            inviteId: "event-game-2",
+            closeReason: "launch_game",
+            transitioning: true,
+          },
+        );
+        await assertEventButtonRetained(page);
+
+        await click(page, "Event");
+        assert.equal(
+          await page.evaluate(
+            () => window.harness.navigationState().modal.eventId,
+          ),
+          "event-1",
+        );
+        await assertEventButtonRetained(page);
+        await page.evaluate(() =>
+          window.harness.launchEventGame("event-game-2"),
+        );
+        await assertEventButtonRetained(page);
+
+        await page.evaluate(() => window.history.back());
+        await page.waitForFunction(
+          () => window.harness.navigationState().modal.eventId === "event-1",
+        );
+        await assertEventButtonRetained(page);
+        await page.evaluate(() => window.history.forward());
+        await page.waitForFunction(
+          () => !window.harness.navigationState().modal.isOpen,
+        );
+        await assertEventButtonRetained(page);
+
+        await page.evaluate(() => window.harness.releaseBootstrap());
+        await page.waitForFunction(
+          () => !window.harness.navigationState().transitioning,
+        );
+        assert.deepEqual(
+          await page.evaluate(
+            () => window.harness.navigationState().bootstraps,
+          ),
+          ["event-game-1", "event-game-2"],
+        );
+        await page.evaluate(() =>
+          window.harness.updateConnection({
+            inviteId: "event-game-2",
+            eventId: "event-1",
+            eventOwned: true,
+            online: true,
+          }),
+        );
+        await assertEventButtonRetained(page);
+      },
+      { realNavigation: true },
+    );
+  },
+);
+
+test(
+  "event game navigation retains the button, avatars, and subscription through slow loading and modal dismissal",
+  { timeout: 60000 },
+  async () => {
+    await fixture(async (page) => {
+      await enterEventGame(page);
+      await rememberEventButton(page);
+      await click(page, "Event");
+      await page.evaluate(() => {
+        window.harness.launchEventGame("event-game-2");
+        window.harness.updateConnection();
+        window.harness.resetMatch();
+      });
+      await assertEventButtonRetained(page);
+      await page.clock.runFor(3001);
+      await assertEventButtonRetained(page);
+      await click(page, "Event");
+      assert.equal(
+        await page.evaluate(
+          () => window.harness.environment.eventModalState.eventId,
+        ),
+        "event-1",
+      );
+      await assertEventButtonRetained(page);
+      await page.evaluate(() => window.harness.dismissEvent());
+      await assertEventButtonRetained(page);
+      await page.clock.runFor(10000);
+      await assertEventButtonRetained(page);
+      await page.evaluate(() =>
+        window.harness.updateConnection({
+          inviteId: "event-game-2",
+          eventId: "event-1",
+          eventOwned: true,
+          online: true,
+        }),
+      );
+      await assertEventButtonRetained(page);
+      await page.evaluate(() => window.harness.dispose());
+      assert.deepEqual(await activeEventSubscriptions(page), []);
+      assert.deepEqual(
+        await page.evaluate(() => ({
+          modalListeners: window.harness.environment.eventModalListeners.size,
+          navigationListeners:
+            window.harness.environment.navigationListeners.size,
+        })),
+        { modalListeners: 0, navigationListeners: 0 },
+      );
+    });
+  },
+);
+
+test(
+  "rapid bracket selections retain the latest destination and ignore outgoing game metadata",
+  { timeout: 60000 },
+  async () => {
+    await fixture(async (page) => {
+      await enterEventGame(page);
+      await page.evaluate(() => {
+        window.harness.openEvent("event-2");
+        window.harness.launchEventGame("event-2-game-1");
+      });
+      assert.deepEqual(await activeEventSubscriptions(page), ["event-2"]);
+      await click(page, "Event");
+      assert.equal(
+        await page.evaluate(
+          () => window.harness.environment.eventModalState.eventId,
+        ),
+        "event-2",
+      );
+      await page.evaluate(() =>
+        window.harness.launchEventGame("event-2-game-2"),
+      );
+      assert.deepEqual(await activeEventSubscriptions(page), ["event-2"]);
+      await page.evaluate(() => {
+        window.harness.openEvent("event-3");
+        window.harness.launchEventGame("event-3-game-1");
+        window.harness.updateConnection({
+          inviteId: "event-2-game-2",
+          eventId: "event-2",
+          eventOwned: true,
+          online: true,
+        });
+      });
+      assert.deepEqual(await activeEventSubscriptions(page), ["event-3"]);
+      await page.clock.runFor(3001);
+      await click(page, "Event");
+      assert.equal(
+        await page.evaluate(
+          () => window.harness.environment.eventModalState.eventId,
+        ),
+        "event-3",
+      );
+      await page.evaluate(() => {
+        window.harness.dismissEvent();
+        window.harness.updateConnection({
+          inviteId: "event-3-game-1",
+          eventId: "event-3",
+          eventOwned: true,
+          online: true,
+        });
+      });
+      assert.deepEqual(await activeEventSubscriptions(page), ["event-3"]);
+    });
+  },
+);
+
+test(
+  "leaving a retained event game clears its button immediately and does not revive retention on return",
+  { timeout: 60000 },
+  async () => {
+    await fixture(async (page) => {
+      for (const route of [
+        { mode: "home", path: "" },
+        { mode: "invite", inviteId: "unrelated-game", path: "unrelated-game" },
+      ]) {
+        await enterEventGame(page);
+        await click(page, "Event");
+        await page.evaluate(() =>
+          window.harness.launchEventGame("event-game-2"),
+        );
+        assert.equal(await count(page, "Event"), 1);
+        await page.evaluate((route) => window.harness.navigate(route), route);
+        assert.equal(await count(page, "Event"), 0);
+        assert.deepEqual(await activeEventSubscriptions(page), []);
+        await page.evaluate(() => {
+          window.harness.navigate({
+            mode: "invite",
+            inviteId: "event-game-2",
+            path: "event-game-2",
+          });
+          window.harness.render();
+        });
+        assert.equal(await count(page, "Event"), 0);
+      }
+    });
+  },
+);
+
+test(
+  "destination metadata replaces retention when it reports no event, nonownership, or a different event",
+  { timeout: 60000 },
+  async () => {
+    await fixture(async (page) => {
+      for (const destination of [
+        { eventId: null, eventOwned: true, expectedEventId: null },
+        { eventId: "event-1", eventOwned: false, expectedEventId: null },
+        { eventId: "event-2", eventOwned: true, expectedEventId: "event-2" },
+      ]) {
+        await enterEventGame(page);
+        await click(page, "Event");
+        await page.evaluate(() => {
+          window.harness.launchEventGame("event-game-2");
+          window.harness.updateConnection();
+        });
+        assert.equal(await count(page, "Event"), 1);
+        await page.evaluate(
+          (destination) =>
+            window.harness.updateConnection({
+              inviteId: "event-game-2",
+              online: true,
+              ...destination,
+            }),
+          destination,
+        );
+        assert.deepEqual(
+          await activeEventSubscriptions(page),
+          destination.expectedEventId ? [destination.expectedEventId] : [],
+        );
+        assert.equal(
+          await count(page, "Event"),
+          destination.expectedEventId ? 1 : 0,
+        );
+        if (destination.expectedEventId) {
+          await click(page, "Event");
+          assert.equal(
+            await page.evaluate(
+              () => window.harness.environment.eventModalState.eventId,
+            ),
+            destination.expectedEventId,
+          );
+          await page.evaluate(() => window.harness.dismissEvent());
+        }
+        await page.evaluate(() => window.harness.updateConnection());
+        assert.equal(await count(page, "Event"), 0);
+      }
+    });
+  },
+);
 
 test(
   "BottomControls preserves synchronous controller callback ordering and exclusive confirmations",

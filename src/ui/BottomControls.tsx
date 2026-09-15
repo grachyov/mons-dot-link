@@ -127,6 +127,7 @@ import {
   transitionToHome,
 } from "../session/AppSessionManager";
 import { getCurrentRouteState } from "../navigation/routeState";
+import { subscribeToNavigationState } from "../navigation/appNavigation";
 import { registerBottomControlsTransientUiHandler } from "./uiSession";
 import {
   decrementLifecycleCounter,
@@ -206,7 +207,6 @@ export {
 } from "./controls/bottomControlsPort";
 
 const EVENT_MODAL_NAV_AUTOCLOSE_SUPPRESS_MS = 10000;
-const EVENT_GAME_BUTTON_STICKY_DURATION_MS = 2500;
 const rematchSeriesDigitsFontFamily =
   'ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, "Liberation Mono", "Courier New", monospace';
 let pendingImmediateCancelAutomatchInviteId: string | null = null;
@@ -721,8 +721,10 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
   const [selectedEventModalId, setSelectedEventModalId] = useState<
     string | null
   >(initialEventModalState.isOpen ? initialEventModalState.eventId : null);
-  const [eventGameButtonStickyEventId, setEventGameButtonStickyEventId] =
-    useState<string | null>(null);
+  const [retainedEventGame, setRetainedEventGame] = useState<{
+    eventId: string;
+    inviteId: string;
+  } | null>(null);
 
   const [waitingStateText, setWaitingStateText] = useState("");
   const [isVoiceReactionButtonVisible, setIsVoiceReactionButtonVisible] =
@@ -767,7 +769,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     hasConfirmedSnapshot: hasFrozenSnapshot,
   } = useAvailableMaterials();
   const eventCloudSubscriptionEventIdRef = useRef<string | null>(null);
-  const eventGameButtonStickyTimeoutRef = useRef<number | null>(null);
   const navigationSelectionEpochRef = useRef(0);
   const beginInviteFlowRef = useRef<
     (options?: { skipSoundInit?: boolean }) => void
@@ -893,37 +894,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     setIsEndMatchTemporarilyDisabled(false);
     setIsVoiceReactionDisabled(false);
   }, []);
-
-  const clearEventGameButtonStickyState = useCallback(() => {
-    if (eventGameButtonStickyTimeoutRef.current !== null) {
-      window.clearTimeout(eventGameButtonStickyTimeoutRef.current);
-      eventGameButtonStickyTimeoutRef.current = null;
-    }
-    setEventGameButtonStickyEventId(null);
-  }, []);
-
-  const holdEventGameButtonDuringLaunchTransition = useCallback(
-    (eventId: string) => {
-      const normalizedEventId =
-        typeof eventId === "string" ? eventId.trim() : "";
-      if (!normalizedEventId) {
-        clearEventGameButtonStickyState();
-        return;
-      }
-      if (eventGameButtonStickyTimeoutRef.current !== null) {
-        window.clearTimeout(eventGameButtonStickyTimeoutRef.current);
-        eventGameButtonStickyTimeoutRef.current = null;
-      }
-      setEventGameButtonStickyEventId(normalizedEventId);
-      eventGameButtonStickyTimeoutRef.current = window.setTimeout(() => {
-        eventGameButtonStickyTimeoutRef.current = null;
-        setEventGameButtonStickyEventId((currentValue) =>
-          currentValue === normalizedEventId ? null : currentValue,
-        );
-      }, EVENT_GAME_BUTTON_STICKY_DURATION_MS);
-    },
-    [clearEventGameButtonStickyState],
-  );
 
   useEffect(() => {
     isTimerButtonDisabledRef.current = isTimerButtonDisabled;
@@ -1220,13 +1190,15 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
           pendingNavigationOpenedEventModalRequestedAtMsRef.current = 0;
         }
         if (state.lastCloseReason === "launch_game" && closingEventId) {
-          holdEventGameButtonDuringLaunchTransition(closingEventId);
-        } else {
-          clearEventGameButtonStickyState();
+          const route = getCurrentRouteState();
+          setRetainedEventGame(
+            route.mode === "invite" && route.inviteId
+              ? { eventId: closingEventId, inviteId: route.inviteId }
+              : null,
+          );
         }
       } else if (isVisible) {
         pendingNavigationOpenedEventModalRequestedAtMsRef.current = 0;
-        clearEventGameButtonStickyState();
       } else {
         activeEventModalEventIdRef.current = null;
       }
@@ -1234,10 +1206,17 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
       wasEventModalVisibleRef.current = isVisible;
       setSelectedEventModalId(isVisible ? state.eventId : null);
     });
-  }, [
-    clearEventGameButtonStickyState,
-    holdEventGameButtonDuringLaunchTransition,
-  ]);
+  }, []);
+
+  useEffect(() => {
+    return subscribeToNavigationState((route) => {
+      setRetainedEventGame((current) =>
+        route.mode === "invite" && current?.inviteId === route.inviteId
+          ? current
+          : null,
+      );
+    });
+  }, []);
 
   useEffect(() => {
     navigationSelectionEpochRef.current += 1;
@@ -1248,10 +1227,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
 
   useEffect(() => {
     return () => {
-      if (eventGameButtonStickyTimeoutRef.current !== null) {
-        window.clearTimeout(eventGameButtonStickyTimeoutRef.current);
-        eventGameButtonStickyTimeoutRef.current = null;
-      }
       clearAllMatchScopedTimeouts();
       hourglassEnableTimeoutRef.current = null;
       hourglassEnableDeadlineRef.current = null;
@@ -2251,42 +2226,33 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
       : routeState.mode === "invite"
         ? routeState.inviteId
         : null;
-  const currentInviteEventId = connection.getCurrentInviteEventId();
-  const routeIsInvite = routeState.mode === "invite";
-  const shouldUseStickyEventGameButton =
-    routeIsInvite &&
-    !!eventGameButtonStickyEventId &&
-    (!currentInviteEventId ||
-      currentInviteEventId === eventGameButtonStickyEventId);
+  const routeInviteId =
+    routeState.mode === "invite" ? routeState.inviteId : null;
+  const hasCurrentInviteContext =
+    !!routeInviteId &&
+    connection.getActiveContextSnapshot()?.inviteId === routeInviteId;
+  const currentInviteEventId =
+    hasCurrentInviteContext && connection.isCurrentInviteEventOwned()
+      ? connection.getCurrentInviteEventId()
+      : null;
+  const shouldRetainEventGameButton =
+    !!retainedEventGame &&
+    retainedEventGame.inviteId === routeInviteId &&
+    (!hasCurrentInviteContext ||
+      currentInviteEventId === retainedEventGame.eventId);
   const effectiveInviteEventId =
     currentInviteEventId ??
-    (shouldUseStickyEventGameButton ? eventGameButtonStickyEventId : null);
+    (shouldRetainEventGameButton ? retainedEventGame.eventId : null);
   const isEventGameButtonVisible =
-    (isOnlineGame &&
-      connection.isCurrentInviteEventOwned() &&
-      !!currentInviteEventId) ||
-    shouldUseStickyEventGameButton;
+    (isOnlineGame && !!currentInviteEventId) || shouldRetainEventGameButton;
 
   useEffect(() => {
-    if (!eventGameButtonStickyEventId) {
-      return;
+    if (retainedEventGame && !shouldRetainEventGameButton) {
+      setRetainedEventGame((current) =>
+        current === retainedEventGame ? null : current,
+      );
     }
-    if (!routeIsInvite) {
-      clearEventGameButtonStickyState();
-      return;
-    }
-    if (
-      currentInviteEventId &&
-      currentInviteEventId !== eventGameButtonStickyEventId
-    ) {
-      clearEventGameButtonStickyState();
-    }
-  }, [
-    clearEventGameButtonStickyState,
-    currentInviteEventId,
-    eventGameButtonStickyEventId,
-    routeIsInvite,
-  ]);
+  }, [retainedEventGame, shouldRetainEventGameButton]);
 
   useEffect(() => {
     if (!effectiveInviteEventId) {
