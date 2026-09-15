@@ -1,10 +1,11 @@
-import { MatchWagerState } from "../connection/connectionModels";
+import type { MatchWagerState } from "../connection/connectionModels";
 
 type WagerStateListener = (state: MatchWagerState | null) => void;
 
 let currentMatchId: string | null = null;
 let currentState: MatchWagerState | null = null;
 let currentStateMatchId: string | null = null;
+let hasConfirmedSnapshot = false;
 
 const listeners = new Set<WagerStateListener>();
 
@@ -19,6 +20,7 @@ export const setCurrentWagerMatch = (matchId: string | null) => {
   if (matchId !== currentStateMatchId) {
     currentState = null;
     currentStateMatchId = null;
+    hasConfirmedSnapshot = false;
   }
   notify();
 };
@@ -38,8 +40,10 @@ export const setWagerState = (
 export const syncCurrentWagerMatchState = (
   matchId: string | null,
   state: MatchWagerState | null,
+  confirmed = false,
 ) => {
   currentMatchId = matchId;
+  hasConfirmedSnapshot = matchId !== null && confirmed;
   if (!matchId) {
     currentState = null;
     currentStateMatchId = null;
@@ -53,6 +57,8 @@ export const syncCurrentWagerMatchState = (
 
 export const getWagerState = () => currentState;
 
+export const hasConfirmedWagerSnapshot = () => hasConfirmedSnapshot;
+
 export const subscribeToWagerState = (listener: WagerStateListener) => {
   listeners.add(listener);
   listener(currentState);
@@ -65,5 +71,6 @@ export const resetWagerStore = () => {
   currentMatchId = null;
   currentState = null;
   currentStateMatchId = null;
+  hasConfirmedSnapshot = false;
   notify();
 };

@@ -7,10 +7,11 @@ import {
   type MaterialImageUrls,
 } from "../resources/materialImageResources";
 
-export const useMaterialImages = (): MaterialImageUrls => {
+export const useMaterialImages = (enabled: boolean): MaterialImageUrls => {
   const [urls, setUrls] = useState(getCachedMaterialImageUrls);
 
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
     const updateUrl = (name: MiningMaterialName, url: string | null) => {
       if (cancelled) return;
@@ -28,7 +29,7 @@ export const useMaterialImages = (): MaterialImageUrls => {
       cancelled = true;
       unsubscribe();
     };
-  }, []);
+  }, [enabled]);
 
   return urls;
 };

@@ -888,10 +888,7 @@ export async function didUpdateIdCardMons() {
   }
 }
 
-async function initializeAssets(
-  onStart: boolean,
-  isProfileMonsChange: boolean,
-) {
+async function initializeAssets(isProfileMonsChange: boolean) {
   assets = (await loadGameAssets(currentAssetsSet)).gameAssets;
 
   if (isExperimentingWithSprites) {
@@ -964,25 +961,14 @@ async function initializeAssets(
   bomb = loadImage(assets.bomb, "bomb");
   supermana = loadImage(assets.supermana, "supermana");
   supermanaSimple = loadImage(assets.supermanaSimple, "supermanaSimple");
-
-  if (onStart) {
-    Object.values(AssetsSet)
-      .filter((set) => set !== currentAssetsSet)
-      .forEach((set) => {
-        loadGameAssets(set).catch(() => {});
-      });
-    if (!isExperimentingWithSprites) {
-      import(`../assets/monsSprites`).catch(() => {});
-    }
-  }
 }
 
-await initializeAssets(true, false);
+await initializeAssets(false);
 
 export async function didToggleItemsStyleSet(
   isProfileMonsChange: boolean = false,
 ) {
-  await initializeAssets(false, isProfileMonsChange);
+  await initializeAssets(isProfileMonsChange);
 
   removeHighlights();
   cleanAllPixels();
@@ -3954,10 +3940,6 @@ export function setupBoard() {
   }
 
   refreshWaves();
-
-  setManagedBoardTimeout(() => {
-    preloadParticleEffects().catch(console.error);
-  }, 100);
 }
 
 export function disposeBoardRuntime() {

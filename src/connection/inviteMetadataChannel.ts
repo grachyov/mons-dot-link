@@ -40,6 +40,7 @@ type InviteMetadataChannelDependencies = Pick<
   | "now"
 > & {
   inviteId: string;
+  initialSnapshot?: InviteMetadataSnapshot;
   readMetadata: (signal: AbortSignal) => Promise<ReadInviteMetadataResponse>;
   onSnapshot: (
     snapshot: InviteMetadataSnapshot,
@@ -52,9 +53,10 @@ export class InviteMetadataChannel extends SnapshotChannel<
   ReadInviteMetadataResponse
 > {
   constructor(dependencies: InviteMetadataChannelDependencies) {
-    let revision = -1;
+    let revision = dependencies.initialSnapshot?.revision ?? -1;
     super({
       ...dependencies,
+      initialSnapshotAccepted: dependencies.initialSnapshot !== undefined,
       socketUrl: getInviteMetadataSocketUrl(dependencies.inviteId),
       socketProtocol: INVITE_METADATA_SOCKET_PROTOCOL,
       maxMessageBytes: INVITE_METADATA_MAX_MESSAGE_BYTES,

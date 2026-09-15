@@ -1,5 +1,11 @@
 import * as MonsRules from "mons-rules";
 import {
+  markMainGameContentReady,
+  markMainGameError,
+  markMainGameWaiting,
+  onMainGameLoaded,
+} from "./mainGameLoadState";
+import {
   MATCH_TIMER_DURATION_SECONDS,
   MATCH_TIMER_TERMINAL,
   parseMatchTimer,
@@ -932,7 +938,7 @@ function restoreLiveBoardView() {
     );
     pendingTimerResolutionOnRestore = null;
     applyWagerState();
-    Board.markWagerInitialStateReceived();
+    markKnownWagerInitialStateReceived();
     updateUndoButtonBasedOnGameState();
     if (!isWatchOnly && !isGameOver && game.winner === undefined) {
       if (isOnlineGame) {
@@ -2226,6 +2232,9 @@ export function didAttemptAuthentication() {
 }
 
 export async function go(routeStateOverride?: RouteState) {
+  initialWagersMatchId = null;
+  cancelRematchScoresPreload?.();
+  cancelRematchScoresPreload = null;
   const routeState = routeStateOverride ?? getCurrentRouteState();
   activeRouteState = routeState;
   clearAllManagedGameTimeouts();
@@ -2392,9 +2401,17 @@ export async function go(routeStateOverride?: RouteState) {
     Board.showRandomEmojisForLoopMode();
   }
   syncInviteBotIntoLocalGameButton();
+  if (isCreateInviteRoute() || isSnapshotRoute() || isBotsRoute()) {
+    markMainGameContentReady(
+      !isBotsRoute() && !isGameOver && game.winner === undefined,
+    );
+  }
 }
 
 export function disposeGameSession(nextRouteState?: RouteState) {
+  initialWagersMatchId = null;
+  cancelRematchScoresPreload?.();
+  cancelRematchScoresPreload = null;
   resetRemoteMoveHistories();
   const preserveAutomatchUi = pendingAutomatchTransition;
   const wasWaitingAnimationRunning =
@@ -2716,6 +2733,7 @@ export function didDiscoverExistingRematchProposalWaitingForResponse() {
   isWaitingForRematchResponse = true;
   if (boardViewMode !== "historicalView") {
     enterWaitingLiveView();
+    markMainGameWaiting();
   }
   triggerMoveHistoryPopupReload();
 }
@@ -2730,6 +2748,7 @@ export function didFindYourOwnInviteThatNobodyJoined(isAutomatch: boolean) {
     setAutomatchWaitingState(true);
     Board.runMonsBoardAsDisplayWaitingAnimation();
   }
+  markMainGameWaiting();
 }
 
 export function didClickStartBotGameButton() {
@@ -2811,6 +2830,7 @@ export function handleFreshlySignedInProfileInGameIfNeeded() {
 export function didFindInviteThatCanBeJoined() {
   showPrimaryAction(PrimaryActionType.JoinGame);
   Board.runMonsBoardAsDisplayWaitingAnimation();
+  markMainGameWaiting();
 }
 
 export function didClickAutomatchButton(
@@ -4399,6 +4419,19 @@ function updateRatings(isWin: boolean) {
   }
 }
 
+let initialWagersMatchId: string | null = null;
+
+export function didReceiveInitialWagers() {
+  initialWagersMatchId = connection.getActiveMatchId();
+  markKnownWagerInitialStateReceived();
+}
+
+function markKnownWagerInitialStateReceived() {
+  if (wagerMatchId !== null && initialWagersMatchId === wagerMatchId) {
+    Board.markWagerInitialStateReceived();
+  }
+}
+
 function resetWagerStateForMatch(matchId: string | null) {
   if (wagerMatchId === matchId) {
     return;
@@ -4414,6 +4447,16 @@ function resetWagerStateForMatch(matchId: string | null) {
   setCurrentWagerMatch(matchId);
   currentWagerState = getWagerState();
   Board.clearWagerPilesForNewMatch();
+}
+
+let cancelRematchScoresPreload: (() => void) | null = null;
+
+function preloadRematchScoresAfterGameLoaded() {
+  cancelRematchScoresPreload?.();
+  const sessionGuard = getSessionGuard();
+  cancelRematchScoresPreload = onMainGameLoaded(() => {
+    if (sessionGuard()) void preloadRematchSeriesScores();
+  });
 }
 
 function normalizeWagerStakeCount(
@@ -5042,7 +5085,7 @@ function didConnectTo(
       );
     }
     applyWagerState();
-    Board.markWagerInitialStateReceived();
+    markKnownWagerInitialStateReceived();
   }
 
   if (game.winner !== undefined) {
@@ -5084,7 +5127,7 @@ function didConnectTo(
 
   updateDisplayedTimerIfNeeded(true, match, matchId);
   ensureBoardViewInvariants("didConnectTo:after");
-  void preloadRematchSeriesScores();
+  preloadRematchScoresAfterGameLoaded();
   triggerMoveHistoryPopupReload();
 }
 
@@ -5526,8 +5569,22 @@ export function didClickInviteActionButtonBeforeThereIsInviteReady() {
 }
 
 export function didFailToLoadPendingInvite() {
+  didFailToLoadGame();
+}
+
+export function didFailToLoadGame(notFound = false) {
   isWaitingForInviteToGetAccepted = false;
+  isReconnect = true;
+  didConnect = false;
   Board.stopMonsBoardAsDisplayAnimations();
+  showPrimaryAction(PrimaryActionType.None);
+  setHomeVisible(true);
+  showWaitingStateText(
+    notFound
+      ? "Game not found."
+      : "Couldn't load this game. Reload to try again.",
+  );
+  markMainGameError();
 }
 
 function showPuzzleInstructions() {
@@ -5877,6 +5934,9 @@ export function didReceiveMatchUpdate(
     }
     rememberRemoteMoveHistory(match, matchId);
     didConnect = true;
+    markMainGameContentReady(
+      !isWatchOnly && !isGameOver && game.winner === undefined,
+    );
     if (isReconnect) {
       updateUndoButtonBasedOnGameState();
       if (!isWatchOnly && !isGameOver && game.winner === undefined) {
@@ -6005,7 +6065,7 @@ export function didRecoverMyMatch(match: Match, matchId: string) {
       false,
     );
     applyWagerState();
-    Board.markWagerInitialStateReceived();
+    markKnownWagerInitialStateReceived();
   }
 
   if (match.status === "surrendered") {
@@ -6018,7 +6078,7 @@ export function didRecoverMyMatch(match: Match, matchId: string) {
 
   updateDisplayedTimerIfNeeded(true, match, matchId);
   ensureBoardViewInvariants("didRecoverMyMatch:after");
-  void preloadRematchSeriesScores();
+  preloadRematchScoresAfterGameLoaded();
 }
 
 export function enterWatchOnlyMode() {

@@ -337,7 +337,7 @@ async function fixture(run, { realNavigation = false } = {}) {
     ["../services/rocksMiningService", "export const MATERIALS = [];"],
     [
       "../game/wagerState",
-      "export const subscribeToWagerState = () => () => {};",
+      "export const subscribeToWagerState = () => () => {}; export const hasConfirmedWagerSnapshot = () => true;",
     ],
     [
       "../utils/playerMetadata",
@@ -402,7 +402,7 @@ export const go = async target => {
     );
     modules.set(
       "bottom-main-load",
-      "export const markMainGameLoaded = () => {};",
+      "export const markMainGameRoutePrepared = () => {};",
     );
     modules.set(
       "bottom-lifecycle",

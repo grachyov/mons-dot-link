@@ -101,37 +101,14 @@ test("browser connection code has no RTDB profile-link dependency", () => {
     /checkBothPlayerProfiles|resolveLocalProfileId|Number\.POSITIVE_INFINITY/,
   );
   assert.doesNotMatch(source, /loginUid === (?:hostId|guestId)/);
-  const roleRead = source.indexOf("let viewer = metadata.viewer;");
-  const autojoinDecision = source.indexOf(
-    "const shouldAutojoinAsGuest",
-    roleRead,
+  const reconnect = source.slice(
+    source.indexOf("public connectToGame("),
+    source.indexOf("public tryNavigateWatchOnlyToLatestApprovedMatch("),
   );
-  const postJoinRoleRead = source.indexOf(
-    "viewer = refreshed.viewer;",
-    autojoinDecision,
-  );
-  const matchRead = source.indexOf(
-    "const myMatchSnapshot = await readMatchSnapshotViaApi",
-    postJoinRoleRead,
-  );
-  const authRecheck = source.indexOf(
-    "tokenProvider.assertCurrentUser()",
-    matchRead,
-  );
-  const hydrationFailure = source.indexOf(
-    "No match data found for writable role",
-    matchRead,
-  );
-  const teardown = source.indexOf("this.detachFromMatchSession()", roleRead);
-  assert.ok(
-    roleRead >= 0 &&
-      autojoinDecision > roleRead &&
-      postJoinRoleRead > autojoinDecision &&
-      matchRead > postJoinRoleRead &&
-      authRecheck > matchRead &&
-      hydrationFailure > authRecheck &&
-      teardown > hydrationFailure,
-  );
+  assert.match(reconnect, /readGameBootstrapViaApi/);
+  assert.match(reconnect, /const \{ actorUid, role \} = viewer/);
+  assert.match(reconnect, /viewer = bootstrap.viewer/);
+  assert.doesNotMatch(reconnect, /await readMatchSnapshotViaApi/);
   assert.match(source, /readInviteRoleViaApi/);
 
   const controllerSource = readFileSync(
@@ -162,7 +139,7 @@ test("browser match snapshots and live subscriptions use Cloudflare", () => {
     "public connectToGame(",
     "public tryNavigateWatchOnlyToLatestApprovedMatch(",
   );
-  assert.match(reconnect, /await readMatchSnapshotViaApi\(/);
+  assert.match(reconnect, /readGameBootstrapViaApi\(/);
   const live = source.slice(source.indexOf("private observeMatch("));
   assert.match(live, /new MatchSyncChannel\(/);
   assert.match(live, /readMatchSyncViaApi\(/);

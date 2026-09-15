@@ -62,6 +62,7 @@ const deferred = () => {
 };
 
 function harness({
+  initialSnapshot,
   getProtocols,
   requiredPlayerIds = () => ["host", "guest"],
   readMatches = async () => response(),
@@ -81,6 +82,7 @@ function harness({
   const reads = [];
   const channel = new MatchSyncChannel({
     inviteId: "invite",
+    initialSnapshot,
     matchId: "invite",
     requiredPlayerIds,
     createSocket(url, protocols) {
@@ -209,6 +211,44 @@ test("hydrates one pair through Cloudflare and polls each second until a socket 
   await h.tick(2_000);
   assert.equal(h.reads.length, 3);
   h.channel.stop();
+});
+
+test("a complete bootstrap seed avoids initial HTTP and rejects older socket data", async () => {
+  const h = harness({ initialSnapshot: snapshot(4) });
+  await h.tick();
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.snapshots.length, 0);
+  h.sockets[0].receive(frame(3));
+  h.sockets[0].receive(frame(4));
+  await h.tick(5_000);
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.snapshots.length, 0);
+  h.sockets[0].receive(frame(5));
+  assert.equal(h.snapshots[0].revision, 5);
+  h.channel.stop();
+});
+
+test("seeded matches retain HTTP fallback for missing records, silent sockets, and failures", async () => {
+  const missing = harness({
+    initialSnapshot: snapshot(2, { guestMatch: null }),
+  });
+  await missing.tick();
+  assert.equal(missing.reads.length, 1);
+  missing.channel.stop();
+
+  const silent = harness({ initialSnapshot: snapshot() });
+  await silent.tick(999);
+  assert.equal(silent.reads.length, 0);
+  await silent.tick(1);
+  assert.equal(silent.reads.length, 1);
+  silent.channel.stop();
+
+  const failed = harness({ initialSnapshot: snapshot() });
+  await failed.tick();
+  failed.sockets[0].fail();
+  await flush();
+  assert.equal(failed.reads.length, 1);
+  failed.channel.stop();
 });
 
 test("drops stale HTTP and duplicate or stale socket revisions without reversing a pair", async () => {

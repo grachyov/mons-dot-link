@@ -994,7 +994,7 @@ function IslandButton({ imageUrl = DEFAULT_URL, dimmed = false }: Props) {
     Record<MaterialName, number>
   >(() => readAvailableMaterials().availableMaterials);
   const amountsDecoupledRef = useRef(false);
-  const materialUrls = useMaterialImages();
+  const materialUrls = useMaterialImages(islandOverlayVisible || islandOpening);
   const [dudeVisible, setDudeVisible] = useState(false);
   const [monVisible, setMonVisible] = useState(false);
   const [monTeleporting, setMonTeleporting] = useState(false);

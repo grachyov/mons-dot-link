@@ -4,6 +4,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import type React from "react";
 import { isWatchOnly, subscribeToWatchOnly } from "../../game/gameController";
@@ -21,7 +22,10 @@ import {
 } from "../controls/bottomControlsPort";
 import { connection } from "../../connection/connection";
 import type { MatchWagerState } from "../../connection/connectionModels";
-import { subscribeToWagerState } from "../../game/wagerState";
+import {
+  hasConfirmedWagerSnapshot,
+  subscribeToWagerState,
+} from "../../game/wagerState";
 import { useAvailableMaterials } from "../../hooks/useAvailableMaterials";
 import { defaultInputEventName } from "../../utils/misc";
 import {
@@ -130,6 +134,11 @@ export const useBoardWagers = ({
   injectPendingPulseKeyframes();
 
   const [wagerState, setWagerState] = useState<MatchWagerState | null>(null);
+  const wagerSnapshotConfirmed = useSyncExternalStore(
+    subscribeToWagerState,
+    hasConfirmedWagerSnapshot,
+    hasConfirmedWagerSnapshot,
+  );
   const { availableMaterials, frozenMaterialsStatus } = useAvailableMaterials();
   const [watchOnlySnapshot, setWatchOnlySnapshot] = useState(isWatchOnly);
   const [activeWagerPanelSide, setActiveWagerPanelSide] = useState<
@@ -197,7 +206,10 @@ export const useBoardWagers = ({
   const wagerAgreement = wagerState?.agreed ?? null;
   const wagerResolved = wagerState?.resolved ?? null;
   const wagerActionsLocked =
-    watchOnlySnapshot || !!wagerAgreement || !!wagerResolved;
+    !wagerSnapshotConfirmed ||
+    watchOnlySnapshot ||
+    !!wagerAgreement ||
+    !!wagerResolved;
   const opponentMaterial = opponentProposal?.material ?? null;
   const opponentCount = opponentProposal?.count ?? 0;
   const extraAvailable =

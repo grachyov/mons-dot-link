@@ -102,6 +102,9 @@ async function fixture(run) {
       await page.waitForFunction(() =>
         Boolean(globalThis.testSessionAuth.currentUser?.uid),
       );
+      await page
+        .getByRole("button", { name: "Sign In", exact: true })
+        .waitFor({ state: "visible" });
       return page;
     };
     await run({ context, open, origin, sessions, refreshes, revoked });
@@ -531,6 +534,7 @@ for (const [scenario, name] of [
   test(name, { timeout: 60_000 }, async () => {
     await fixture(async ({ context, open, origin, revoked }) => {
       const inviteId = "recovery-invite";
+      const bootstrapPath = `/invites/${inviteId}/bootstrap`;
       const metadataPath = `/invites/${inviteId}/metadata`;
       const wagersPath = `/invites/${inviteId}/wagers`;
       const matchPath = `/invites/${inviteId}/matches/${inviteId}/snapshot`;
@@ -548,7 +552,39 @@ for (const [scenario, name] of [
           if (request.method() === "OPTIONS")
             return route.fulfill({ status: 204, headers });
           let json;
-          if (pathname === metadataPath) {
+          if (pathname === bootstrapPath) {
+            json = {
+              ok: true,
+              schemaVersion: 1,
+              metadata: {
+                inviteId,
+                revision: 1,
+                hostId: "host",
+                guestId: "guest",
+                hostColor: "white",
+                hostRematches: "",
+                guestRematches: "",
+                automatchStateHint: null,
+                eventId: null,
+                eventOwned: false,
+              },
+              viewer: {
+                role: "watch",
+                actorUid: null,
+                automatchOperationId: null,
+              },
+              hasPendingProposal: false,
+              match: {
+                inviteId,
+                matchId: inviteId,
+                revision: 1,
+                hostPlayerId: "host",
+                guestPlayerId: "guest",
+                hostMatch: null,
+                guestMatch: null,
+              },
+            };
+          } else if (pathname === metadataPath) {
             json = {
               ok: true,
               snapshot: {

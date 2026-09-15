@@ -30,6 +30,7 @@ export const environment = {
   style: "grid",
   mobile: new URLSearchParams(location.search).has("mobile"),
   state: null as any,
+  snapshotConfirmed: true,
   balance: {
     availableMaterials: { obsidian: 50, gold: 50 },
     frozenMaterialsStatus: "ready",
@@ -107,6 +108,7 @@ export const subscribeToWagerState = (callback: Function) => {
   callback(environment.state);
   return unsubscribe;
 };
+export const hasConfirmedWagerSnapshot = () => environment.snapshotConfirmed;
 const materialSubscribe = (cb: Function) =>
   subscribe(environment.materialSubscribers, cb);
 export const useAvailableMaterials = () =>

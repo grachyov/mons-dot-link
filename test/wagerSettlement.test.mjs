@@ -118,6 +118,7 @@ function harness() {
     sameProfilePlayerUid: "actor",
     sessionEpoch: 1,
     pendingWagerMutations: new Set(),
+    updateWagerStateForCurrentMatch: () => {},
     wagerSnapshotGeneration: 0,
     ensureAuthenticated: async () => {},
     flushPendingMoves: async () => {},

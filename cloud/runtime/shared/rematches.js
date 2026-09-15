@@ -138,6 +138,26 @@ const getApprovedRematchIndices = (inviteData) => {
 const getLatestApprovedRematchIndex = (inviteData) =>
   getApprovedRematchIndices(inviteData).at(-1) || 0;
 
+const selectInviteMatch = (inviteId, inviteData, actorUid, options = {}) => {
+  const hostIndices = parseRematchIndices(inviteData?.hostRematches);
+  const guestIndices = parseRematchIndices(inviteData?.guestRematches);
+  let index = getLatestApprovedRematchIndex(inviteData);
+  const hasPendingProposal = Boolean(
+    !options.preferApproved &&
+    !rematchSeriesEnded(inviteData) &&
+    actorUid &&
+    ((inviteData?.hostId === actorUid &&
+      hostIndices.length > guestIndices.length) ||
+      (inviteData?.guestId === actorUid &&
+        guestIndices.length > hostIndices.length)),
+  );
+  if (hasPendingProposal) index += 1;
+  return {
+    matchId: index > 0 ? `${inviteId}${index}` : inviteId,
+    hasPendingProposal,
+  };
+};
+
 const deriveLatestMatchId = (inviteId, inviteData, latestMatchIdHint) => {
   const hintedIndex = getHintMatchIndex(inviteId, latestMatchIdHint);
   const maxIndex = getLatestRematchIndex(inviteData, hintedIndex);
@@ -174,6 +194,7 @@ module.exports = {
   getHintMatchIndex,
   getLatestRematchIndex,
   getLatestApprovedRematchIndex,
+  selectInviteMatch,
   deriveLatestMatchId,
   getHistoricalMatchIds,
 };

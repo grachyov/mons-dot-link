@@ -26,6 +26,12 @@ export function getLatestRematchIndex(
 export function getLatestApprovedRematchIndex(
   inviteData: RematchInviteData | null | undefined,
 ): number;
+export function selectInviteMatch(
+  inviteId: string,
+  inviteData: RematchInviteData & { hostId?: unknown; guestId?: unknown },
+  actorUid: string | null,
+  options?: { preferApproved?: boolean },
+): { matchId: string; hasPendingProposal: boolean };
 export function deriveLatestMatchId(
   inviteId: string,
   inviteData: RematchInviteData | null | undefined,

@@ -1,4 +1,3 @@
-import "./session/pendingLogoutWipeBootstrap";
 import "./index.css";
 import ReactDOM from "react-dom/client";
 import React, {
@@ -34,7 +33,6 @@ import { isMainGameLoaded, onMainGameLoaded } from "./game/mainGameLoadState";
 import { Sound } from "./utils/gameModels";
 import { initializeAppSessionManager } from "./session/AppSessionManager";
 import { getCurrentRouteState } from "./navigation/routeState";
-import { installLogoutSync } from "./session/logoutOrchestrator";
 import {
   isLogoutRecoveryRequired,
   subscribeToLogoutRecovery,
@@ -225,5 +223,4 @@ document.addEventListener(
 );
 
 connection.signIn();
-installLogoutSync();
 initializeAppSessionManager();

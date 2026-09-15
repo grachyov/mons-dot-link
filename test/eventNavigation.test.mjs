@@ -50,7 +50,7 @@ registerHooks({
         };`;
     } else if (parsed.pathname.endsWith("/game/mainGameLoadState.ts")) {
       source = `${harness}
-        export const markMainGameLoaded = () => { harness.loaded += 1; };`;
+        export const markMainGameRoutePrepared = () => { harness.loaded += 1; };`;
     }
     return source === undefined
       ? nextLoad(url, context)

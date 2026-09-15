@@ -545,6 +545,7 @@ test("shared package preserves every direct export subpath", () => {
     "./auth": "./auth.js",
     "./event-prizes": "./event-prizes.js",
     "./events": "./events.js",
+    "./game-bootstrap": "./game-bootstrap.js",
     "./game-sessions": "./game-sessions.js",
     "./game-variants": "./game-variants.js",
     "./ids": "./ids.js",

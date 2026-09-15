@@ -43,6 +43,24 @@ function isPendingRematchEnd(value: unknown): value is PendingRematchEnd {
   );
 }
 
+export function readPendingRematchEnd(
+  scope: RematchEndScope,
+  persistence: Pick<Storage, "getItem"> | null,
+): PendingRematchEnd | null {
+  const key = rematchEndDeliveryStorageKey(scope);
+  const text = persistence?.getItem(key);
+  if (!text) return null;
+  const stored = JSON.parse(text);
+  if (
+    stored?.version !== 1 ||
+    !isPendingRematchEnd(stored.record) ||
+    rematchEndDeliveryStorageKey(stored.record) !== key
+  ) {
+    throw new Error("invalid-stored-rematch-end");
+  }
+  return { ...stored.record };
+}
+
 function codeOf(error: unknown): string {
   const code =
     error && typeof error === "object" && "code" in error
@@ -102,17 +120,7 @@ export class RematchEndDelivery {
     this.dependencies = dependencies;
     this.key = rematchEndDeliveryStorageKey(scope);
     try {
-      const text = dependencies.storage?.getItem(this.key);
-      if (!text) return;
-      const stored = JSON.parse(text);
-      if (
-        stored?.version !== 1 ||
-        !isPendingRematchEnd(stored.record) ||
-        rematchEndDeliveryStorageKey(stored.record) !== this.key
-      ) {
-        throw new Error("invalid-stored-rematch-end");
-      }
-      this.record = { ...stored.record };
+      this.record = readPendingRematchEnd(scope, dependencies.storage);
     } catch (error) {
       this.report(error);
     }

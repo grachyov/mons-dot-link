@@ -122,6 +122,21 @@ function harness(invite, onMatchRead = () => {}) {
     decrementLifecycleCounter: noop,
   });
   let instance;
+  const dependenciesReadMatch = async () => {
+    onMatchRead();
+    return {
+      match: {
+        version: 1,
+        color: "white",
+        emojiId: 1,
+        fen: "fen",
+        gameVariant: "classic",
+        status: "",
+        flatMovesString: "",
+        timer: "",
+      },
+    };
+  };
   const Connection = instantiate(
     `class Connection { ${methods.join("\n")} }`,
     "Connection",
@@ -180,6 +195,7 @@ function harness(invite, onMatchRead = () => {}) {
       didRecoverMyMatch: noop,
       didDiscoverExistingRematchProposalWaitingForResponse: noop,
       didFailToLoadPendingInvite: noop,
+      didFailToLoadGame: noop,
       incrementLifecycleCounter: noop,
       decrementLifecycleCounter: noop,
       console: { log: noop, error: (...args) => events.errors.push(args) },
@@ -196,11 +212,36 @@ function harness(invite, onMatchRead = () => {}) {
     getMoveDelivery: (_scope, match) => ({
       reconcile: () => match,
       resume: noop,
+      suspend: noop,
     }),
     auth: { currentUser: { uid: UID } },
     db: {},
     getUserBoundAuthTokenProvider: () => ({ assertCurrentUser: noop }),
-    fetchInviteWithPendingCreation: async () => metadata(invite),
+    fetchInviteWithPendingCreation: async () => {
+      const value = metadata(invite);
+      const actor = await dependenciesReadMatch(
+        { playerId: UID, matchId: INVITE_ID },
+        { signal: new AbortController().signal },
+      );
+      return {
+        ok: true,
+        schemaVersion: 1,
+        metadata: value.snapshot,
+        viewer: value.viewer,
+        hasPendingProposal: false,
+        match: {
+          inviteId: INVITE_ID,
+          matchId: INVITE_ID,
+          revision: 1,
+          hostPlayerId: UID,
+          guestPlayerId: value.snapshot.guestId,
+          hostMatch: actor.match,
+          guestMatch: value.snapshot.guestId
+            ? { ...actor.match, color: "black" }
+            : null,
+        },
+      };
+    },
     getLatestMatchIdForActor: () => ({
       matchId: INVITE_ID,
       hasPendingProposal: false,

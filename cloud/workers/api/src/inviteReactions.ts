@@ -379,8 +379,13 @@ export class InviteReactions
   async readMatches(
     inviteId: string,
     matchId: string,
+    options: { fresh?: boolean } = {},
   ): Promise<MatchSyncReadResult> {
-    return this.matchSync.read(inviteId, matchId);
+    if (options.fresh) {
+      await this.inviteChannels.readMetadata(inviteId);
+      await this.matchSync.notify(inviteId, [matchId]);
+    }
+    return this.matchSync.read(inviteId, matchId, options.fresh);
   }
 
   private async readMatchPair(

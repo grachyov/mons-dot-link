@@ -43,6 +43,7 @@ export type SnapshotChannelDependencies<
   parseMessage: (value: unknown) => TSnapshot | null;
   captureGeneration?: () => number;
   needsHttpRefresh?: () => boolean;
+  initialSnapshotAccepted?: boolean;
   retryAfterMs: (error: unknown) => number;
   readError: (error: unknown) => unknown;
   channelError: () => unknown;
@@ -96,7 +97,16 @@ export class SnapshotChannel<
       this.refresh(),
     );
     this.scheduleReconnect(0);
-    this.requestRefresh();
+    if (
+      dependencies.initialSnapshotAccepted &&
+      !dependencies.needsHttpRefresh?.()
+    ) {
+      this.scheduleHttp(
+        Math.min(dependencies.refreshMs, SNAPSHOT_HEARTBEAT_TIMEOUT_MS),
+      );
+    } else {
+      this.requestRefresh();
+    }
   }
 
   get signal(): AbortSignal {

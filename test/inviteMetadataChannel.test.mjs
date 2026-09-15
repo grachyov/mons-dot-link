@@ -60,6 +60,7 @@ const deferred = () => {
 };
 
 function harness({
+  initialSnapshot,
   getProtocols,
   readMetadata = async () => response(),
   createError = false,
@@ -78,6 +79,7 @@ function harness({
   const reads = [];
   const channel = new InviteMetadataChannel({
     inviteId: "invite",
+    initialSnapshot,
     createSocket(url, protocols) {
       if (createError) throw new Error("secret-token-in-error");
       const socket = {
@@ -197,6 +199,34 @@ test("starts pending-lobby HTTP and metadata sockets asynchronously and delivers
   assert.equal(h.snapshots.length, 2);
   assert.deepEqual(h.snapshots[1].viewer, response().viewer);
   await h.tick(5_000);
+  assert.equal(h.reads.length, 2);
+  h.channel.stop();
+});
+
+test("bootstrap metadata seeds its revision without a duplicate read or callback", async () => {
+  const h = harness({ initialSnapshot: snapshot(3) });
+  await h.tick();
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.snapshots.length, 0);
+  h.sockets[0].receive(frame(2));
+  h.sockets[0].receive(frame(3));
+  await h.tick(5_000);
+  assert.equal(h.reads.length, 0);
+  assert.equal(h.snapshots.length, 0);
+  h.sockets[0].receive(frame(4));
+  assert.equal(h.snapshots[0].snapshot.revision, 4);
+  h.channel.stop();
+});
+
+test("seeded metadata refreshes when the socket stays silent or the page wakes", async () => {
+  const h = harness({ initialSnapshot: snapshot() });
+  await h.tick(4_999);
+  assert.equal(h.reads.length, 0);
+  await h.tick(1);
+  assert.equal(h.reads.length, 1);
+  h.sockets[0].receive(frame());
+  h.wake();
+  await flush();
   assert.equal(h.reads.length, 2);
   h.channel.stop();
 });

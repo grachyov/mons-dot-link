@@ -84,6 +84,7 @@ function harness({ historical = false, connected = true, onOutput } = {}) {
   const rendered = [];
   const surrendered = [];
   const timers = [];
+  const contentReady = [];
   const spy = (game) => {
     const play = game.playFen.bind(game);
     game.playFen = (input) => {
@@ -133,6 +134,8 @@ function harness({ historical = false, connected = true, onOutput } = {}) {
       kind: "provisional",
       gameModel: spy(Game.fromFen(match.fen)),
     }),
+    markMainGameContentReady: (canPlay) =>
+      contentReady.push({ canPlay, fen: api.game().toFen() }),
     resetOnlineReconnectRequestState: noop,
     showWaitingStateText: noop,
     setEndMatchVisible: noop,
@@ -168,6 +171,7 @@ function harness({ historical = false, connected = true, onOutput } = {}) {
     rendered,
     surrendered,
     timers,
+    contentReady,
     popupReloads: () => popupReloads,
     invalidate: (matchId = activeMatchId) => {
       activeMatchId = matchId;
@@ -413,8 +417,10 @@ test("a provisional initial snapshot seeds processed counts and is not replayed 
   const moves = [nextMove(game).inputFen];
   const initial = record(game, "white", moves);
   const h = harness({ connected: false });
+  assert.deepEqual(h.contentReady, []);
   h.receive(initial);
   h.receive(initial);
+  assert.deepEqual(h.contentReady, [{ canPlay: false, fen: initial.fen }]);
   assert.deepEqual(h.played, []);
   assert.deepEqual(h.counts(), { white: 1, black: 0 });
   moves.push(nextMove(game).inputFen, game.takeback().inputFen);

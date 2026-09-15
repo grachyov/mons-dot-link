@@ -1420,7 +1420,7 @@ const MainMenu: React.FC = () => {
         : "rating";
     },
   );
-  const materialUrls = useMaterialImages();
+  const materialUrls = useMaterialImages(isMenuOpen);
   const [specialLeaderboardTypeUrls, setSpecialLeaderboardTypeUrls] = useState<
     Record<LeaderboardSpecialType, string | null>
   >({

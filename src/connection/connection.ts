@@ -3,6 +3,7 @@ import {
   didFindInviteThatCanBeJoined,
   didReceiveInviteReactionUpdate,
   didReceiveMatchUpdates,
+  didReceiveInitialWagers,
   didReceiveMatchPresentationUpdate,
   didRecoverInviteReactions,
   didRecoverMyMatch,
@@ -14,6 +15,7 @@ import {
   failedToCreateRematchProposal,
   didUpdateRematchSeriesMetadata,
   didFailToLoadPendingInvite,
+  didFailToLoadGame,
 } from "../game/gameController";
 import {
   getPlayersEmojiId,
@@ -134,6 +136,7 @@ import {
   parseInviteMatchIndex,
   parseRematchIndices,
   rematchSeriesEnded,
+  selectInviteMatch,
 } from "@mons/shared/rematches";
 import {
   getNavigationSortBucket,
@@ -208,6 +211,12 @@ import { InviteMetadataChannel } from "./inviteMetadataChannel";
 import { InviteWagersChannel } from "./inviteWagersChannel";
 import { MatchSyncChannel } from "./matchSyncChannel";
 import type { MatchSyncSnapshot } from "@mons/shared/match-sync";
+import type { ReadGameBootstrapResponse } from "@mons/shared/game-bootstrap";
+import {
+  GameBootstrapApiError,
+  readGameBootstrapViaApi,
+} from "../services/gameBootstrapApi";
+import { takeInitialGameBootstrap } from "../services/initialGameBootstrap";
 import {
   createMatchSyncSocketProtocols,
   readMatchSyncViaApi,
@@ -221,11 +230,9 @@ import { InviteMetadataState } from "./inviteMetadataState";
 import type {
   InviteMetadataSnapshot,
   InviteMetadataViewer,
-  ReadInviteMetadataResponse,
 } from "@mons/shared/invite-metadata";
 import {
   createInviteMetadataSocketProtocols,
-  InviteMetadataApiError,
   readInviteMetadataViaApi,
 } from "../services/inviteMetadataApi";
 import { MatchPresentationState } from "./matchPresentationState";
@@ -372,6 +379,7 @@ class Connection {
   private inviteMetadataViewer: InviteMetadataViewer | null = null;
   private inviteMetadataBootstrapController: AbortController | null = null;
   private inviteBootstrapLoginUid: string | null = null;
+  private connectAttemptCleanup: (() => void) | null = null;
   private inviteMetadataSubscription: {
     contextId: number;
     channel: InviteMetadataChannel;
@@ -523,6 +531,8 @@ class Connection {
 
   private beginConnectAttempt(): number {
     this.inviteMetadataBootstrapController?.abort();
+    this.connectAttemptCleanup?.();
+    this.connectAttemptCleanup = null;
     this.inviteMetadataBootstrapController = null;
     this.inviteBootstrapLoginUid = null;
     this.connectAttemptId += 1;
@@ -921,7 +931,13 @@ class Connection {
     if (requestedContext !== this.activeContext) return { ok: false };
     const context = this.requireWritableContext(undefined, "wager-mutation");
     const poller = this.miningFrozenPoller;
-    if (!context || !poller) return { ok: false };
+    if (
+      !context ||
+      !poller ||
+      this.inviteWagersSnapshot?.inviteId !== context.inviteId ||
+      this.wagerSnapshotNeedsReconciliation
+    )
+      return { ok: false };
     const boundTokenProvider = this.getUserBoundAuthTokenProvider(
       context.loginUid,
     );
@@ -941,6 +957,11 @@ class Connection {
       return await poller.runMutation(
         async () => {
           tokenProvider.assertCurrentUser();
+          if (
+            this.inviteWagersSnapshot?.inviteId !== context.inviteId ||
+            this.wagerSnapshotNeedsReconciliation
+          )
+            return { ok: false as const };
           const finish = this.beginWagerSnapshotMutation(context);
           try {
             return await action(tokenProvider);
@@ -969,6 +990,7 @@ class Connection {
     this.pendingWagerMutations.add(mutation);
     this.wagerSnapshotGeneration += 1;
     this.wagerSnapshotNeedsReconciliation = true;
+    this.updateWagerStateForCurrentMatch();
     return () => {
       if (!this.pendingWagerMutations.delete(mutation)) return;
       this.wagerSnapshotGeneration += 1;
@@ -4401,29 +4423,9 @@ class Connection {
     invite: Invite,
     actorUid: string | null,
   ): { matchId: string; hasPendingProposal: boolean } {
-    const hostIndices = parseRematchIndices(invite.hostRematches);
-    const guestIndices = parseRematchIndices(invite.guestRematches);
-    let rematchIndex =
-      this.getLatestBothSidesApprovedRematchIndexForInvite(invite);
-    let hasPendingProposal = false;
-    if (
-      !this.rematchSeriesEndIsIndicatedForInvite(invite) &&
-      !this.isRematchEndPending(inviteId) &&
-      actorUid
-    ) {
-      const hostHasPending =
-        invite.hostId === actorUid && hostIndices.length > guestIndices.length;
-      const guestHasPending =
-        invite.guestId === actorUid && guestIndices.length > hostIndices.length;
-      if (hostHasPending || guestHasPending) {
-        rematchIndex = rematchIndex ? rematchIndex + 1 : 1;
-        hasPendingProposal = true;
-      }
-    }
-    if (!rematchIndex) {
-      return { matchId: inviteId, hasPendingProposal };
-    }
-    return { matchId: `${inviteId}${rematchIndex}`, hasPendingProposal };
+    return selectInviteMatch(inviteId, invite, actorUid, {
+      preferApproved: this.isRematchEndPending(inviteId),
+    });
   }
 
   private maybeRefreshContextAfterRematchMetadata(
@@ -4477,17 +4479,14 @@ class Connection {
     inviteId: string,
     epoch: number,
     connectAttemptId: number,
-    tokenProvider: AuthTokenProvider,
-    signal: AbortSignal,
-  ): Promise<ReadInviteMetadataResponse | null> {
+    readBootstrap: () => Promise<ReadGameBootstrapResponse>,
+  ): Promise<ReadGameBootstrapResponse | null> {
     const read = async () => {
       try {
-        return await readInviteMetadataViaApi(inviteId, tokenProvider, {
-          signal,
-        });
+        return await readBootstrap();
       } catch (error) {
         if (
-          error instanceof InviteMetadataApiError &&
+          error instanceof GameBootstrapApiError &&
           error.code === "http-404"
         ) {
           return null;
@@ -4512,9 +4511,6 @@ class Connection {
     ) {
       return null;
     }
-    if (initial) {
-      return initial;
-    }
     const refreshed = await read();
     if (!this.isConnectAttemptActive(connectAttemptId, epoch)) {
       return null;
@@ -4537,8 +4533,10 @@ class Connection {
         : null;
     let connectEpoch = this.sessionEpoch;
     let connectAttemptId = this.beginConnectAttempt();
+    const connectUser = this.auth.currentUser;
     const isConnectActive = () =>
       this.isConnectAttemptActive(connectAttemptId, connectEpoch) &&
+      this.auth.currentUser === connectUser &&
       this.isCurrentAuthUser(uid);
     let tokenProvider: AuthTokenProvider & {
       readonly assertCurrentUser: () => void;
@@ -4552,14 +4550,64 @@ class Connection {
     this.inviteMetadataBootstrapController = controller;
     this.inviteBootstrapLoginUid = uid;
 
+    const suspendedDeliveries = new Set<MoveDelivery>();
+    const readRevisions = new Map<string, number>();
+    let released = false;
+    const releaseDeliveries = () => {
+      if (released) return;
+      released = true;
+      for (const delivery of suspendedDeliveries) delivery.resume();
+      if (this.connectAttemptCleanup === releaseDeliveries)
+        this.connectAttemptCleanup = null;
+    };
+    this.connectAttemptCleanup = releaseDeliveries;
+    let firstRead = true;
+    const readBootstrap = async (): Promise<ReadGameBootstrapResponse> => {
+      if (!isConnectActive()) throw new GameBootstrapApiError("aborted");
+      for (const [key, delivery] of this.moveDeliveries) {
+        if (
+          delivery.scope.loginUid === uid &&
+          delivery.scope.inviteId === inviteId
+        ) {
+          delivery.suspend();
+          suspendedDeliveries.add(delivery);
+          readRevisions.set(key, delivery.confirmationVersion);
+        }
+      }
+      const selection = this.isRematchEndPending(inviteId, uid)
+        ? "approved"
+        : "current";
+      const initial = firstRead
+        ? takeInitialGameBootstrap(inviteId, this.auth.currentUser!, selection)
+        : null;
+      firstRead = false;
+      if (!initial)
+        return readGameBootstrapViaApi(inviteId, tokenProvider, {
+          signal: controller.signal,
+          selection,
+        });
+      const abort = () => initial.abort();
+      controller.signal.addEventListener("abort", abort, { once: true });
+      try {
+        const bootstrap = await initial.promise;
+        const hasMoveRecovery = Array.from(this.moveDeliveries.values()).some(
+          (delivery) =>
+            delivery.scope.loginUid === uid &&
+            delivery.scope.inviteId === inviteId,
+        );
+        return hasMoveRecovery ? readBootstrap() : bootstrap;
+      } finally {
+        controller.signal.removeEventListener("abort", abort);
+      }
+    };
+
     const resolveInvite = (async () => {
       try {
         return await this.fetchInviteWithPendingCreation(
           inviteId,
           connectEpoch,
           connectAttemptId,
-          tokenProvider,
-          controller.signal,
+          readBootstrap,
         );
       } catch (error) {
         if (!autojoin || !isAutoInviteId(inviteId)) {
@@ -4587,8 +4635,7 @@ class Connection {
         inviteId,
         connectEpoch,
         connectAttemptId,
-        tokenProvider,
-        controller.signal,
+        readBootstrap,
       );
     })();
 
@@ -4599,18 +4646,22 @@ class Connection {
         }
         if (!metadata) {
           console.log("No invite data found");
+          const hadActiveContext = !!this.activeContext;
           this.detachFromMatchSession();
           this.loginUid = uid;
           if (isPendingLocalInviteCreation) {
             didFailToLoadPendingInvite();
+          } else if (!hadActiveContext) {
+            didFailToLoadGame(true);
           }
           return;
         }
 
+        let bootstrap = metadata;
         const metadataState =
-          cachedMetadataState ?? new InviteMetadataState(metadata.snapshot);
-        metadataState.accept(metadata.snapshot);
-        let viewer = metadata.viewer;
+          cachedMetadataState ?? new InviteMetadataState(bootstrap.metadata);
+        metadataState.accept(bootstrap.metadata);
+        let viewer = bootstrap.viewer;
         let workingInvite: Invite = {
           ...metadataState.snapshot,
           wagers: cachedInvite?.wagers ?? null,
@@ -4658,16 +4709,10 @@ class Connection {
               return;
             }
           }
-          const refreshed = await readInviteMetadataViaApi(
-            inviteId,
-            tokenProvider,
-            {
-              signal: controller.signal,
-            },
-          );
+          bootstrap = await readBootstrap();
           if (!isConnectActive()) return;
-          metadataState.accept(refreshed.snapshot);
-          viewer = refreshed.viewer;
+          metadataState.accept(bootstrap.metadata);
+          viewer = bootstrap.viewer;
           workingInvite = {
             ...metadataState.snapshot,
             wagers: workingInvite.wagers,
@@ -4690,28 +4735,43 @@ class Connection {
           }
         }
 
-        const { actorUid, role } = viewer;
-        if (rematchSeriesEnded(metadata.snapshot)) {
-          this.confirmRematchEndFromMetadata(uid, inviteId);
-        }
-        if (!isConnectActive()) {
-          return;
-        }
-        if (!cachedInvite) {
-          const response = await readInviteWagersViaApi(
-            inviteId,
-            tokenProvider,
-            { signal: controller.signal },
-          );
-          if (!isConnectActive()) return;
-          wagersSnapshot = response.snapshot;
-          workingInvite.wagers = { ...wagersSnapshot.wagers };
-        }
-        const { matchId, hasPendingProposal } = this.getLatestMatchIdForActor(
+        let selection = this.getLatestMatchIdForActor(
           inviteId,
           workingInvite,
-          actorUid,
+          viewer.actorUid,
         );
+        for (let attempt = 0; ; attempt++) {
+          const pair = bootstrap.match;
+          if (
+            pair.inviteId === inviteId &&
+            pair.matchId === selection.matchId &&
+            pair.hostPlayerId === workingInvite.hostId &&
+            pair.guestPlayerId === (workingInvite.guestId ?? null) &&
+            bootstrap.hasPendingProposal === selection.hasPendingProposal
+          )
+            break;
+          if (attempt >= 2)
+            throw new GameBootstrapApiError("bootstrap-metadata-changed");
+          bootstrap = await readBootstrap();
+          if (!isConnectActive()) return;
+          metadataState.accept(bootstrap.metadata);
+          viewer = bootstrap.viewer;
+          workingInvite = {
+            ...metadataState.snapshot,
+            wagers: workingInvite.wagers,
+          };
+          selection = this.getLatestMatchIdForActor(
+            inviteId,
+            workingInvite,
+            viewer.actorUid,
+          );
+        }
+        const { actorUid, role } = viewer;
+        const { matchId, hasPendingProposal } = selection;
+        if (rematchSeriesEnded(workingInvite)) {
+          this.confirmRematchEndFromMetadata(uid, inviteId);
+        }
+        if (!isConnectActive()) return;
         const canWrite = role !== "watch" && !!actorUid;
         let myMatch: Match | null = null;
         let moveDelivery: MoveDelivery | null = null;
@@ -4723,21 +4783,14 @@ class Connection {
             playerId: actorUid,
           };
           const moveKey = moveDeliveryStorageKey(moveScope);
-          const existingDelivery = this.moveDeliveries.get(moveKey);
-          const readRevision = existingDelivery?.confirmationVersion;
-          existingDelivery?.suspend();
-          const myMatchSnapshot = await readMatchSnapshotViaApi(
-            { playerId: actorUid, matchId },
-            { signal: controller.signal },
-          ).finally(() => existingDelivery?.resume());
-          tokenProvider.assertCurrentUser();
-          if (!isConnectActive()) {
-            return;
-          }
-          myMatch = myMatchSnapshot.match as Match | null;
+          myMatch = (
+            actorUid === bootstrap.match.hostPlayerId
+              ? bootstrap.match.hostMatch
+              : bootstrap.match.guestMatch
+          ) as Match | null;
           if (myMatch === null) {
             try {
-              const ensured = await ensureMatchViaApi(
+              await ensureMatchViaApi(
                 {
                   operationId: crypto.randomUUID(),
                   inviteId,
@@ -4748,7 +4801,37 @@ class Connection {
                 tokenProvider,
               );
               tokenProvider.assertCurrentUser();
-              myMatch = ensured.match as Match;
+              if (!isConnectActive()) return;
+              bootstrap = await readBootstrap();
+              if (!isConnectActive()) return;
+              metadataState.accept(bootstrap.metadata);
+              const nextSelection = this.getLatestMatchIdForActor(
+                inviteId,
+                { ...metadataState.snapshot, wagers: workingInvite.wagers },
+                bootstrap.viewer.actorUid,
+              );
+              if (
+                bootstrap.match.matchId !== matchId ||
+                nextSelection.matchId !== matchId ||
+                bootstrap.viewer.actorUid !== actorUid ||
+                bootstrap.viewer.role !== role ||
+                bootstrap.match.hostPlayerId !== workingInvite.hostId ||
+                bootstrap.match.guestPlayerId !==
+                  (workingInvite.guestId ?? null)
+              ) {
+                releaseDeliveries();
+                this.connectToGame(uid, inviteId, false);
+                return;
+              }
+              workingInvite = {
+                ...metadataState.snapshot,
+                wagers: workingInvite.wagers,
+              };
+              myMatch = (
+                actorUid === bootstrap.match.hostPlayerId
+                  ? bootstrap.match.hostMatch
+                  : bootstrap.match.guestMatch
+              ) as Match | null;
             } catch (error) {
               console.error("Failed to ensure participant match", error);
             }
@@ -4763,9 +4846,12 @@ class Connection {
               role,
               actorUid,
             });
+            if (!this.activeContext) didFailToLoadGame();
             return;
           }
           moveDelivery = this.getMoveDelivery(moveScope, myMatch);
+          moveDelivery.suspend();
+          suspendedDeliveries.add(moveDelivery);
           this.reconcilingMoveKeys.add(moveKey);
           try {
             if (moveDelivery.isConflicted) {
@@ -4773,7 +4859,7 @@ class Connection {
             } else {
               myMatch = {
                 ...myMatch,
-                ...moveDelivery.reconcile(myMatch, readRevision),
+                ...moveDelivery.reconcile(myMatch, readRevisions.get(moveKey)),
               };
             }
           } catch (error) {
@@ -4805,10 +4891,14 @@ class Connection {
         const wagerRevisionFloor = reusingWagers
           ? this.wagerSnapshotRevisionFloor
           : (wagersSnapshot?.revision ?? -1);
+        this.connectAttemptCleanup = null;
+        this.inviteMetadataBootstrapController = null;
+        this.inviteBootstrapLoginUid = null;
         this.detachFromMatchSession();
         this.loginUid = uid;
         connectEpoch = this.sessionEpoch;
         connectAttemptId = this.connectAttemptId;
+        this.connectAttemptCleanup = releaseDeliveries;
 
         this.latestInvite = workingInvite;
         this.inviteMetadataState = metadataState;
@@ -4830,11 +4920,30 @@ class Connection {
           connectEpoch,
         );
         this.activateContext(nextContext, "connect-to-game");
-        moveDelivery?.resume();
-        this.updateWagerStateForCurrentMatch();
-        this.observeInviteReactions(nextContext);
-        this.observeInviteMetadata(nextContext);
-        this.observeWagers(nextContext);
+        if (!isConnectActive()) return;
+        const startObservers = () => {
+          if (!isConnectActive()) return;
+          this.updateWagerStateForCurrentMatch();
+          if (!isConnectActive()) return;
+          if (
+            this.inviteWagersSnapshot &&
+            !this.wagerSnapshotNeedsReconciliation
+          )
+            didReceiveInitialWagers();
+          if (!isConnectActive()) return;
+          this.applyInviteMetadata(
+            nextContext,
+            metadataState.snapshot,
+            viewer,
+            true,
+          );
+          if (!isConnectActive()) return;
+          this.observeInviteMetadata(nextContext, metadataState.snapshot);
+          if (!isConnectActive()) return;
+          this.observeWagers(nextContext);
+          if (!isConnectActive()) return;
+          this.observeInviteReactions(nextContext);
+        };
 
         if (!canWrite) {
           const canJoinAsGuest =
@@ -4843,31 +4952,56 @@ class Connection {
             didFindInviteThatCanBeJoined();
           } else {
             enterWatchOnlyMode();
-            this.observeMatch(workingInvite.hostId, matchId, nextContext);
-            if (workingInvite.guestId) {
-              this.observeMatch(workingInvite.guestId, matchId, nextContext);
-            }
+            if (!isConnectActive()) return;
+            this.observeMatch(
+              workingInvite.hostId,
+              matchId,
+              nextContext,
+              bootstrap.match,
+              workingInvite.guestId ? [workingInvite.guestId] : [],
+              isConnectActive,
+            );
           }
+          startObservers();
           return;
         }
 
         didRecoverMyMatch(myMatch!, matchId);
+        if (!isConnectActive()) return;
         if (this.isRematchEndPending(inviteId, uid)) {
           didReceiveRematchesSeriesEndIndicator();
+          if (!isConnectActive()) return;
           this.getRematchEndDelivery(uid, inviteId).refresh();
+          if (!isConnectActive()) return;
         }
         if (hasPendingProposal) {
           didDiscoverExistingRematchProposalWaitingForResponse();
+          if (!isConnectActive()) return;
         }
         if (role === "host") {
           if (workingInvite.guestId) {
-            this.observeMatch(workingInvite.guestId, matchId, nextContext);
+            this.observeMatch(
+              workingInvite.guestId,
+              matchId,
+              nextContext,
+              bootstrap.match,
+              [],
+              isConnectActive,
+            );
           } else {
             didFindYourOwnInviteThatNobodyJoined(isAutoInviteId(inviteId));
           }
         } else {
-          this.observeMatch(workingInvite.hostId, matchId, nextContext);
+          this.observeMatch(
+            workingInvite.hostId,
+            matchId,
+            nextContext,
+            bootstrap.match,
+            [],
+            isConnectActive,
+          );
         }
+        startObservers();
       })
       .catch((error) => {
         if (!isConnectActive()) {
@@ -4875,9 +5009,12 @@ class Connection {
         }
         if (isPendingLocalInviteCreation) {
           didFailToLoadPendingInvite();
+        } else if (!this.activeContext) {
+          didFailToLoadGame();
         }
         console.error("Failed to connect to invite:", error);
-      });
+      })
+      .finally(releaseDeliveries);
   }
 
   public tryNavigateWatchOnlyToLatestApprovedMatch(): boolean {
@@ -5018,6 +5155,7 @@ class Connection {
 
   private observeInviteMetadata(
     context: MatchRuntimeContext | null = this.activeContext,
+    initialSnapshot?: InviteMetadataSnapshot,
   ): void {
     if (!context || !this.inviteMetadataState) return;
     if (this.inviteMetadataSubscription?.contextId === context.contextId)
@@ -5027,9 +5165,10 @@ class Connection {
     const isActive = () =>
       this.isContextActive(context.contextId, context.sessionEpoch) &&
       this.isCurrentAuthUser(context.loginUid);
-    let initialized = false;
+    let initialized = initialSnapshot !== undefined;
     const channel = new InviteMetadataChannel({
       inviteId: context.inviteId,
+      initialSnapshot,
       createSocket: (url, protocols) => new WebSocket(url, protocols),
       getTokenRemainingMs: (token) => this.auth.getTokenRemainingMs(token),
       getProtocols: async (forceRefresh) => {
@@ -5118,7 +5257,12 @@ class Connection {
       availableMatchIds: wagers ? Object.keys(wagers) : [],
       state: summarizeWagerState(matchWagerState),
     });
-    syncCurrentWagerMatchState(targetMatchId, matchWagerState);
+    syncCurrentWagerMatchState(
+      targetMatchId,
+      matchWagerState,
+      this.inviteWagersSnapshot?.inviteId === this.inviteId &&
+        !this.wagerSnapshotNeedsReconciliation,
+    );
   }
 
   private observeWagers(
@@ -5195,6 +5339,7 @@ class Connection {
           revision: snapshot.revision,
         });
         this.updateWagerStateForCurrentMatch();
+        didReceiveInitialWagers();
         this.miningFrozenPoller?.refresh();
       },
       onError: (error) =>
@@ -5431,6 +5576,9 @@ class Connection {
     playerId: string,
     matchId: string,
     context: MatchRuntimeContext | null = this.activeContext,
+    initialSnapshot?: MatchSyncSnapshot,
+    additionalPlayerIds: string[] = [],
+    isInitialSnapshotActive?: () => boolean,
   ): void {
     if (
       !context ||
@@ -5449,12 +5597,13 @@ class Connection {
       subscription.channel.refresh();
     } else {
       this.stopObservingAllMatches();
-      const players = new Set([playerId]);
+      const players = new Set([playerId, ...additionalPlayerIds]);
       const key = `match-sync:${matchId}`;
       const channel = new MatchSyncChannel({
         inviteId: context.inviteId,
         matchId,
         requiredPlayerIds: () => players,
+        initialSnapshot,
         createSocket: (url, protocols) => new WebSocket(url, protocols),
         getTokenRemainingMs: (token) => this.auth.getTokenRemainingMs(token),
         getProtocols: async (forceRefresh) => {
@@ -5516,31 +5665,44 @@ class Connection {
       subscription = { contextId: context.contextId, channel, players, stop };
       this.matchSyncSubscription = subscription;
       incrementLifecycleCounter("connectionObservers");
+      if (initialSnapshot) {
+        this.applyMatchSyncSnapshot(
+          context,
+          initialSnapshot,
+          players,
+          isInitialSnapshotActive,
+        );
+        if (isInitialSnapshotActive && !isInitialSnapshotActive()) return;
+      }
     }
 
-    this.getPlayerProfileWithRetry(playerId, isObserverActive)
-      .then((profile) => {
-        if (!profile || !isObserverActive()) {
-          return;
-        }
-        didGetPlayerProfile(profile, playerId, false);
-      })
-      .catch((error) => {
-        if (!isObserverActive()) {
-          return;
-        }
-        console.error("Error getting player profile:", error);
-      });
+    for (const observedPlayerId of [playerId, ...additionalPlayerIds]) {
+      this.getPlayerProfileWithRetry(observedPlayerId, isObserverActive)
+        .then((profile) => {
+          if (!profile || !isObserverActive()) {
+            return;
+          }
+          didGetPlayerProfile(profile, observedPlayerId, false);
+        })
+        .catch((error) => {
+          if (!isObserverActive()) {
+            return;
+          }
+          console.error("Error getting player profile:", error);
+        });
+    }
   }
 
   private applyMatchSyncSnapshot(
     context: MatchRuntimeContext,
     snapshot: MatchSyncSnapshot,
     players: ReadonlySet<string>,
+    isSnapshotActive?: () => boolean,
   ): void {
     const isActive = () =>
       this.isContextActive(context.contextId, context.sessionEpoch) &&
-      this.isCurrentAuthUser(context.loginUid);
+      this.isCurrentAuthUser(context.loginUid) &&
+      (!isSnapshotActive || isSnapshotActive());
     if (
       !isActive() ||
       snapshot.inviteId !== context.inviteId ||

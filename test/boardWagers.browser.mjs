@@ -630,7 +630,7 @@ async function scenarios(browser, origin, mode, snapshots) {
         await invoke(page, "emit");
         assert.equal(await page.locator("[data-wager-pile]").count(), 5);
         const bindings = await invoke(page, "bindings");
-        assert.equal(bindings.wager, 1);
+        assert.equal(bindings.wager, 2);
         assert.equal(bindings.material, 1);
         await invoke(page, "dispose");
         assert.deepEqual(errors, []);
@@ -640,6 +640,83 @@ async function scenarios(browser, origin, mode, snapshots) {
     }
   }
 }
+
+test(
+  "wager actions follow confirmation readiness even when the proposal object is unchanged",
+  { timeout: 60_000 },
+  async () => {
+    await fixture(null, async ({ browser, origin }) => {
+      for (const mobile of [false, true]) {
+        const { context, page, errors } = await openPage(
+          browser,
+          origin,
+          mobile,
+          false,
+        );
+        try {
+          await invoke(page, "proposals");
+          await invoke(page, "emit");
+          await interact(page, pile(page, "player"), mobile);
+          assert.equal(
+            await page
+              .getByRole("button", { name: "Cancel Proposal", exact: true })
+              .count(),
+            1,
+          );
+          await invoke(page, "confirmed", false);
+          assert.equal(
+            await page
+              .getByRole("button", { name: "Cancel Proposal", exact: true })
+              .count(),
+            0,
+          );
+          await interact(page, pile(page, "opponent"), mobile);
+          assert.equal(
+            await page
+              .getByRole("button", { name: "Accept", exact: true })
+              .count(),
+            0,
+          );
+          assert.equal(
+            await page
+              .getByRole("button", { name: "Decline", exact: true })
+              .count(),
+            0,
+          );
+          assert.deepEqual(
+            await page.evaluate(() => window.harness.e.calls),
+            [],
+          );
+          await invoke(page, "confirmed", true);
+          for (const [side, name, method] of [
+            ["opponent", "Accept", "acceptWagerProposal"],
+            ["opponent", "Decline", "declineWagerProposal"],
+            ["player", "Cancel Proposal", "cancelWagerProposal"],
+          ]) {
+            if (
+              !(await page.getByRole("button", { name, exact: true }).count())
+            )
+              await interact(page, pile(page, side), mobile);
+            await interact(
+              page,
+              page.getByRole("button", { name, exact: true }),
+              mobile,
+            );
+            assert.equal(
+              await page.evaluate(() => window.harness.e.calls.at(-1)),
+              method,
+            );
+          }
+          await invoke(page, "dispose");
+          assert.equal((await invoke(page, "bindings")).wager, 0);
+          assert.deepEqual(errors, []);
+        } finally {
+          await context.close();
+        }
+      }
+    });
+  },
+);
 
 test(
   "capture readiness times out for a retained pending image",

@@ -69,6 +69,11 @@ import {
   isMatchSyncPath,
   type MatchSyncRouteDependencies,
 } from "./matchSyncRoute.ts";
+import {
+  handleGameBootstrapRoute,
+  isGameBootstrapPath,
+  type GameBootstrapRouteDependencies,
+} from "./gameBootstrapRoute.ts";
 
 const RATE_LIMIT_RETRY_AFTER_SECONDS = 60;
 
@@ -98,6 +103,7 @@ export async function handleRequest(
     metadata?: InviteMetadataRouteDependencies;
     wagers?: InviteWagersRouteDependencies;
     matchSync?: MatchSyncRouteDependencies;
+    gameBootstrap?: GameBootstrapRouteDependencies;
     xCallback?: XCallbackDependencyOverrides;
   } = {},
   ctx?: WorkerExecutionContext,
@@ -105,6 +111,15 @@ export async function handleRequest(
   const pathname = new URL(request.url).pathname;
   if (SESSION_PATHS.includes(pathname)) {
     return handleSessionRoute(request, env, dependencyOverrides.session);
+  }
+  if (isGameBootstrapPath(pathname)) {
+    if (!ctx) return jsonResponse({ ok: false, error: "unavailable" }, 503);
+    return handleGameBootstrapRoute(
+      request,
+      env,
+      ctx,
+      dependencyOverrides.gameBootstrap,
+    );
   }
   if (isMatchSyncPath(pathname)) {
     if (!ctx) return jsonResponse({ ok: false, error: "unavailable" }, 503);

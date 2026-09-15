@@ -131,6 +131,10 @@ const harness = {
     e.state = state;
     run(() => e.subscribers.forEach((callback) => callback(state)));
   },
+  confirmed(value: boolean) {
+    e.snapshotConfirmed = value;
+    run(() => e.subscribers.forEach((callback) => callback(e.state)));
+  },
   proposals(playerCount = 4, opponentCount = 8) {
     this.state({
       proposals: {

@@ -3,9 +3,12 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
 import { InviteMetadataState } from "../src/connection/inviteMetadataState.ts";
-import { InviteMetadataApiError } from "../src/services/inviteMetadataApi.ts";
+import { GameBootstrapApiError } from "../src/services/gameBootstrapApi.ts";
 import { withAutomatchOperationLock } from "../src/connection/automatchOperationLock.ts";
-import { moveDeliveryStorageKey } from "../src/connection/moveDelivery.ts";
+import {
+  MoveDelivery,
+  moveDeliveryStorageKey,
+} from "../src/connection/moveDelivery.ts";
 import {
   RematchEndDelivery,
   rematchEndDeliveryStorageKey,
@@ -15,6 +18,7 @@ import { isAutoInviteId } from "../cloud/runtime/shared/ids.js";
 import {
   parseRematchIndices,
   rematchSeriesEnded,
+  selectInviteMatch,
 } from "../cloud/runtime/shared/rematches.js";
 
 const source = ts.createSourceFile(
@@ -197,8 +201,10 @@ function harness({
   propose,
   end,
   onMetadata,
+  onRecover,
   readWagers,
   readMatch,
+  takeBootstrap = () => null,
   ensureMatch,
   surrender,
   records = new Map(),
@@ -207,6 +213,7 @@ function harness({
     reads: [],
     legacyReads: [],
     matchReads: [],
+    bootstrapReads: [],
     ensuredMatches: [],
     recoveredMatches: [],
     surrenders: [],
@@ -249,7 +256,9 @@ function harness({
     },
     moveDeliveryStorageKey,
     InviteMetadataState,
-    InviteMetadataApiError,
+    selectInviteMatch,
+    takeInitialGameBootstrap: takeBootstrap,
+    GameBootstrapApiError,
     withAutomatchOperationLock,
     isAutoInviteId,
     summarizeWagerState: (value) => value,
@@ -289,6 +298,18 @@ function harness({
         this.stops = 0;
         this.refreshes = 0;
         events.wagerChannels.push(this);
+        const generation = dependencies.captureGeneration();
+        queueMicrotask(() => {
+          void dependencies.readWagers(this.signal).then(
+            (response) => {
+              if (!this.signal.aborted)
+                this.emit(response.snapshot, "http", generation);
+            },
+            (error) => {
+              if (!this.signal.aborted) dependencies.onError(error);
+            },
+          );
+        });
       }
       stop() {
         this.stops++;
@@ -321,6 +342,57 @@ function harness({
     readInviteMetadataViaApi: async (inviteId, provider, options) => {
       events.reads.push({ inviteId, provider, signal: options.signal });
       return read ? read(events.reads.length, options.signal) : currentResponse;
+    },
+    readGameBootstrapViaApi: async (inviteId, provider, options) => {
+      events.bootstrapReads.push({ inviteId, ...options });
+      const metadata = await dependencies.readInviteMetadataViaApi(
+        inviteId,
+        provider,
+        options,
+      );
+      provider.assertCurrentUser();
+      const selected = selectInviteMatch(
+        inviteId,
+        metadata.snapshot,
+        metadata.viewer.actorUid,
+        {
+          preferApproved: options.selection === "approved",
+        },
+      );
+      let actorMatch = match;
+      if (metadata.viewer.actorUid) {
+        const input = {
+          playerId: metadata.viewer.actorUid,
+          matchId: selected.matchId,
+        };
+        events.matchReads.push({ ...input, ...options });
+        actorMatch = readMatch
+          ? await readMatch(events.matchReads.length, input, options)
+          : match;
+      }
+      return {
+        ok: true,
+        schemaVersion: 1,
+        metadata: metadata.snapshot,
+        viewer: metadata.viewer,
+        hasPendingProposal: selected.hasPendingProposal,
+        match: {
+          inviteId,
+          matchId: selected.matchId,
+          revision: metadata.snapshot.revision,
+          hostPlayerId: metadata.snapshot.hostId,
+          guestPlayerId: metadata.snapshot.guestId,
+          hostMatch:
+            metadata.viewer.actorUid === metadata.snapshot.hostId
+              ? actorMatch
+              : match,
+          guestMatch: metadata.snapshot.guestId
+            ? metadata.viewer.actorUid === metadata.snapshot.guestId
+              ? actorMatch
+              : { ...match, color: "black" }
+            : null,
+        },
+      };
     },
     createInviteMetadataSocketProtocols: (token) => [
       "mons-invite-metadata-v1",
@@ -375,12 +447,16 @@ function harness({
       events.home.push(options);
       instance.detachFromMatchSession();
     },
+    didFailToLoadGame: (notFound) =>
+      events.ui.push(notFound ? "not-found" : "load-failed"),
+    didReceiveInitialWagers: () => events.ui.push("wagers-known"),
     didFailToLoadPendingInvite: () => events.ui.push("pending-failed"),
     didFindInviteThatCanBeJoined: () => events.ui.push("join-button"),
     enterWatchOnlyMode: () => events.ui.push("watch"),
     didRecoverMyMatch: (value) => {
       events.ui.push("recover");
       events.recoveredMatches.push({ ...value });
+      onRecover?.(instance);
     },
     didDiscoverExistingRematchProposalWaitingForResponse: () =>
       events.ui.push("pending-rematch"),
@@ -450,6 +526,8 @@ function harness({
     reconnectAfterMatchUpdateFailure: noop,
     getMoveDelivery: (scope, match) => {
       const delivery = {
+        scope,
+        confirmationVersion: 0,
         reconcile: () => match,
         resume: noop,
         suspend: noop,
@@ -543,7 +621,7 @@ function harness({
   };
 }
 
-test("metadata bootstrap preserves linked-login actors and loads existing wagers before recovery", async () => {
+test("game bootstrap preserves linked-login actors and recovers before independent wagers", async () => {
   const wagers = { invite: { agreed: { count: 3 } } };
   const h = harness({ wagers });
   await h.connect();
@@ -556,17 +634,268 @@ test("metadata bootstrap preserves linked-login actors and loads existing wagers
   assert.equal(h.events.wagerReads.length, 1);
   assert.equal(h.instance.activeContext.loginUid, "login");
   assert.equal(h.instance.activeContext.actorUid, "host");
-  assert.deepEqual(h.events.wagering[0], wagers);
+  assert.equal(h.events.wagering[0], null);
+  assert.deepEqual(h.instance.latestInvite.wagers, wagers);
+  assert.equal(h.events.bootstrapReads.length, 1);
+  assert.ok(
+    h.events.ui.indexOf("recover") < h.events.ui.indexOf("wagers-known"),
+  );
   assert.equal(h.events.ui.includes("refresh-claims"), false);
   h.channel().emit(snapshot({ revision: 2, hostRematches: "1" }));
   assert.deepEqual(h.instance.latestInvite.wagers, wagers);
   h.instance.detachFromMatchSession();
 });
 
+test("prefetched bootstrap is reused only while no matching move recovery has started", async () => {
+  const metadata = response();
+  const prefetched = {
+    ok: true,
+    schemaVersion: 1,
+    metadata: metadata.snapshot,
+    viewer: metadata.viewer,
+    hasPendingProposal: false,
+    match: {
+      inviteId: "invite",
+      matchId: "invite",
+      revision: 1,
+      hostPlayerId: "host",
+      guestPlayerId: "guest",
+      hostMatch: match,
+      guestMatch: { ...match, color: "black" },
+    },
+  };
+  for (const recoveryTiming of ["none", "before-adoption", "during-adoption"]) {
+    const pending = deferred();
+    let adoptions = 0;
+    const confirmed = {
+      ...match,
+      fen: "confirmed-fen",
+      flatMovesString: "move1",
+    };
+    const h = harness({
+      takeBootstrap: () => {
+        adoptions++;
+        return { promise: pending.promise, abort: () => {} };
+      },
+      readMatch: () => confirmed,
+    });
+    const recoverMove = async () => {
+      const scope = {
+        loginUid: "login",
+        inviteId: "invite",
+        matchId: "invite",
+        playerId: "host",
+      };
+      const delivery = new MoveDelivery(scope, match, {
+        storage: {
+          getItem: () => null,
+          setItem: () => {},
+          removeItem: () => {},
+        },
+        isAuthorized: () => true,
+        isOnline: () => true,
+        submit: async () => ({ outcome: "applied" }),
+        read: async () => confirmed,
+        onError: (error) => h.events.errors.push(error.message),
+        onRemoteAdvance: () => {},
+      });
+      delivery.enqueue("move1", "confirmed-fen");
+      await delivery.flush();
+      assert.equal(delivery.confirmationVersion, 1);
+      h.instance.moveDeliveries.set(moveDeliveryStorageKey(scope), delivery);
+      h.instance.getMoveDelivery = () => delivery;
+    };
+    if (recoveryTiming === "before-adoption") {
+      pending.resolve(prefetched);
+      await recoverMove();
+    }
+    h.instance.connectToGame("login", "invite", false);
+    await settle();
+    if (recoveryTiming === "during-adoption") await recoverMove();
+    pending.resolve(prefetched);
+    await settle();
+    assert.deepEqual(h.events.errors, [], recoveryTiming);
+    assert.equal(h.instance.activeContext?.actorUid, "host", recoveryTiming);
+    assert.equal(
+      h.instance.myMatch.fen,
+      recoveryTiming === "none" ? match.fen : confirmed.fen,
+    );
+    assert.equal(
+      h.events.bootstrapReads.length,
+      recoveryTiming === "none" ? 0 : 1,
+    );
+    assert.equal(adoptions, 1);
+    h.instance.detachFromMatchSession();
+  }
+});
+
+test("a loaded game remains available while wagers are unknown and rejects wager writes", async () => {
+  const pending = deferred();
+  const h = harness({ readWagers: () => pending.promise });
+  await h.connect();
+  assert.equal(h.instance.activeContext.actorUid, "host");
+  assert.equal(h.instance.inviteWagersSnapshot, null);
+  assert.ok(h.events.ui.includes("recover"));
+  assert.ok(!h.events.ui.includes("wagers-known"));
+  const result = await h.instance.runWagerMutation(
+    async () => assert.fail("wager write ran before its snapshot"),
+    true,
+  );
+  assert.deepEqual(result, { ok: false });
+  pending.resolve({ ok: true, snapshot: wagerSnapshot(1) });
+  await settle();
+  assert.ok(h.events.ui.includes("wagers-known"));
+  assert.deepEqual(h.instance.latestInvite.wagers, {});
+  h.instance.detachFromMatchSession();
+});
+
+test("bootstrap reconciliation captures the delivery revision before an in-flight acknowledgment", async () => {
+  const pending = deferred();
+  const h = harness({
+    readMatch: (attempt) => (attempt === 1 ? match : pending.promise),
+  });
+  await h.connect();
+  const delivery = [...h.instance.moveDeliveries.values()][0];
+  delivery.confirmationVersion = 4;
+  let captured;
+  delivery.reconcile = (_remote, revision) => {
+    captured = revision;
+    return { fen: "confirmed-newer", flatMovesString: "confirmed-move" };
+  };
+  h.instance.getMoveDelivery = () => delivery;
+  h.instance.connectToGame("login", "invite", false);
+  await settle();
+  delivery.confirmationVersion = 5;
+  pending.resolve(match);
+  await settle();
+  assert.deepEqual(h.events.errors, []);
+  assert.equal(captured, 4);
+  assert.equal(h.instance.myMatch.fen, "confirmed-newer");
+  h.instance.detachFromMatchSession();
+});
+
+test("a bootstrap cannot activate after replacing the auth object with the same login UID", async () => {
+  const pending = deferred();
+  const h = harness({ readMatch: () => pending.promise });
+  h.instance.connectToGame("login", "invite", false);
+  await settle();
+  h.instance.auth.currentUser = { ...h.instance.auth.currentUser };
+  pending.resolve(match);
+  await settle();
+  assert.equal(h.instance.activeContext, null);
+  assert.deepEqual(h.events.recoveredMatches, []);
+  assert.deepEqual(h.events.observed, []);
+  assert.deepEqual(h.events.errors, []);
+  h.instance.detachFromMatchSession();
+});
+
+test("a canceled bootstrap cannot resume a replacement attempt's suspended move delivery", async () => {
+  const first = deferred();
+  const second = deferred();
+  const h = harness({
+    readMatch: (attempt) =>
+      attempt === 1 ? match : attempt === 2 ? first.promise : second.promise,
+  });
+  await h.connect();
+  const delivery = [...h.instance.moveDeliveries.values()][0];
+  let suspended = false;
+  let resumes = 0;
+  delivery.suspend = () => {
+    suspended = true;
+  };
+  delivery.resume = () => {
+    suspended = false;
+    resumes++;
+  };
+  h.instance.getMoveDelivery = () => delivery;
+  h.instance.connectToGame("login", "invite", false);
+  await settle();
+  assert.equal(suspended, true);
+  h.instance.connectToGame("login", "invite", false);
+  await settle();
+  assert.equal(resumes, 1);
+  first.resolve(match);
+  await settle();
+  assert.equal(suspended, true);
+  assert.equal(resumes, 1);
+  second.resolve(match);
+  await settle();
+  assert.deepEqual(h.events.errors, []);
+  assert.equal(suspended, false);
+  assert.equal(resumes, 2);
+  h.instance.detachFromMatchSession();
+});
+
+test("a reconnect triggered during hydration retains the replacement delivery suspension", async () => {
+  const pending = deferred();
+  let reconnectOnHydration = false;
+  const h = harness({
+    readMatch: (attempt) => (attempt < 3 ? match : pending.promise),
+    onRecover: (connection) => {
+      if (!reconnectOnHydration) return;
+      reconnectOnHydration = false;
+      connection.connectToGame("login", "invite", false);
+    },
+  });
+  await h.connect();
+  const delivery = [...h.instance.moveDeliveries.values()][0];
+  let suspended = false;
+  let resumes = 0;
+  delivery.suspend = () => {
+    suspended = true;
+  };
+  delivery.resume = () => {
+    suspended = false;
+    resumes++;
+  };
+  h.instance.getMoveDelivery = () => delivery;
+  reconnectOnHydration = true;
+  const previousUiCount = h.events.ui.length;
+  const previousObserverCount = h.events.observed.length;
+  h.instance.connectToGame("login", "invite", false);
+  await settle();
+  assert.equal(h.events.matchReads.length, 3);
+  assert.equal(suspended, true);
+  assert.equal(resumes, 1);
+  assert.deepEqual(h.events.ui.slice(previousUiCount), ["recover"]);
+  assert.equal(h.events.observed.length, previousObserverCount);
+  pending.resolve(match);
+  await settle();
+  assert.deepEqual(h.events.errors, []);
+  assert.equal(suspended, false);
+  assert.equal(resumes, 2);
+  assert.equal(h.events.observed.length, previousObserverCount + 1);
+  h.instance.detachFromMatchSession();
+});
+
+test("newer accepted rematch metadata forces a fresh matching bootstrap before hydration", async () => {
+  const pending = deferred();
+  const next = response(
+    snapshot({ revision: 3, hostRematches: "1", guestRematches: "1" }),
+  );
+  const h = harness({
+    read: (attempt) =>
+      attempt === 1 ? response() : attempt === 2 ? pending.promise : next,
+  });
+  await h.connect();
+  h.instance.connectToGame("login", "invite", false);
+  await settle();
+  h.instance.inviteMetadataState.confirmRematches("host", "1");
+  h.instance.inviteMetadataState.confirmRematches("guest", "1");
+  pending.resolve(response());
+  await settle();
+  assert.deepEqual(h.events.errors, []);
+  assert.equal(h.events.bootstrapReads.length, 3);
+  assert.equal(h.instance.activeContext.matchId, "invite1");
+  assert.equal(h.events.recoveredMatches.length, 2);
+  h.instance.detachFromMatchSession();
+});
+
 test("reconnect ensures a participant match only after a successful missing Worker snapshot", async () => {
   const ensuredMatch = { ...match, fen: "ensured-fen" };
   const h = harness({
-    readMatch: (attempt) => (attempt === 1 ? match : null),
+    readMatch: (attempt) =>
+      attempt === 1 ? match : attempt === 2 ? null : ensuredMatch,
     ensureMatch: async () => ({ ok: true, match: ensuredMatch }),
   });
   await h.connect();
@@ -574,7 +903,7 @@ test("reconnect ensures a participant match only after a successful missing Work
   h.instance.connectToGame("login", "invite", false);
   await settle();
   assert.deepEqual(h.events.errors, []);
-  assert.equal(h.events.matchReads.length, 2);
+  assert.equal(h.events.matchReads.length, 3);
   assert.equal(h.events.ensuredMatches.length, 1);
   assert.equal(h.events.ensuredMatches[0].inviteId, "invite");
   assert.equal(h.events.ensuredMatches[0].matchId, "invite");
@@ -651,7 +980,7 @@ test("private automatch denial joins before metadata retry and never reads the o
   const h = harness({
     initial: paired,
     read: (attempt) => {
-      if (attempt === 1) throw new InviteMetadataApiError("http-403", 403);
+      if (attempt === 1) throw new GameBootstrapApiError("http-403", 403);
       return paired;
     },
   });
@@ -668,7 +997,7 @@ test("private automatch denial joins before metadata retry and never reads the o
 test("pending invite creation waits after missing metadata and reads the created invite", async () => {
   const h = harness({
     read: (attempt) => {
-      if (attempt === 1) throw new InviteMetadataApiError("http-404", 404);
+      if (attempt === 1) throw new GameBootstrapApiError("http-404", 404);
       return response();
     },
   });
@@ -1210,7 +1539,7 @@ test("detaching during wager bootstrap aborts the read and drops its late respon
   pending.resolve({ ok: true, snapshot: wagerSnapshot(2) });
   await settle();
   assert.equal(h.instance.activeContext, null);
-  assert.equal(h.events.wagerChannels.length, 0);
+  assert.equal(h.events.wagerChannels.length, 1);
   assert.equal(h.events.legacyReads.length, 0);
 });
 
@@ -1224,9 +1553,10 @@ test("account replacement during wager bootstrap never publishes the old account
   assert.equal(h.events.wagerReads[0].signal.aborted, true);
   pending.resolve({ ok: true, snapshot: wagerSnapshot(2) });
   await settle();
-  assert.equal(h.instance.activeContext, null);
-  assert.equal(h.events.wagerChannels.length, 0);
-  assert.equal(h.events.wagerStates.length, 0);
+  assert.equal(h.instance.inviteWagersSnapshot, null);
+  assert.equal(h.instance.isCurrentAuthUser("login"), false);
+  assert.equal(h.events.wagerChannels.length, 1);
+  assert.ok(h.events.wagerStates.every(({ state }) => state === null));
   unsubscribe();
 });
 
@@ -1245,7 +1575,7 @@ test("invite-wide wager snapshots update historical selection and empty snapshot
     matchId: "invite1",
     state: proposalState(4),
   });
-  assert.equal(h.events.frozenRefreshes, 1);
+  assert.equal(h.events.frozenRefreshes, 2);
   h.wagerChannel().emit(wagerSnapshot(3));
   assert.deepEqual(h.events.wagerStates.at(-1), {
     matchId: "invite1",
@@ -1262,7 +1592,7 @@ test("internal-only revisions refresh frozen balances while duplicate and older 
   h.wagerChannel().emit(wagerSnapshot(2, wagers));
   h.wagerChannel().emit(wagerSnapshot(2, wagers));
   h.wagerChannel().emit(wagerSnapshot(1), "http");
-  assert.equal(h.events.frozenRefreshes, 1);
+  assert.equal(h.events.frozenRefreshes, 2);
   assert.deepEqual(h.instance.latestInvite.wagers, wagers);
   assert.equal(h.instance.inviteWagersSnapshot.revision, 2);
   h.instance.detachFromMatchSession();
@@ -1443,7 +1773,7 @@ test("reconnect keeps the latest wager snapshot received while metadata bootstra
   assert.deepEqual(h.events.errors, []);
   assert.equal(h.instance.inviteWagersSnapshot.revision, 3);
   assert.deepEqual(h.instance.latestInvite.wagers.invite, proposalState(3));
-  assert.equal(h.events.wagerReads.length, 1);
+  assert.equal(h.events.wagerReads.length, 2);
   h.instance.detachFromMatchSession();
 });
 

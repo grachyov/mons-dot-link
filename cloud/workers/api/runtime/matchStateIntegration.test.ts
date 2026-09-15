@@ -241,6 +241,7 @@ describe("canonical match room integration", () => {
   });
 
   it("delivers durable timeout effects after eviction with no connected sockets", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
     const host = { ...match, color: "black" };
     const guest = { ...match, color: "white" };
     const game = resolveMatchTimerGame(
@@ -344,7 +345,7 @@ describe("canonical match room integration", () => {
         });
       };
     });
-    vi.spyOn(Date, "now").mockReturnValue(saved.effect.next_at_ms);
+    clock.mockReturnValue(saved.effect.next_at_ms);
     expect(await runDurableObjectAlarm(room)).toBe(true);
     expect(attempts).toBe(2);
     expect(

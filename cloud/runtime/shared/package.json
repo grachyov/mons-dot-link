@@ -7,6 +7,7 @@
     "./auth": "./auth.js",
     "./event-prizes": "./event-prizes.js",
     "./events": "./events.js",
+    "./game-bootstrap": "./game-bootstrap.js",
     "./game-variants": "./game-variants.js",
     "./game-sessions": "./game-sessions.js",
     "./ids": "./ids.js",

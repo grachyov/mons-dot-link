@@ -140,7 +140,7 @@ const bootstrapForRoute = async (target: RouteState) => {
   const gameController = await import("../game/gameController");
   await gameController.go(target);
   const mainGameLoadState = await import("../game/mainGameLoadState");
-  mainGameLoadState.markMainGameLoaded();
+  mainGameLoadState.markMainGameRoutePrepared();
 };
 
 const runTransition = async (

@@ -6,6 +6,7 @@ import React, {
   useReducer,
   useCallback,
   useMemo,
+  useSyncExternalStore,
 } from "react";
 import {
   FIXED_STICKER_IDS,
@@ -102,9 +103,7 @@ import {
   ShimmerText,
 } from "./BottomControlsStyles";
 import { closeMenuAndInfoIfAny } from "./controls/menuPort";
-import BoardStylePickerComponent, {
-  preloadPangchiuBoardPreview,
-} from "./BoardStylePicker";
+import BoardStylePickerComponent from "./BoardStylePicker";
 import { Sound } from "../utils/gameModels";
 import MoveHistoryPopup from "./MoveHistoryPopup";
 import {
@@ -119,7 +118,10 @@ import {
   NavigationGameStatus,
   NavigationItem,
 } from "../connection/connectionModels";
-import { subscribeToWagerState } from "../game/wagerState";
+import {
+  hasConfirmedWagerSnapshot,
+  subscribeToWagerState,
+} from "../game/wagerState";
 import { getStashedPlayerProfile } from "../utils/playerMetadata";
 import {
   getCurrentTarget,
@@ -762,7 +764,14 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
     name: MaterialName | null;
     count: number;
   }>({ name: null, count: 0 });
-  const materialUrls = useMaterialImages();
+  const materialUrls = useMaterialImages(
+    isWagerMode && isReactionPickerVisible,
+  );
+  const hasConfirmedInviteWagers = useSyncExternalStore(
+    subscribeToWagerState,
+    hasConfirmedWagerSnapshot,
+    hasConfirmedWagerSnapshot,
+  );
   const {
     availableMaterials: materialAmounts,
     frozenMaterialsStatus,
@@ -1050,41 +1059,6 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
       );
     };
   }, [isEventModalVisible]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const win: any = typeof window !== "undefined" ? (window as any) : null;
-    const schedule = (fn: () => void) => {
-      if (!win) {
-        const t = setTimeout(() => {
-          if (!cancelled) fn();
-        }, 200);
-        return () => clearTimeout(t);
-      }
-      if (typeof win.requestIdleCallback === "function") {
-        const id = win.requestIdleCallback(() => {
-          if (!cancelled) fn();
-        });
-        return () => {
-          if (typeof win.cancelIdleCallback === "function")
-            win.cancelIdleCallback(id);
-        };
-      }
-      const t = setTimeout(() => {
-        if (!cancelled) fn();
-      }, 200);
-      return () => clearTimeout(t);
-    };
-
-    const cleanup = schedule(() => {
-      preloadPangchiuBoardPreview();
-    });
-
-    return () => {
-      cancelled = true;
-      if (cleanup) cleanup();
-    };
-  }, []);
 
   useEffect(() => {
     if (!isReactionPickerVisible) {
@@ -1943,6 +1917,7 @@ const BottomControls: React.FC<BottomControlsProps> = ({ authState }) => {
   const isAutomatchPillVisible =
     isAutomatchButtonVisible && !isCancelAutomatchInFlight;
   const canSubmitWager =
+    hasConfirmedInviteWagers &&
     isEligibleForWager &&
     !hasAgreedWager &&
     !hasResolvedWager &&

@@ -33,6 +33,7 @@ type MatchSyncChannelDependencies = Pick<
   inviteId: string;
   matchId: string;
   requiredPlayerIds: () => Iterable<string>;
+  initialSnapshot?: MatchSyncSnapshot;
   readMatches: (signal: AbortSignal) => Promise<ReadMatchSyncResponse>;
   onSnapshot: (snapshot: MatchSyncSnapshot) => void;
 };
@@ -42,9 +43,10 @@ export class MatchSyncChannel extends SnapshotChannel<
   ReadMatchSyncResponse
 > {
   constructor(dependencies: MatchSyncChannelDependencies) {
-    let latest: MatchSyncSnapshot | null = null;
+    let latest: MatchSyncSnapshot | null = dependencies.initialSnapshot ?? null;
     super({
       ...dependencies,
+      initialSnapshotAccepted: latest !== null,
       socketUrl: getMatchSyncSocketUrl(
         dependencies.inviteId,
         dependencies.matchId,

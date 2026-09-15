@@ -278,6 +278,55 @@ test("spectators share one channel and cache both actor records before the first
   ]);
 });
 
+test("bootstrap hydrates both spectator actors immediately using one seeded subscription", () => {
+  const h = harness();
+  const seed = snapshot();
+  h.connection.observeMatch("host", "invite", h.context, seed, ["guest"]);
+  assert.equal(h.channels.length, 1);
+  assert.equal(h.channels[0].refreshes, 0);
+  assert.equal(h.channels[0].dependencies.initialSnapshot, seed);
+  assert.deepEqual(
+    [...h.channels[0].dependencies.requiredPlayerIds()],
+    ["host", "guest"],
+  );
+  assert.equal(h.deliveries.length, 2);
+  assert.deepEqual(h.deliveries[0].cached.hostMatch, seed.hostMatch);
+  assert.deepEqual(h.deliveries[0].cached.guestMatch, seed.guestMatch);
+});
+
+test("bootstrap hydrates an opponent with reconciled own moves before any network callback", () => {
+  const h = harness({ participant: true });
+  const own = h.connection.myMatch;
+  h.connection.observeMatch("guest", "invite", h.context, snapshot());
+  assert.equal(h.deliveries.length, 1);
+  assert.equal(h.deliveries[0].playerId, "guest");
+  assert.deepEqual(h.deliveries[0].cached.hostMatch, own);
+  assert.equal(h.connection.observedMatchSnapshots.has("invite_host"), false);
+  assert.equal(h.channels[0].refreshes, 0);
+});
+
+test("a superseded bootstrap stops actor delivery and profile work even before the context rotates", () => {
+  let bootstrapActive = true;
+  const h = harness({
+    onMatch: () => {
+      bootstrapActive = false;
+    },
+  });
+  h.connection.observeMatch(
+    "host",
+    "invite",
+    h.context,
+    snapshot(),
+    ["guest"],
+    () => bootstrapActive,
+  );
+  assert.equal(h.connection.activeContext, h.context);
+  assert.equal(h.deliveries.length, 1);
+  assert.equal(h.deliveries[0].playerId, "host");
+  assert.deepEqual(h.profileReads, []);
+  h.connection.detachFromMatchSession();
+});
+
 test("participant pair delivery only observes the opponent and preserves optimistic actor state and journal", () => {
   const h = harness({ participant: true });
   const optimistic = h.connection.myMatch;

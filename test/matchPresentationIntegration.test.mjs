@@ -718,6 +718,7 @@ function historyAppearanceHarness({
       applyTimerStateFromStashes: () => false,
       getTimerMatchIdCandidate: () => null,
       applyWagerState: noop,
+      markKnownWagerInitialStateReceived: noop,
       updateUndoButtonBasedOnGameState: noop,
     },
     "({ get: getDisplayedMatchPresentation, refresh: refreshDisplayedMatchPresentation, restore: restoreLiveBoardView, rematch: didConfirmRematchProposal })",

@@ -59,6 +59,7 @@ import type {
   BoardPlayerInfoSlotState,
 } from "../game/boardUiPort";
 import type { BotAutomoveMode } from "../game/botAutomoveMode";
+import { onMainGameLoaded } from "../game/mainGameLoadState";
 
 import { BoardWagerLayer } from "./wagers/BoardWagerLayer";
 import { useBoardWagers } from "./wagers/useBoardWagers";
@@ -1624,15 +1625,18 @@ const BoardComponent: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
-    preloadEndOfGameIcons().forEach((promise) => {
-      void promise.then((resolvedUrl) => {
-        if (!cancelled && resolvedUrl) {
-          setEndOfGameIconHrefs(getEndOfGameIconHrefs());
-        }
+    const unsubscribe = onMainGameLoaded(() => {
+      preloadEndOfGameIcons().forEach((promise) => {
+        void promise.then((resolvedUrl) => {
+          if (!cancelled && resolvedUrl) {
+            setEndOfGameIconHrefs(getEndOfGameIconHrefs());
+          }
+        });
       });
     });
     return () => {
       cancelled = true;
+      unsubscribe();
     };
   }, []);
 
